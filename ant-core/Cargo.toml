@@ -38,7 +38,7 @@ tracing = "0.1"
 bytes = "1"
 lru = "0.16"
 rand = "0.8"
-ant-node = "0.10.0"
+ant-node = { git = "https://github.com/jacderida/ant-node.git", branch = "feat/shard-consumer-instrumentation" }
 saorsa-pqc = "0.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

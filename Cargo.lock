@@ -904,8 +904,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "716cbaf63c0fb090667e8db0c87364ad3293ffc04396999c6ec1a5b394af8989"
+source = "git+https://github.com/jacderida/ant-node.git?branch=feat%2Fshard-consumer-instrumentation#58dcfdcecbdbe000857d60d708f5dd59d37b5c69"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -5099,13 +5098,13 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8eefc3539465111e2769b9b8334ddd4d7071e12c183de4a9fee7d9bfbdb3da23"
+source = "git+https://github.com/jacderida/saorsa-core.git?branch=feat%2Fshard-consumer-instrumentation#d28b5bf2ba838e7ef6f56bf7d33a432e187a465d"
 dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
  "bytes",
+ "dashmap",
  "dirs 6.0.0",
  "futures",
  "hex",
@@ -6043,9 +6042,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.0"
+version = "1.52.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a91135f59b1cbf38c91e73cf3386fca9bb77915c45ce2771460c9d92f0f3d776"
+checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
 dependencies = [
  "bytes",
  "libc",
@@ -6692,9 +6691,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.6"
+version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "804f18a4ac2676ffb4e8b5b5fa9ae38af06df08162314f96a68d2a363e21a8ca"
+checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
 dependencies = [
  "rustls-pki-types",
 ]
