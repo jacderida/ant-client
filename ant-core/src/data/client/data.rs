@@ -126,7 +126,7 @@ impl Client {
             };
 
             let chunks_stored = self
-                .merkle_upload_chunks(chunk_contents, addresses, &batch_result)
+                .merkle_upload_chunks(chunk_contents, addresses, &batch_result, None)
                 .await?;
 
             info!("Data uploaded via merkle: {chunks_stored} chunks stored ({content_len} bytes)");

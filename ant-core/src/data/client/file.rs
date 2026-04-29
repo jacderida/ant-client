@@ -821,11 +821,24 @@ impl Client {
     /// Equivalent to [`Client::file_prepare_upload_with_visibility`] with
     /// [`Visibility::Private`] — see that method for details.
     pub async fn file_prepare_upload(&self, path: &Path) -> Result<PreparedUpload> {
-        self.file_prepare_upload_with_visibility(path, Visibility::Private)
+        self.file_prepare_upload_with_progress(path, Visibility::Private, None)
             .await
     }
 
     /// Phase 1 of external-signer upload with explicit [`Visibility`] control.
+    ///
+    /// Equivalent to [`Client::file_prepare_upload_with_progress`] with
+    /// `progress: None` — see that method for details.
+    pub async fn file_prepare_upload_with_visibility(
+        &self,
+        path: &Path,
+        visibility: Visibility,
+    ) -> Result<PreparedUpload> {
+        self.file_prepare_upload_with_progress(path, visibility, None)
+            .await
+    }
+
+    /// Phase 1 of external-signer upload with progress events.
     ///
     /// Requires an EVM network (for contract price queries) but NOT a wallet.
     /// Returns a [`PreparedUpload`] containing the data map, prepared chunks,
@@ -839,6 +852,12 @@ impl Client {
     /// surfaced via [`FileUploadResult::data_map_address`] so the uploader
     /// can share a single address from which anyone can retrieve the file.
     ///
+    /// When `progress` is `Some`, [`UploadEvent`]s are emitted on the channel
+    /// during encryption ([`UploadEvent::Encrypting`] / [`UploadEvent::Encrypted`])
+    /// and per-chunk quoting ([`UploadEvent::ChunkQuoted`]). Storage events are
+    /// emitted later by [`Client::finalize_upload_with_progress`] /
+    /// [`Client::finalize_upload_merkle_with_progress`].
+    ///
     /// **Memory note:** Encryption uses disk spilling for bounded memory, but
     /// the returned [`PreparedUpload`] holds all chunk content in memory (each
     /// [`PreparedChunk`] contains a `Bytes` with the full chunk data). This is
@@ -850,10 +869,11 @@ impl Client {
     ///
     /// Returns an error if there is insufficient disk space, the file cannot
     /// be read, encryption fails, or quote collection fails.
-    pub async fn file_prepare_upload_with_visibility(
+    pub async fn file_prepare_upload_with_progress(
         &self,
         path: &Path,
         visibility: Visibility,
+        progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<PreparedUpload> {
         debug!(
             "Preparing file upload for external signing (visibility={visibility:?}): {}",
@@ -863,7 +883,7 @@ impl Client {
         let file_size = std::fs::metadata(path)?.len();
         check_disk_space_for_spill(file_size)?;
 
-        let (spill, data_map) = self.encrypt_file_to_spill(path, None).await?;
+        let (spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
 
         info!(
             "Encrypted {} into {} chunks for external signing (spilled to disk)",
@@ -905,6 +925,14 @@ impl Client {
 
         let chunk_count = chunk_data.len();
 
+        if let Some(ref tx) = progress {
+            let _ = tx
+                .send(UploadEvent::Encrypted {
+                    total_chunks: chunk_count,
+                })
+                .await;
+        }
+
         let payment_info = if should_use_merkle(chunk_count, PaymentMode::Auto) {
             // Merkle path: build tree, collect candidate pools, return for external payment.
             info!("Using merkle batch preparation for {chunk_count} file chunks");
@@ -932,12 +960,14 @@ impl Client {
                 chunk_addresses: addresses,
             }
         } else {
-            // Wave-batch path: collect quotes per chunk concurrently.
+            // Wave-batch path: collect quotes per chunk concurrently, emitting
+            // a `ChunkQuoted` event after each completion so callers can drive
+            // a progress bar through the (slow) quoting phase.
             // Clamp fan-out to chunk_count so a partial wave doesn't
             // pay for slots it can't fill (see PERF-RESULTS.md).
             let quote_limiter = self.controller().quote.clone();
             let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
-            let results: Vec<Result<Option<PreparedChunk>>> = stream::iter(chunk_data)
+            let mut quote_stream = stream::iter(chunk_data)
                 .map(|content| {
                     let limiter = quote_limiter.clone();
                     async move {
@@ -949,14 +979,20 @@ impl Client {
                         .await
                     }
                 })
-                .buffer_unordered(quote_concurrency)
-                .collect()
-                .await;
+                .buffer_unordered(quote_concurrency);
 
             let mut prepared_chunks = Vec::with_capacity(spill.len());
-            for result in results {
+            let mut quoted = 0usize;
+            while let Some(result) = quote_stream.next().await {
                 if let Some(prepared) = result? {
                     prepared_chunks.push(prepared);
+                }
+                quoted += 1;
+                if let Some(ref tx) = progress {
+                    let _ = tx.try_send(UploadEvent::ChunkQuoted {
+                        quoted,
+                        total: chunk_count,
+                    });
                 }
             }
 
@@ -1014,14 +1050,35 @@ impl Client {
         prepared: PreparedUpload,
         tx_hash_map: &HashMap<QuoteHash, TxHash>,
     ) -> Result<FileUploadResult> {
+        self.finalize_upload_with_progress(prepared, tx_hash_map, None)
+            .await
+    }
+
+    /// Phase 2 of external-signer upload (wave-batch) with progress events.
+    ///
+    /// Same as [`Client::finalize_upload`] but emits [`UploadEvent::ChunkStored`]
+    /// on the provided channel as each chunk is successfully stored.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::finalize_upload`].
+    pub async fn finalize_upload_with_progress(
+        &self,
+        prepared: PreparedUpload,
+        tx_hash_map: &HashMap<QuoteHash, TxHash>,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
         let data_map_address = prepared.data_map_address;
         match prepared.payment_info {
             ExternalPaymentInfo::WaveBatch {
                 prepared_chunks,
                 payment_intent: _,
             } => {
+                let total_chunks = prepared_chunks.len();
                 let paid_chunks = finalize_batch_payment(prepared_chunks, tx_hash_map)?;
-                let wave_result = self.store_paid_chunks(paid_chunks).await;
+                let wave_result = self
+                    .store_paid_chunks_with_events(paid_chunks, progress.as_ref(), 0, total_chunks)
+                    .await;
                 if !wave_result.failed.is_empty() {
                     let failed_count = wave_result.failed.len();
                     let stored_count = wave_result.stored.len();
@@ -1073,6 +1130,24 @@ impl Client {
         prepared: PreparedUpload,
         winner_pool_hash: [u8; 32],
     ) -> Result<FileUploadResult> {
+        self.finalize_upload_merkle_with_progress(prepared, winner_pool_hash, None)
+            .await
+    }
+
+    /// Phase 2 of external-signer upload (merkle) with progress events.
+    ///
+    /// Same as [`Client::finalize_upload_merkle`] but emits [`UploadEvent::ChunkStored`]
+    /// on the provided channel as each chunk is successfully stored.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::finalize_upload_merkle`].
+    pub async fn finalize_upload_merkle_with_progress(
+        &self,
+        prepared: PreparedUpload,
+        winner_pool_hash: [u8; 32],
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
         let data_map_address = prepared.data_map_address;
         match prepared.payment_info {
             ExternalPaymentInfo::Merkle {
@@ -1082,7 +1157,12 @@ impl Client {
             } => {
                 let batch_result = finalize_merkle_batch(prepared_batch, winner_pool_hash)?;
                 let chunks_stored = self
-                    .merkle_upload_chunks(chunk_contents, chunk_addresses, &batch_result)
+                    .merkle_upload_chunks(
+                        chunk_contents,
+                        chunk_addresses,
+                        &batch_result,
+                        progress.as_ref(),
+                    )
                     .await?;
 
                 info!("External-signer merkle upload finalized: {chunks_stored} chunks stored");

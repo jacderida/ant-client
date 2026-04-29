@@ -531,17 +531,12 @@ impl Client {
     /// Retries failed chunks up to 3 times with exponential backoff (500ms, 1s, 2s).
     /// Returns a [`WaveResult`] with both successes and failures so callers can
     /// track partial progress instead of losing information about stored chunks.
-    pub(crate) async fn store_paid_chunks(&self, paid_chunks: Vec<PaidChunk>) -> WaveResult {
-        self.store_paid_chunks_with_events(paid_chunks, None, 0, 0)
-            .await
-    }
-
-    /// Same as [`Client::store_paid_chunks`] but sends [`UploadEvent::ChunkStored`]
-    /// as each chunk is successfully stored.
     ///
-    /// `stored_before` is the count of chunks already stored in previous waves,
-    /// so the event reports an accurate cumulative total. `total_chunks` is the
-    /// total across all waves.
+    /// When `progress` is `Some`, sends [`UploadEvent::ChunkStored`] as each
+    /// chunk is successfully stored. `stored_before` is the count of chunks
+    /// already stored in previous waves so the event reports an accurate
+    /// cumulative total; `total_chunks` is the total across all waves. Pass
+    /// `None`/0/0 when progress reporting is not needed.
     pub(crate) async fn store_paid_chunks_with_events(
         &self,
         paid_chunks: Vec<PaidChunk>,

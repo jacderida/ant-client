@@ -6,6 +6,7 @@
 
 use crate::data::client::adaptive::observe_op;
 use crate::data::client::classify_error;
+use crate::data::client::file::UploadEvent;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{
@@ -22,6 +23,7 @@ use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use xor_name::XorName;
 
@@ -531,6 +533,7 @@ impl Client {
         chunk_contents: Vec<Bytes>,
         addresses: Vec<[u8; 32]>,
         batch_result: &MerkleBatchPaymentResult,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
     ) -> Result<usize> {
         let mut stored = 0usize;
         let store_limiter = self.controller().store.clone();
@@ -566,6 +569,12 @@ impl Client {
         while let Some(result) = upload_stream.next().await {
             result?;
             stored += 1;
+            if let Some(tx) = progress {
+                let _ = tx.try_send(UploadEvent::ChunkStored {
+                    stored,
+                    total: batch_size,
+                });
+            }
         }
 
         Ok(stored)
@@ -643,7 +652,7 @@ mod send_assertions {
     )]
     async fn _merkle_upload_chunks_is_send(client: &Client) {
         let batch_result: MerkleBatchPaymentResult = todo!();
-        let fut = client.merkle_upload_chunks(Vec::new(), Vec::new(), &batch_result);
+        let fut = client.merkle_upload_chunks(Vec::new(), Vec::new(), &batch_result, None);
         _assert_send(&fut);
     }
 }
