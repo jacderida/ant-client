@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.2.1"
+version = "0.2.2-rc.1"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.2.2"
+version = "0.2.3-rc.1"
 dependencies = [
  "alloy",
  "ant-node",
