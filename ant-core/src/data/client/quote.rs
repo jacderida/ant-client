@@ -31,11 +31,14 @@ fn xor_distance(peer_id: &PeerId, target: &[u8; 32]) -> [u8; 32] {
     distance
 }
 
-/// ML-DSA-65 public key length in bytes. The storer rejects any quote whose
-/// `pub_key` is not exactly this length (saorsa-core's
-/// `peer_id_from_public_key_bytes` enforces it). We mirror the same length
-/// check here so the client drops obviously-malformed quotes before any
-/// hashing, payment, or close-group selection.
+/// ML-DSA-65 public key length in bytes. Mirrors the same value defined as
+/// `pub const ML_DSA_65_PUBLIC_KEY_SIZE` in `saorsa-pqc::pqc::types`, which
+/// the storer's `peer_id_from_public_key_bytes` enforces. We keep a local
+/// copy here rather than adding a direct `saorsa-pqc` dep — the constant
+/// is FIPS-mandated for ML-DSA-65 and won't change unless we change variant.
+///
+/// TODO: switch to `saorsa_pqc::pqc::types::ML_DSA_65_PUBLIC_KEY_SIZE` once
+/// `ant-protocol` re-exports it (`pqc::ops::ML_DSA_65_PUBLIC_KEY_SIZE`).
 const ML_DSA_PUB_KEY_LEN: usize = 1952;
 
 /// Check that a quote's `pub_key` is well-formed and BLAKE3-hashes to the
@@ -150,6 +153,21 @@ fn classify_quote_response(
     let price = payment_quote.price;
     debug!("Received quote from {peer_id}: price = {price}");
     Ok((payment_quote, price))
+}
+
+/// Map a per-peer quote-collection outcome to the AIMD-cache success flag.
+///
+/// `Ok(_)` and `AlreadyStored` are both *benign* outcomes — the peer is
+/// reachable and well-behaved — so we record them as successes (recording
+/// a smooth RTT). Every other variant (network/timeout/protocol/
+/// serialization, plus the three storer-rejecting variants
+/// `BadQuoteBinding` / `BadQuoteContent` / `BadQuoteSignature`) records
+/// as a failure so the local AIMD bootstrap cache learns to deprioritize
+/// peers that don't help us upload.
+///
+/// Pulled out of the per-peer closure for unit-testing.
+fn quote_outcome_is_success(result: &std::result::Result<(PaymentQuote, Amount), Error>) -> bool {
+    matches!(result, Ok(_) | Err(Error::AlreadyStored))
 }
 
 /// Drop quotes whose `pub_key` does not BLAKE3-hash to the peer that supplied
@@ -282,12 +300,8 @@ impl Client {
                 .await;
 
                 // Record the per-peer outcome for the AIMD bootstrap cache.
-                // A bad-binding response is treated as a failure so the local
-                // peer cache learns to deprioritize misbehaving peers and we
-                // don't keep re-asking them on every upload. AlreadyStored is
-                // a benign outcome (peer is reachable and well-behaved), so
-                // we count it as success.
-                let success = matches!(&result, Ok(_) | Err(Error::AlreadyStored));
+                // See `quote_outcome_is_success` for the full classification.
+                let success = quote_outcome_is_success(&result);
                 let rtt_ms = success.then(|| start.elapsed().as_millis() as u64);
                 record_peer_outcome(&node_clone, peer_id_clone, &addrs_clone, success, rtt_ms)
                     .await;
@@ -1000,6 +1014,81 @@ mod tests {
             matches!(result, Err(Error::BadQuoteContent { .. })),
             "wrong-content peer must NOT be allowed to cast an AlreadyStored vote"
         );
+    }
+
+    // ============================================================
+    // AIMD attribution: every error variant is classified correctly
+    // for `record_peer_outcome` so misbehaving peers are deprioritized
+    // and reachable-but-already-storing peers stay reputable.
+    // ============================================================
+
+    #[test]
+    fn aimd_success_for_ok_result() {
+        let (_, _, quote, _) = good_quote_for(&TEST_ADDR);
+        let result: std::result::Result<(PaymentQuote, Amount), Error> =
+            Ok((quote.clone(), quote.price));
+        assert!(quote_outcome_is_success(&result));
+    }
+
+    #[test]
+    fn aimd_success_for_already_stored() {
+        let result: std::result::Result<(PaymentQuote, Amount), Error> = Err(Error::AlreadyStored);
+        assert!(
+            quote_outcome_is_success(&result),
+            "an honest peer reporting already_stored is a benign outcome — \
+             the peer is reachable and well-behaved, so the AIMD cache must \
+             keep them at high reputation"
+        );
+    }
+
+    #[test]
+    fn aimd_failure_for_bad_quote_binding() {
+        let result: std::result::Result<(PaymentQuote, Amount), Error> =
+            Err(Error::BadQuoteBinding {
+                peer_id: "abc123".to_string(),
+                detail: "test".to_string(),
+            });
+        assert!(
+            !quote_outcome_is_success(&result),
+            "BadQuoteBinding peers must be marked as failures so the AIMD \
+             bootstrap cache learns to stop asking them on every upload"
+        );
+    }
+
+    #[test]
+    fn aimd_failure_for_bad_quote_signature() {
+        let result: std::result::Result<(PaymentQuote, Amount), Error> =
+            Err(Error::BadQuoteSignature {
+                peer_id: "abc123".to_string(),
+            });
+        assert!(!quote_outcome_is_success(&result));
+    }
+
+    #[test]
+    fn aimd_failure_for_bad_quote_content() {
+        let result: std::result::Result<(PaymentQuote, Amount), Error> =
+            Err(Error::BadQuoteContent {
+                peer_id: "abc123".to_string(),
+                expected: "00".to_string(),
+                actual: "ff".to_string(),
+            });
+        assert!(!quote_outcome_is_success(&result));
+    }
+
+    #[test]
+    fn aimd_failure_for_network_and_timeout_and_protocol_and_serialization() {
+        for err in [
+            Error::Network("net".to_string()),
+            Error::Timeout("to".to_string()),
+            Error::Protocol("proto".to_string()),
+            Error::Serialization("ser".to_string()),
+        ] {
+            let result: std::result::Result<(PaymentQuote, Amount), Error> = Err(err);
+            assert!(
+                !quote_outcome_is_success(&result),
+                "network-class errors must be classified as failures: {result:?}"
+            );
+        }
     }
 
     /// Independent attestation: round-trip a "would be rejected by storer"
