@@ -9,8 +9,8 @@ use crate::data::error::{Error, Result};
 use ant_protocol::evm::{Amount, PaymentQuote};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{
-    send_and_await_chunk_response, ChunkMessage, ChunkMessageBody, ChunkQuoteRequest,
-    ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
+    compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
+    ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::{Duration, Instant};
@@ -28,6 +28,43 @@ fn xor_distance(peer_id: &PeerId, target: &[u8; 32]) -> [u8; 32] {
         *d = pb ^ target[i];
     }
     distance
+}
+
+/// Check that a quote's `pub_key` BLAKE3-hashes to the claimed `peer_id`.
+///
+/// The storer node enforces this via `validate_peer_bindings` in
+/// `ant-node/src/payment/verifier.rs`: every quote inside a `ProofOfPayment`
+/// must satisfy `BLAKE3(pub_key) == peer_id`. If even one of the
+/// `CLOSE_GROUP_SIZE` quotes fails the check, the storer rejects the entire
+/// proof and the chunk's payment is wasted.
+///
+/// This mirrors the storer-side check so we can drop bad quotes before
+/// committing payment, instead of paying for a proof we know will be
+/// rejected. Mismatches happen when an operator runs two co-located node
+/// identities with crossed quote-signing keys.
+fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
+    compute_address(&quote.pub_key) == *peer_id.as_bytes()
+}
+
+/// Drop quotes whose `pub_key` does not BLAKE3-hash to the peer that supplied
+/// them. Logs each dropped quote at WARN.
+fn drop_quotes_with_bad_bindings(
+    quotes: &mut Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>,
+) -> usize {
+    let before = quotes.len();
+    quotes.retain(|(peer_id, _, quote, _)| {
+        if quote_binding_is_valid(peer_id, quote) {
+            true
+        } else {
+            warn!(
+                "Dropping quote from peer {peer_id} — quote.pub_key BLAKE3 mismatch \
+                 (peer is signing quotes with another peer's key); the storer would \
+                 reject this proof"
+            );
+            false
+        }
+    });
+    before - quotes.len()
 }
 
 impl Client {
@@ -200,6 +237,17 @@ impl Client {
             Ok(Ok(())) => {}
         }
 
+        let bad_dropped = drop_quotes_with_bad_bindings(&mut quotes);
+        if bad_dropped > 0 {
+            info!(
+                "Dropped {bad_dropped} quotes with mismatched peer bindings for address {} \
+                 ({} good quotes remain from {} responders)",
+                hex::encode(address),
+                quotes.len(),
+                quotes.len() + bad_dropped,
+            );
+        }
+
         // Check already-stored: only count votes from the closest CLOSE_GROUP_SIZE peers.
         if !already_stored_peers.is_empty() {
             let mut all_peers_by_distance: Vec<(bool, [u8; 32])> = Vec::new();
@@ -252,5 +300,144 @@ impl Client {
             "Got {quote_count} quotes, need {CLOSE_GROUP_SIZE} ({total_responses} responses: {already_stored_count} already_stored, {failure_count} failed). Failures: [{}]",
             failures.join("; ")
         )))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ant_protocol::evm::RewardsAddress;
+    use std::time::SystemTime;
+    use xor_name::XorName;
+
+    /// Build a `(PeerId, MultiAddrs, PaymentQuote, Amount)` tuple where the
+    /// quote's `pub_key` correctly BLAKE3-hashes to the peer ID.
+    fn good_quote(pub_key: Vec<u8>) -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount) {
+        let peer_id_bytes = compute_address(&pub_key);
+        let peer_id = PeerId::from_bytes(peer_id_bytes);
+        let quote = PaymentQuote {
+            content: XorName([0u8; 32]),
+            timestamp: SystemTime::UNIX_EPOCH,
+            price: Amount::ZERO,
+            rewards_address: RewardsAddress::new([0u8; 20]),
+            pub_key,
+            signature: Vec::new(),
+        };
+        (peer_id, Vec::new(), quote, Amount::ZERO)
+    }
+
+    /// Build a tuple where the quote's `pub_key` BLAKE3-hashes to a different
+    /// peer ID than the one we claim. This is the "misbehaving operator
+    /// running two co-located identities with crossed quote-signing keys"
+    /// shape that triggers the storer-side rejection.
+    fn bad_quote(
+        claimed_pub_key: Vec<u8>,
+        signed_with_pub_key: Vec<u8>,
+    ) -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount) {
+        // Peer ID is BLAKE3 of the *claimed* identity's public key…
+        let peer_id_bytes = compute_address(&claimed_pub_key);
+        let peer_id = PeerId::from_bytes(peer_id_bytes);
+        // …but the quote carries a *different* public key.
+        let quote = PaymentQuote {
+            content: XorName([0u8; 32]),
+            timestamp: SystemTime::UNIX_EPOCH,
+            price: Amount::ZERO,
+            rewards_address: RewardsAddress::new([0u8; 20]),
+            pub_key: signed_with_pub_key,
+            signature: Vec::new(),
+        };
+        (peer_id, Vec::new(), quote, Amount::ZERO)
+    }
+
+    #[test]
+    fn quote_binding_accepts_matched_pubkey() {
+        let (peer_id, _, quote, _) = good_quote(b"valid pub_key bytes".to_vec());
+        assert!(quote_binding_is_valid(&peer_id, &quote));
+    }
+
+    #[test]
+    fn quote_binding_rejects_mismatched_pubkey() {
+        let (peer_id, _, quote, _) = bad_quote(
+            b"claimed identity pub_key".to_vec(),
+            b"a different identity's pub_key".to_vec(),
+        );
+        assert!(!quote_binding_is_valid(&peer_id, &quote));
+    }
+
+    #[test]
+    fn drop_quotes_with_bad_bindings_leaves_only_good_ones() {
+        let mut quotes = vec![
+            good_quote(b"peer-A pub_key".to_vec()),
+            bad_quote(b"peer-B pub_key".to_vec(), b"peer-X pub_key".to_vec()),
+            good_quote(b"peer-C pub_key".to_vec()),
+            bad_quote(b"peer-D pub_key".to_vec(), b"peer-Y pub_key".to_vec()),
+            good_quote(b"peer-E pub_key".to_vec()),
+        ];
+
+        let dropped = drop_quotes_with_bad_bindings(&mut quotes);
+
+        assert_eq!(dropped, 2, "two bad-binding quotes should be dropped");
+        assert_eq!(quotes.len(), 3, "three good quotes should remain");
+        for (peer_id, _, quote, _) in &quotes {
+            assert!(
+                quote_binding_is_valid(peer_id, quote),
+                "every retained quote must have a valid binding"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_quotes_with_bad_bindings_is_noop_when_all_good() {
+        let mut quotes: Vec<_> = (0..5)
+            .map(|i| good_quote(format!("peer-{i} pub_key").into_bytes()))
+            .collect();
+        let before = quotes.len();
+        let dropped = drop_quotes_with_bad_bindings(&mut quotes);
+        assert_eq!(dropped, 0);
+        assert_eq!(quotes.len(), before);
+    }
+
+    /// Repro of the production failure from 2026-04-30 testnet runs:
+    ///
+    /// An external operator on `75.48.86.24` ran two co-located ant-node
+    /// identities (peer `0755ecb55b…` and peer `073db92f…`) that crossed
+    /// their quote-signing keys. Every chunk whose XOR-closest set
+    /// happened to include peer `0755ecb5` got a payment proof with one
+    /// malformed quote, and the storer's `validate_peer_bindings` rejected
+    /// the entire close-group proof — burning the chunk's payment.
+    ///
+    /// With the over-query buffer (`2x CLOSE_GROUP_SIZE` peers) and the
+    /// drop-bad-bindings filter, the misbehaving peer is now removed
+    /// before payment, leaving `CLOSE_GROUP_SIZE` good quotes from the
+    /// remaining over-queried peers.
+    #[test]
+    fn repro_2026_04_30_one_bad_peer_in_over_query_set() {
+        // Simulate the over-query response: 14 peers, one of them is the
+        // misbehaving operator's `0755ecb5` identity that signs with
+        // `073db92f`'s key.
+        let over_query_count = CLOSE_GROUP_SIZE * 2;
+        let mut quotes: Vec<_> = (0..over_query_count - 1)
+            .map(|i| good_quote(format!("honest-peer-{i}").into_bytes()))
+            .collect();
+        // Splice the bad peer somewhere in the middle.
+        quotes.insert(
+            over_query_count / 2,
+            bad_quote(
+                b"0755ecb5_claimed_identity".to_vec(),
+                b"073db92f_signing_identity".to_vec(),
+            ),
+        );
+        assert_eq!(quotes.len(), over_query_count);
+
+        let dropped = drop_quotes_with_bad_bindings(&mut quotes);
+
+        assert_eq!(dropped, 1);
+        assert!(
+            quotes.len() >= CLOSE_GROUP_SIZE,
+            "after dropping the misbehaving peer we must still have \
+             CLOSE_GROUP_SIZE good quotes — that's the whole point of \
+             over-querying 2x"
+        );
     }
 }
