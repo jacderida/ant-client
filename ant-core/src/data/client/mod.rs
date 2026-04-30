@@ -66,9 +66,7 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         | Error::Config(_)
         | Error::InsufficientDiskSpace(_)
         | Error::CostEstimationInconclusive(_)
-        | Error::BadQuoteBinding { .. }
-        | Error::BadQuoteSignature { .. }
-        | Error::BadQuoteContent { .. } => Outcome::ApplicationError,
+        | Error::BadQuoteBinding { .. } => Outcome::ApplicationError,
     }
 }
 
@@ -607,9 +605,7 @@ mod tests {
             | Error::InsufficientDiskSpace(_)
             | Error::CostEstimationInconclusive(_)
             | Error::PartialUpload { .. }
-            | Error::BadQuoteBinding { .. }
-            | Error::BadQuoteSignature { .. }
-            | Error::BadQuoteContent { .. } => (),
+            | Error::BadQuoteBinding { .. } => (),
         };
     }
 }

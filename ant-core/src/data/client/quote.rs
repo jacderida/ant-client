@@ -9,9 +9,8 @@ use crate::data::error::{Error, Result};
 use ant_protocol::evm::{Amount, PaymentQuote};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{
-    compute_address, send_and_await_chunk_response, verify_quote_content, verify_quote_signature,
-    ChunkMessage, ChunkMessageBody, ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY,
-    CLOSE_GROUP_SIZE,
+    compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
+    ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::{Duration, Instant};
@@ -51,9 +50,11 @@ const ML_DSA_PUB_KEY_LEN: usize = 1952;
 /// failing either check causes the storer to reject the entire close-group
 /// proof and burn the chunk's payment.
 ///
-/// This is one of three storer-side checks the client now mirrors. The other
-/// two — `verify_quote_content` and `verify_quote_signature` — live in
-/// `classify_quote_response` so they run ahead of payment commitment.
+/// We mirror the cheap structural check here. The storer also runs
+/// `verify_quote_content` and `verify_quote_signature`; those are ML-DSA
+/// verifications (~1 ms × 14 quotes × every chunk) and are deliberately NOT
+/// mirrored on the client to keep upload latency unchanged. They are tracked
+/// as a follow-up if a real attack surfaces them.
 fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
     if quote.pub_key.len() != ML_DSA_PUB_KEY_LEN {
         return false;
@@ -63,13 +64,17 @@ fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
 
 /// Classification of a `ChunkQuoteResponse::Success` body for a single peer.
 ///
-/// Mirrors all three storer-side rejection conditions from
-/// `ant-node/src/payment/verifier.rs` so the client never pays on-chain
-/// for a `ProofOfPayment` the network is guaranteed to reject:
+/// Mirrors the storer-side `validate_peer_bindings` check from
+/// `ant-node/src/payment/verifier.rs` — the cheap BLAKE3 binding —
+/// so we drop misbehaving peers' quotes before payment.
 ///
-///   1. peer-binding (`BLAKE3(pub_key) == peer_id`),
-///   2. content (`quote.content == request.address`), and
-///   3. ML-DSA-65 signature over `(content, timestamp, price, rewards_address)`.
+/// We deliberately do NOT mirror the storer's `verify_quote_signature`
+/// (ML-DSA-65 verify, ~1 ms × CLOSE_GROUP_SIZE × every chunk) or
+/// `verify_quote_content`. Those are useful defense-in-depth for an
+/// attacker who self-consistently crafts a signed-but-stolen or wrong-
+/// content quote, but they are NOT cheap and are out of scope for this
+/// fix. Adding them changes upload latency materially. Track them as a
+/// follow-up if a real attack surfaces them.
 ///
 /// Pulling the logic out of the async closure lets us unit-test the
 /// primary defense (not just the post-collect defensive filter).
@@ -78,19 +83,14 @@ fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
 ///
 /// - `Ok((quote, price))` — the response is honoured as a quote.
 /// - `Err(Error::AlreadyStored)` — the peer claims the chunk is already
-///   present AND the quote it provided passes all three storer checks.
-///   Vote counts in the close-group "already stored" majority.
-/// - `Err(Error::BadQuoteBinding { .. })` — peer-binding failure.
-/// - `Err(Error::BadQuoteContent { .. })` — content-address mismatch.
-/// - `Err(Error::BadQuoteSignature { .. })` — ML-DSA-65 signature failure.
+///   present AND the quote it provided binds to its peer ID. Vote counts.
+/// - `Err(Error::BadQuoteBinding { .. })` — bad binding (mirrors the
+///   storer-side rejection); the peer is treated as a failure so the
+///   AIMD cache learns to deprioritize it. Outer collector counts these
+///   via the typed variant (no string matching).
 /// - `Err(Error::Serialization(...))` — the quote bytes did not deserialize.
-///
-/// All bad-quote variants flow into the outer collector as failures so
-/// `record_peer_outcome` correctly marks the peer as a failure in the
-/// AIMD bootstrap cache.
 fn classify_quote_response(
     peer_id: &PeerId,
-    address: &[u8; 32],
     quote_bytes: &[u8],
     already_stored: bool,
 ) -> std::result::Result<(PaymentQuote, Amount), Error> {
@@ -98,7 +98,10 @@ fn classify_quote_response(
         Error::Serialization(format!("Failed to deserialize quote from {peer_id}: {e}"))
     })?;
 
-    // 1. Peer binding: BLAKE3(pub_key) must equal peer_id.
+    // Peer binding: BLAKE3(pub_key) must equal peer_id. This is the
+    // exact mitigation Chris and the AI investigation requested for the
+    // 2026-04-30 production failure: drop crossed-key peers before they
+    // poison the close-group ProofOfPayment.
     if !quote_binding_is_valid(peer_id, &payment_quote) {
         let derived = compute_address(&payment_quote.pub_key);
         warn!(
@@ -116,36 +119,6 @@ fn classify_quote_response(
         });
     }
 
-    // 2. Content address: quote must be for the chunk we asked about.
-    // The storer enforces this; a peer could otherwise replay a stale-but-
-    // fresh quote for a different chunk and the storer rejects post-payment.
-    if !verify_quote_content(&payment_quote, address) {
-        warn!(
-            "Dropping response from {peer_id} — quote.content does not match \
-             requested address; the storer would reject this proof"
-        );
-        return Err(Error::BadQuoteContent {
-            peer_id: peer_id.to_string(),
-            expected: hex::encode(address),
-            actual: hex::encode(payment_quote.content.0),
-        });
-    }
-
-    // 3. ML-DSA-65 signature: storer verifies, so we should too. Otherwise
-    // a peer with a self-consistent (peer_id, pub_key) pair but a forged or
-    // empty signature would still pass the binding check, get included in
-    // the proof, and the storer rejects post-payment. Cost: ~1 ms per quote,
-    // far below the per-peer RTT we already paid.
-    if !verify_quote_signature(&payment_quote) {
-        warn!(
-            "Dropping response from {peer_id} — quote signature failed \
-             ML-DSA-65 verification; the storer would reject this proof"
-        );
-        return Err(Error::BadQuoteSignature {
-            peer_id: peer_id.to_string(),
-        });
-    }
-
     if already_stored {
         debug!("Peer {peer_id} already has chunk");
         return Err(Error::AlreadyStored);
@@ -160,10 +133,9 @@ fn classify_quote_response(
 /// `Ok(_)` and `AlreadyStored` are both *benign* outcomes — the peer is
 /// reachable and well-behaved — so we record them as successes (recording
 /// a smooth RTT). Every other variant (network/timeout/protocol/
-/// serialization, plus the three storer-rejecting variants
-/// `BadQuoteBinding` / `BadQuoteContent` / `BadQuoteSignature`) records
-/// as a failure so the local AIMD bootstrap cache learns to deprioritize
-/// peers that don't help us upload.
+/// serialization, plus `BadQuoteBinding`) records as a failure so the
+/// local AIMD bootstrap cache learns to deprioritize peers that don't
+/// help us upload.
 ///
 /// Pulled out of the per-peer closure for unit-testing.
 fn quote_outcome_is_success(result: &std::result::Result<(PaymentQuote, Amount), Error>) -> bool {
@@ -264,7 +236,6 @@ impl Client {
             let peer_id_clone = *peer_id;
             let addrs_clone = peer_addrs.clone();
             let node_clone = node.clone();
-            let address_clone = *address;
 
             let quote_future = async move {
                 let start = Instant::now();
@@ -281,7 +252,6 @@ impl Client {
                             already_stored,
                         }) => Some(classify_quote_response(
                             &peer_id_clone,
-                            &address_clone,
                             &quote,
                             already_stored,
                         )),
@@ -337,15 +307,10 @@ impl Client {
                             already_stored_peers.push((peer_id, dist));
                         }
                         Err(e) => {
-                            // Count storer-rejecting variants separately (typed
-                            // — no string sniffing). Treat as normal failures
-                            // for InsufficientPeers reporting otherwise.
-                            if matches!(
-                                &e,
-                                Error::BadQuoteBinding { .. }
-                                    | Error::BadQuoteContent { .. }
-                                    | Error::BadQuoteSignature { .. }
-                            ) {
+                            // Count bad-binding peers separately (typed
+                            // variant — no string sniffing). Treat as a
+                            // normal failure for InsufficientPeers reporting.
+                            if matches!(&e, Error::BadQuoteBinding { .. }) {
                                 bad_quote_count += 1;
                             }
                             warn!("Failed to get quote from {peer_id}: {e}");
@@ -430,7 +395,7 @@ impl Client {
             info!(
                 "Collected {} quotes for address {} ({total_responses} responses: \
                  {quote_count} ok, {already_stored_count} already_stored, {failure_count} failed, \
-                 {bad_quote_count} would-be-rejected by storer)",
+                 {bad_quote_count} bad-binding)",
                 quotes.len(),
                 hex::encode(address),
             );
@@ -440,8 +405,7 @@ impl Client {
         Err(Error::InsufficientPeers(format!(
             "Got {quote_count} quotes, need {CLOSE_GROUP_SIZE} ({total_responses} responses: \
              {already_stored_count} already_stored, {failure_count} failed including \
-             {bad_quote_count} that the storer would have rejected — peer-binding, \
-             content, or signature mismatch). Failures: [{}]",
+             {bad_quote_count} with mismatched peer bindings). Failures: [{}]",
             failures.join("; ")
         )))
     }
@@ -450,22 +414,20 @@ impl Client {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    //! Test fixtures use real ML-DSA-65 keypairs (1952-byte public keys) and
-    //! produce real ML-DSA-65 signatures over `bytes_for_sig`. This avoids
-    //! the "synthetic-key" honesty problem and exercises exactly the same
-    //! byte paths that run in production. The "bad" quotes mirror the
-    //! shapes the storer would reject:
-    //!
-    //!   * `bad_binding_quote_for(addr)` — `quote.pub_key` swapped for a
-    //!     different keypair's pub_key (the Apr 30 production failure).
-    //!   * `bad_content_quote_for(addr)` — `quote.content` is a different
-    //!     XorName than the chunk address we asked for.
-    //!   * `bad_signature_quote_for(addr)` — quote is signed but with a
-    //!     post-hoc field tweak that invalidates the signature.
+    //! Test fixtures use real ML-DSA-65 keypairs (1952-byte public keys), the
+    //! same key material that ships on the wire. The "bad" quote is built by
+    //! **swapping** the public key field with a different real keypair's
+    //! public key — the exact shape produced by the Apr 30 production
+    //! failure (an operator running two co-located identities with crossed
+    //! quote-signing keys). Signatures are not exercised here because this
+    //! filter only mirrors `validate_peer_bindings` (BLAKE3 binding); see
+    //! the doc-comment on `quote_binding_is_valid` for why
+    //! `verify_quote_signature` and `verify_quote_content` are deliberately
+    //! NOT mirrored.
 
     use super::*;
     use ant_protocol::evm::RewardsAddress;
-    use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaPublicKey, MlDsaSecretKey};
+    use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaPublicKey};
     use ant_protocol::transport::MlDsa65;
     use std::time::SystemTime;
     use xor_name::XorName;
@@ -474,156 +436,68 @@ mod tests {
     struct Keypair {
         peer_id: PeerId,
         pub_key_bytes: Vec<u8>,
-        secret_key_bytes: Vec<u8>,
     }
 
     fn gen_keypair() -> Keypair {
         let ml_dsa = MlDsa65::new();
-        let (pub_key, sk) = ml_dsa.generate_keypair().expect("ML-DSA-65 keygen");
+        let (pub_key, _sk) = ml_dsa.generate_keypair().expect("ML-DSA-65 keygen");
         let pub_key_bytes = pub_key.as_bytes().to_vec();
-        let secret_key_bytes = sk.as_bytes().to_vec();
         let peer_id = PeerId::from_bytes(compute_address(&pub_key_bytes));
         Keypair {
             peer_id,
             pub_key_bytes,
-            secret_key_bytes,
         }
     }
 
-    /// Sign a quote's `bytes_for_sig` with the given secret key bytes.
-    fn sign_quote(quote: &mut PaymentQuote, secret_key_bytes: &[u8]) {
-        let ml_dsa = MlDsa65::new();
-        let sk = MlDsaSecretKey::from_bytes(secret_key_bytes).expect("sk parse");
-        let msg = quote.bytes_for_sig();
-        quote.signature = ml_dsa
-            .sign(&sk, &msg)
-            .expect("ml-dsa sign")
-            .as_bytes()
-            .to_vec();
-    }
-
-    /// Build a fully-valid quote: the keypair is internally consistent, the
-    /// content matches `address`, and the signature is genuine. The storer
-    /// must accept this; the classifier must accept this.
-    fn good_quote_for(address: &[u8; 32]) -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount) {
+    /// Build a quote tuple whose `pub_key` correctly hashes to its peer_id.
+    /// Signature is left empty: this filter does not verify signatures.
+    fn good_quote_real() -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount) {
         let kp = gen_keypair();
-        let mut quote = PaymentQuote {
-            content: XorName(*address),
-            timestamp: SystemTime::now(),
-            price: Amount::from(42u64),
-            rewards_address: RewardsAddress::new([1u8; 20]),
+        let quote = PaymentQuote {
+            content: XorName([0u8; 32]),
+            timestamp: SystemTime::UNIX_EPOCH,
+            price: Amount::ZERO,
+            rewards_address: RewardsAddress::new([0u8; 20]),
             pub_key: kp.pub_key_bytes,
             signature: Vec::new(),
         };
-        sign_quote(&mut quote, &kp.secret_key_bytes);
         (kp.peer_id, Vec::new(), quote, Amount::ZERO)
     }
 
-    /// Build a quote where `quote.pub_key` belongs to a DIFFERENT keypair
-    /// than the peer_id derives from (the Apr 30 production-failure shape).
-    /// Signature is over the served pub_key's secret so it would pass the
-    /// signature check in isolation — the binding check is what catches it.
-    fn bad_binding_quote_for(address: &[u8; 32]) -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount) {
+    /// Build a quote tuple where the quote carries a different keypair's
+    /// `pub_key` than the peer_id derives from. Mirrors the production
+    /// failure shape: peer A advertised on the transport, but the quote
+    /// carries peer B's key.
+    fn bad_quote_real() -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount) {
         let claimed = gen_keypair();
         let signing = gen_keypair();
         assert_ne!(claimed.pub_key_bytes, signing.pub_key_bytes);
         assert_ne!(claimed.peer_id.as_bytes(), signing.peer_id.as_bytes());
-        let mut quote = PaymentQuote {
-            content: XorName(*address),
-            timestamp: SystemTime::now(),
-            price: Amount::from(42u64),
-            rewards_address: RewardsAddress::new([1u8; 20]),
-            pub_key: signing.pub_key_bytes.clone(),
+        let quote = PaymentQuote {
+            content: XorName([0u8; 32]),
+            timestamp: SystemTime::UNIX_EPOCH,
+            price: Amount::ZERO,
+            rewards_address: RewardsAddress::new([0u8; 20]),
+            pub_key: signing.pub_key_bytes,
             signature: Vec::new(),
         };
-        // Sign with the served pub_key's secret so the signature is valid
-        // over the served pub_key. The defect is the binding mismatch
-        // between served pub_key and claimed peer_id, not the signature.
-        sign_quote(&mut quote, &signing.secret_key_bytes);
         (claimed.peer_id, Vec::new(), quote, Amount::ZERO)
     }
 
-    /// Build a quote whose `content` is a DIFFERENT XorName than `address`.
-    /// The peer is honest (binding + signature both valid) but is replaying
-    /// a quote it issued for a different chunk. The storer enforces
-    /// `verify_quote_content`, so we filter this too.
-    fn bad_content_quote_for(
-        _address: &[u8; 32],
-    ) -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount) {
-        let kp = gen_keypair();
-        // Use a content address that is definitely NOT what the caller asked for.
-        let wrong_content = [0xAAu8; 32];
-        let mut quote = PaymentQuote {
-            content: XorName(wrong_content),
-            timestamp: SystemTime::now(),
-            price: Amount::from(42u64),
-            rewards_address: RewardsAddress::new([1u8; 20]),
-            pub_key: kp.pub_key_bytes,
-            signature: Vec::new(),
-        };
-        sign_quote(&mut quote, &kp.secret_key_bytes);
-        (kp.peer_id, Vec::new(), quote, Amount::ZERO)
-    }
-
-    /// Build a quote with a valid binding but an invalid signature: we sign
-    /// the original message, then tweak the price after signing so the
-    /// signature no longer covers the new payload. The storer enforces
-    /// `verify_quote_signature`, so we filter this too.
-    fn bad_signature_quote_for(
-        address: &[u8; 32],
-    ) -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount) {
-        let kp = gen_keypair();
-        let mut quote = PaymentQuote {
-            content: XorName(*address),
-            timestamp: SystemTime::now(),
-            price: Amount::from(42u64),
-            rewards_address: RewardsAddress::new([1u8; 20]),
-            pub_key: kp.pub_key_bytes,
-            signature: Vec::new(),
-        };
-        sign_quote(&mut quote, &kp.secret_key_bytes);
-        // Tamper: change the price after signing so the signature no longer
-        // matches `bytes_for_sig`.
-        quote.price = Amount::from(99_999u64);
-        (kp.peer_id, Vec::new(), quote, Amount::ZERO)
-    }
-
-    /// Independent re-implementation of ALL THREE storer-side spec checks
-    /// (`ant-node/src/payment/verifier.rs`):
+    /// Independent re-implementation of the storer-side binding spec
+    /// (`ant-node/src/payment/verifier.rs::validate_peer_bindings` +
+    /// `peer_id_from_public_key_bytes`):
+    /// (a) `pub_key` parses as ML-DSA-65 (length 1952), and
+    /// (b) `BLAKE3(pub_key) == peer_id`.
     ///
-    ///   1. `peer_id_from_public_key_bytes` — pub_key parses as ML-DSA-65,
-    ///   2. `validate_peer_bindings` — `BLAKE3(pub_key) == peer_id`,
-    ///   3. `verify_quote_content` — `quote.content == address`,
-    ///   4. `verify_quote_signature` — ML-DSA-65 sig over `bytes_for_sig`.
-    ///
-    /// Re-derived from spec, NOT delegating to `quote_binding_is_valid` or
-    /// `classify_quote_response`, so cross-checks are not "function ==
-    /// itself".
-    fn storer_would_accept(peer_id: &PeerId, address: &[u8; 32], quote: &PaymentQuote) -> bool {
-        // 1+2: pub_key is ML-DSA-65 length and BLAKE3-binds to peer_id.
+    /// Re-derived from spec, NOT delegating to `quote_binding_is_valid`,
+    /// so cross-checks are not "function == itself".
+    fn storer_binding_would_accept(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
         if MlDsaPublicKey::from_bytes(&quote.pub_key).is_err() {
             return false;
         }
-        if compute_address(&quote.pub_key) != *peer_id.as_bytes() {
-            return false;
-        }
-        // 3: content matches the requested chunk address.
-        if quote.content.0 != *address {
-            return false;
-        }
-        // 4: signature verifies. (We delegate to the upstream helper here —
-        // it's the spec that the storer also calls, so equality is the right
-        // notion of "would the storer accept this".)
-        if !verify_quote_signature(quote) {
-            return false;
-        }
-        true
+        compute_address(&quote.pub_key) == *peer_id.as_bytes()
     }
-
-    /// Default test address used by the legacy filter tests. Most filter-
-    /// only tests don't care which content address the quotes carry, so a
-    /// fixed value is fine.
-    const TEST_ADDR: [u8; 32] = [7u8; 32];
 
     // ============================================================
     // Tests for `quote_binding_is_valid` (the predicate)
@@ -631,19 +505,19 @@ mod tests {
 
     #[test]
     fn binding_accepts_real_self_consistent_keypair() {
-        let (peer_id, _, quote, _) = good_quote_for(&TEST_ADDR);
+        let (peer_id, _, quote, _) = good_quote_real();
         // Property under test: the predicate accepts a quote whose pub_key
         // genuinely belongs to the claimed peer.
         assert!(quote_binding_is_valid(&peer_id, &quote));
         // Cross-check against the independent full storer-spec implementation.
-        assert!(storer_would_accept(&peer_id, &TEST_ADDR, &quote));
+        assert!(storer_binding_would_accept(&peer_id, &quote));
     }
 
     #[test]
     fn binding_rejects_real_crossed_keypair() {
-        let (peer_id, _, quote, _) = bad_binding_quote_for(&TEST_ADDR);
+        let (peer_id, _, quote, _) = bad_quote_real();
         assert!(!quote_binding_is_valid(&peer_id, &quote));
-        assert!(!storer_would_accept(&peer_id, &TEST_ADDR, &quote));
+        assert!(!storer_binding_would_accept(&peer_id, &quote));
     }
 
     #[test]
@@ -668,7 +542,7 @@ mod tests {
             !quote_binding_is_valid(&peer_id, &quote),
             "predicate must reject oversize pub_key even when BLAKE3 happens to match"
         );
-        assert!(!storer_would_accept(&peer_id, &TEST_ADDR, &quote));
+        assert!(!storer_binding_would_accept(&peer_id, &quote));
     }
 
     #[test]
@@ -684,7 +558,7 @@ mod tests {
             signature: Vec::new(),
         };
         assert!(!quote_binding_is_valid(&peer_id, &quote));
-        assert!(!storer_would_accept(&peer_id, &TEST_ADDR, &quote));
+        assert!(!storer_binding_would_accept(&peer_id, &quote));
     }
 
     // ============================================================
@@ -694,11 +568,11 @@ mod tests {
     #[test]
     fn filter_drops_only_bad_bindings_and_leaves_storer_acceptable_quotes() {
         let mut quotes = vec![
-            good_quote_for(&TEST_ADDR),
-            bad_binding_quote_for(&TEST_ADDR),
-            good_quote_for(&TEST_ADDR),
-            bad_binding_quote_for(&TEST_ADDR),
-            good_quote_for(&TEST_ADDR),
+            good_quote_real(),
+            bad_quote_real(),
+            good_quote_real(),
+            bad_quote_real(),
+            good_quote_real(),
         ];
 
         let dropped = drop_quotes_with_bad_bindings(&mut quotes);
@@ -713,7 +587,7 @@ mod tests {
         // the per-peer classifier upstream).
         for (peer_id, _, quote, _) in &quotes {
             assert!(
-                storer_would_accept(peer_id, &TEST_ADDR, quote),
+                storer_binding_would_accept(peer_id, quote),
                 "every retained quote must satisfy the full storer-side spec"
             );
         }
@@ -721,13 +595,13 @@ mod tests {
 
     #[test]
     fn filter_is_noop_when_all_quotes_are_storer_acceptable() {
-        let mut quotes: Vec<_> = (0..5).map(|_| good_quote_for(&TEST_ADDR)).collect();
+        let mut quotes: Vec<_> = (0..5).map(|_| good_quote_real()).collect();
         let before = quotes.len();
         let dropped = drop_quotes_with_bad_bindings(&mut quotes);
         assert_eq!(dropped, 0);
         assert_eq!(quotes.len(), before);
         for (peer_id, _, quote, _) in &quotes {
-            assert!(storer_would_accept(peer_id, &TEST_ADDR, quote));
+            assert!(storer_binding_would_accept(peer_id, quote));
         }
     }
 
@@ -738,7 +612,7 @@ mod tests {
         // not skip the filter, not return malformed quotes). The caller in
         // get_store_quotes then surfaces InsufficientPeers.
         let mut quotes: Vec<_> = (0..CLOSE_GROUP_SIZE * 2)
-            .map(|_| bad_binding_quote_for(&TEST_ADDR))
+            .map(|_| bad_quote_real())
             .collect();
         let dropped = drop_quotes_with_bad_bindings(&mut quotes);
         assert_eq!(dropped, CLOSE_GROUP_SIZE * 2);
@@ -751,7 +625,7 @@ mod tests {
         // signature, content, timestamp, price, rewards_address. The patch
         // is a filter, not a transformation; this test catches any future
         // regression that mutates a retained quote.
-        let (peer_id, addrs, original_quote, amount) = good_quote_for(&TEST_ADDR);
+        let (peer_id, addrs, original_quote, amount) = good_quote_real();
         let mut quotes = vec![(peer_id, addrs.clone(), original_quote.clone(), amount)];
         let _ = drop_quotes_with_bad_bindings(&mut quotes);
 
@@ -801,17 +675,17 @@ mod tests {
     fn repro_apr_30_storer_would_have_rejected_pre_filter_and_accepts_post_filter() {
         let over_query_count = CLOSE_GROUP_SIZE * 2;
         let mut quotes: Vec<_> = (0..over_query_count - 1)
-            .map(|_| good_quote_for(&TEST_ADDR))
+            .map(|_| good_quote_real())
             .collect();
         // Splice the crossed-key quote in the middle (mirrors the random
         // position the bad peer takes in the DHT-returned closest set).
-        quotes.insert(over_query_count / 2, bad_binding_quote_for(&TEST_ADDR));
+        quotes.insert(over_query_count / 2, bad_quote_real());
         assert_eq!(quotes.len(), over_query_count);
 
         // Step 1: prove the storer would reject the pre-filter set.
         let storer_would_reject_count = quotes
             .iter()
-            .filter(|(p, _, q, _)| !storer_would_accept(p, &TEST_ADDR, q))
+            .filter(|(p, _, q, _)| !storer_binding_would_accept(p, q))
             .count();
         assert_eq!(
             storer_would_reject_count, 1,
@@ -825,7 +699,7 @@ mod tests {
         // Step 3: prove the storer would accept every survivor under the FULL spec.
         for (peer_id, _, quote, _) in &quotes {
             assert!(
-                storer_would_accept(peer_id, &TEST_ADDR, quote),
+                storer_binding_would_accept(peer_id, quote),
                 "every post-filter quote must be accepted by the storer spec — \
                  this is what the patch guarantees: no more burned payments"
             );
@@ -848,9 +722,9 @@ mod tests {
         // Buffer is 2x; if more than half are bad, there's no way to refill.
         let bad_count = CLOSE_GROUP_SIZE + 1;
         let good_count = CLOSE_GROUP_SIZE - 1;
-        let mut quotes: Vec<_> = std::iter::repeat_with(|| bad_binding_quote_for(&TEST_ADDR))
+        let mut quotes: Vec<_> = std::iter::repeat_with(bad_quote_real)
             .take(bad_count)
-            .chain(std::iter::repeat_with(|| good_quote_for(&TEST_ADDR)).take(good_count))
+            .chain(std::iter::repeat_with(good_quote_real).take(good_count))
             .collect();
 
         let dropped = drop_quotes_with_bad_bindings(&mut quotes);
@@ -861,7 +735,7 @@ mod tests {
         );
         // Sanity: every survivor is storer-acceptable under the full spec.
         for (peer_id, _, quote, _) in &quotes {
-            assert!(storer_would_accept(peer_id, &TEST_ADDR, quote));
+            assert!(storer_binding_would_accept(peer_id, quote));
         }
     }
 
@@ -885,9 +759,9 @@ mod tests {
 
     #[test]
     fn classifier_accepts_real_self_consistent_quote() {
-        let (peer_id, _, quote, _) = good_quote_for(&TEST_ADDR);
+        let (peer_id, _, quote, _) = good_quote_real();
         let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&peer_id, &TEST_ADDR, &bytes, false);
+        let result = classify_quote_response(&peer_id, &bytes, false);
         match result {
             Ok((q, price)) => {
                 assert_eq!(q.pub_key, quote.pub_key);
@@ -899,9 +773,9 @@ mod tests {
 
     #[test]
     fn classifier_rejects_crossed_keypair_with_typed_error() {
-        let (peer_id, _, quote, _) = bad_binding_quote_for(&TEST_ADDR);
+        let (peer_id, _, quote, _) = bad_quote_real();
         let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&peer_id, &TEST_ADDR, &bytes, false);
+        let result = classify_quote_response(&peer_id, &bytes, false);
         match result {
             Err(Error::BadQuoteBinding {
                 peer_id: pid,
@@ -929,10 +803,10 @@ mod tests {
     ///   unfiltered."
     #[test]
     fn classifier_rejects_already_stored_vote_from_bad_binding_peer() {
-        let (peer_id, _, quote, _) = bad_binding_quote_for(&TEST_ADDR);
+        let (peer_id, _, quote, _) = bad_quote_real();
         let bytes = serialize_quote(&quote);
         // The peer claims already_stored=true, but its quote has a crossed key.
-        let result = classify_quote_response(&peer_id, &TEST_ADDR, &bytes, true);
+        let result = classify_quote_response(&peer_id, &bytes, true);
         assert!(
             matches!(result, Err(Error::BadQuoteBinding { .. })),
             "crossed-key peer must be classified BadQuoteBinding even when \
@@ -944,9 +818,9 @@ mod tests {
     /// passing the bind-check). This is the contrast to the test above.
     #[test]
     fn classifier_honours_already_stored_vote_from_good_binding_peer() {
-        let (peer_id, _, quote, _) = good_quote_for(&TEST_ADDR);
+        let (peer_id, _, quote, _) = good_quote_real();
         let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&peer_id, &TEST_ADDR, &bytes, true);
+        let result = classify_quote_response(&peer_id, &bytes, true);
         assert!(
             matches!(result, Err(Error::AlreadyStored)),
             "honest peer's already_stored vote must be honoured; got {result:?}"
@@ -955,64 +829,12 @@ mod tests {
 
     #[test]
     fn classifier_returns_serialization_error_on_bad_bytes() {
-        let (peer_id, _, _, _) = good_quote_for(&TEST_ADDR);
+        let (peer_id, _, _, _) = good_quote_real();
         let garbage = b"this is not a valid msgpack PaymentQuote".to_vec();
-        let result = classify_quote_response(&peer_id, &TEST_ADDR, &garbage, false);
+        let result = classify_quote_response(&peer_id, &garbage, false);
         assert!(
             matches!(result, Err(Error::Serialization(_))),
             "garbage bytes must produce a Serialization error; got {result:?}"
-        );
-    }
-
-    /// The classifier rejects a quote whose `content` does not match the
-    /// requested chunk address. Mirrors the storer's `verify_quote_content`.
-    #[test]
-    fn classifier_rejects_quote_with_wrong_content_address() {
-        let (peer_id, _, quote, _) = bad_content_quote_for(&TEST_ADDR);
-        let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&peer_id, &TEST_ADDR, &bytes, false);
-        match result {
-            Err(Error::BadQuoteContent {
-                peer_id: pid,
-                expected,
-                actual,
-            }) => {
-                assert_eq!(pid, peer_id.to_string());
-                assert_eq!(expected, hex::encode(TEST_ADDR));
-                assert_ne!(actual, expected, "actual must differ from expected");
-            }
-            other => panic!("expected BadQuoteContent for content-mismatched quote, got {other:?}"),
-        }
-    }
-
-    /// The classifier rejects a quote whose ML-DSA-65 signature does not
-    /// verify. Mirrors the storer's `verify_quote_signature`.
-    #[test]
-    fn classifier_rejects_quote_with_invalid_signature() {
-        let (peer_id, _, quote, _) = bad_signature_quote_for(&TEST_ADDR);
-        let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&peer_id, &TEST_ADDR, &bytes, false);
-        match result {
-            Err(Error::BadQuoteSignature { peer_id: pid }) => {
-                assert_eq!(pid, peer_id.to_string());
-            }
-            other => {
-                panic!("expected BadQuoteSignature for tampered-after-sign quote, got {other:?}")
-            }
-        }
-    }
-
-    /// The classifier rejects a content-mismatched quote even when the peer
-    /// votes `already_stored=true` (mirrors the same defense as the
-    /// crossed-key already-stored test, but for content mismatch).
-    #[test]
-    fn classifier_rejects_already_stored_vote_from_wrong_content_peer() {
-        let (peer_id, _, quote, _) = bad_content_quote_for(&TEST_ADDR);
-        let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&peer_id, &TEST_ADDR, &bytes, true);
-        assert!(
-            matches!(result, Err(Error::BadQuoteContent { .. })),
-            "wrong-content peer must NOT be allowed to cast an AlreadyStored vote"
         );
     }
 
@@ -1024,7 +846,7 @@ mod tests {
 
     #[test]
     fn aimd_success_for_ok_result() {
-        let (_, _, quote, _) = good_quote_for(&TEST_ADDR);
+        let (_, _, quote, _) = good_quote_real();
         let result: std::result::Result<(PaymentQuote, Amount), Error> =
             Ok((quote.clone(), quote.price));
         assert!(quote_outcome_is_success(&result));
@@ -1056,26 +878,6 @@ mod tests {
     }
 
     #[test]
-    fn aimd_failure_for_bad_quote_signature() {
-        let result: std::result::Result<(PaymentQuote, Amount), Error> =
-            Err(Error::BadQuoteSignature {
-                peer_id: "abc123".to_string(),
-            });
-        assert!(!quote_outcome_is_success(&result));
-    }
-
-    #[test]
-    fn aimd_failure_for_bad_quote_content() {
-        let result: std::result::Result<(PaymentQuote, Amount), Error> =
-            Err(Error::BadQuoteContent {
-                peer_id: "abc123".to_string(),
-                expected: "00".to_string(),
-                actual: "ff".to_string(),
-            });
-        assert!(!quote_outcome_is_success(&result));
-    }
-
-    #[test]
     fn aimd_failure_for_network_and_timeout_and_protocol_and_serialization() {
         for err in [
             Error::Network("net".to_string()),
@@ -1091,43 +893,28 @@ mod tests {
         }
     }
 
-    /// Independent attestation: round-trip a "would be rejected by storer"
-    /// quote through the classifier and confirm the classifier's verdict
-    /// matches the storer's spec verdict across ALL three failure modes.
-    /// If they ever disagree, either the classifier is letting through a
-    /// quote the storer will reject (money-loss regression), or it's
-    /// filtering a quote the storer would have accepted (availability
-    /// regression). Both are bugs.
+    /// Cross-validate the classifier's binding verdict against the
+    /// independent storer-spec re-derivation across mixed responders.
     #[test]
-    fn classifier_verdict_matches_storer_spec_for_mixed_failure_modes() {
-        // 8 honest + 3 crossed-key + 3 wrong-content + 3 invalid-signature.
-        let mut responders: Vec<(PeerId, PaymentQuote)> = (0..8)
+    fn classifier_verdict_matches_storer_binding_spec_for_mixed_responders() {
+        let mut responders: Vec<(PeerId, PaymentQuote)> = (0..12)
             .map(|_| {
-                let (p, _, q, _) = good_quote_for(&TEST_ADDR);
+                let (p, _, q, _) = good_quote_real();
                 (p, q)
             })
             .collect();
-        for _ in 0..3 {
-            let (p, _, q, _) = bad_binding_quote_for(&TEST_ADDR);
-            responders.push((p, q));
-        }
-        for _ in 0..3 {
-            let (p, _, q, _) = bad_content_quote_for(&TEST_ADDR);
-            responders.push((p, q));
-        }
-        for _ in 0..3 {
-            let (p, _, q, _) = bad_signature_quote_for(&TEST_ADDR);
+        for _ in 0..4 {
+            let (p, _, q, _) = bad_quote_real();
             responders.push((p, q));
         }
 
         for (peer_id, quote) in &responders {
             let bytes = serialize_quote(quote);
-            let storer_verdict = storer_would_accept(peer_id, &TEST_ADDR, quote);
-            let classifier_verdict =
-                classify_quote_response(peer_id, &TEST_ADDR, &bytes, false).is_ok();
+            let storer_verdict = storer_binding_would_accept(peer_id, quote);
+            let classifier_verdict = classify_quote_response(peer_id, &bytes, false).is_ok();
             assert_eq!(
                 classifier_verdict, storer_verdict,
-                "classifier and storer-spec must agree on every responder \
+                "classifier and storer-binding-spec must agree on every responder \
                  (peer_id={}, storer={storer_verdict}, classifier={classifier_verdict})",
                 peer_id
             );

@@ -75,27 +75,6 @@ pub enum Error {
         detail: String,
     },
 
-    /// A peer's quote ML-DSA-65 signature did not verify. The storer would
-    /// reject this quote, so the client drops the response before payment.
-    #[error("bad quote signature from peer {peer_id}")]
-    BadQuoteSignature {
-        /// The peer ID we got the quote from.
-        peer_id: String,
-    },
-
-    /// A peer's quote was issued for a different content address than the one
-    /// we asked about. The storer enforces `quote.content == request.address`,
-    /// so the client drops the response before payment.
-    #[error("quote content mismatch from peer {peer_id}: expected {expected}, got {actual}")]
-    BadQuoteContent {
-        /// The peer ID we got the quote from.
-        peer_id: String,
-        /// Hex-encoded expected content address.
-        expected: String,
-        /// Hex-encoded content address the peer's quote claimed.
-        actual: String,
-    },
-
     /// Not enough disk space for the operation.
     #[error("insufficient disk space: {0}")]
     InsufficientDiskSpace(String),
