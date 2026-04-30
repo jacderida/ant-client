@@ -64,6 +64,17 @@ pub enum Error {
     #[error("already stored on network")]
     AlreadyStored,
 
+    /// A peer's quote `pub_key` does not BLAKE3-hash to the peer ID. The
+    /// storer would reject any `ProofOfPayment` containing this quote, so
+    /// the client drops the response before payment.
+    #[error("bad quote binding from peer {peer_id}: {detail}")]
+    BadQuoteBinding {
+        /// The peer ID we got the quote from (claimed identity).
+        peer_id: String,
+        /// Diagnostic detail (e.g. "BLAKE3(pub_key) = …, peer_id = …").
+        detail: String,
+    },
+
     /// Not enough disk space for the operation.
     #[error("insufficient disk space: {0}")]
     InsufficientDiskSpace(String),
