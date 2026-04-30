@@ -403,16 +403,22 @@ pub fn extract_zip(data: &[u8], install_dir: &Path, binary_name: &str) -> Result
 /// `pub(crate)` so the supervisor can poll the on-disk binary's version to detect
 /// auto-upgrade state without duplicating the parse logic.
 pub(crate) async fn extract_version(binary_path: &Path) -> Result<String> {
-    let output = tokio::process::Command::new(binary_path)
-        .arg("--version")
-        .output()
-        .await
-        .map_err(|e| {
-            Error::BinaryResolution(format!(
-                "failed to run {} --version: {e}",
-                binary_path.display()
-            ))
-        })?;
+    let mut cmd = tokio::process::Command::new(binary_path);
+    cmd.arg("--version");
+    // CREATE_NO_WINDOW: prevents Windows from allocating a console window for
+    // the console-subsystem child binary. Without this, every version probe
+    // flashes a window — visible as "ghost flashes" in GUI consumers.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().await.map_err(|e| {
+        Error::BinaryResolution(format!(
+            "failed to run {} --version: {e}",
+            binary_path.display()
+        ))
+    })?;
 
     if !output.status.success() {
         return Err(Error::BinaryResolution(format!(

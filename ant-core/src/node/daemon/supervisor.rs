@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, RwLock};
+use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
@@ -608,6 +609,10 @@ pub fn spawn_upgrade_monitor(
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // After a Windows sleep/hibernate the default `Burst` catch-up would fire one
+        // tick per missed interval back-to-back, producing a flood of `extract_version`
+        // subprocess spawns. `Skip` resumes on the next aligned tick instead.
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // Skip the immediate first tick — we don't want to probe while nodes are still in the
         // Starting -> Running transition.
         ticker.tick().await;
@@ -984,6 +989,10 @@ pub fn spawn_liveness_monitor(
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // Don't burst-catchup after a Windows sleep/hibernate: a flood of liveness
+        // probes serves no purpose, and uniform `Skip` policy across supervisor
+        // monitors keeps post-wake behaviour predictable.
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,

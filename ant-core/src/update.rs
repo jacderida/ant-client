@@ -411,16 +411,22 @@ fn verify_signature(archive_bytes: &[u8], signature_bytes: &[u8]) -> Result<()> 
 
 /// Extract the version string from a binary by running `<binary> --version`.
 async fn extract_version(binary_path: &Path) -> Result<String> {
-    let output = tokio::process::Command::new(binary_path)
-        .arg("--version")
-        .output()
-        .await
-        .map_err(|e| {
-            Error::UpdateFailed(format!(
-                "failed to run {} --version: {e}",
-                binary_path.display()
-            ))
-        })?;
+    let mut cmd = tokio::process::Command::new(binary_path);
+    cmd.arg("--version");
+    // CREATE_NO_WINDOW: prevents Windows from allocating a console window for
+    // the console-subsystem child binary. Without this, every version probe
+    // flashes a window — visible as "ghost flashes" in GUI consumers.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().await.map_err(|e| {
+        Error::UpdateFailed(format!(
+            "failed to run {} --version: {e}",
+            binary_path.display()
+        ))
+    })?;
 
     if !output.status.success() {
         return Err(Error::UpdateFailed(format!(
