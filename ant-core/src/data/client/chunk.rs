@@ -8,9 +8,9 @@ use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{
-    compute_address, send_and_await_chunk_response, ChunkGetRequest, ChunkGetResponse,
-    ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, DataChunk, XorName,
-    CLOSE_GROUP_MAJORITY,
+    compute_address, detect_proof_type, send_and_await_chunk_response, ChunkGetRequest,
+    ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, DataChunk,
+    ProofType, XorName, CLOSE_GROUP_MAJORITY,
 };
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -20,6 +20,16 @@ use tracing::{debug, warn};
 
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
+
+/// Store-response timeout for non-merkle chunk PUTs.
+const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn store_response_timeout_for_proof(proof: &[u8], merkle_timeout_secs: u64) -> Duration {
+    match detect_proof_type(proof) {
+        Some(ProofType::Merkle) => Duration::from_secs(merkle_timeout_secs),
+        _ => STORE_RESPONSE_TIMEOUT,
+    }
+}
 
 /// A reusable set of peers built from a single DHT lookup, suitable
 /// for fetching many chunks from overlapping close groups without
@@ -187,6 +197,8 @@ impl Client {
     ) -> Result<XorName> {
         let address = compute_address(&content);
         let node = self.network().node();
+        let timeout = store_response_timeout_for_proof(&proof, self.config().store_timeout_secs);
+        let timeout_secs = timeout.as_secs();
 
         let request_id = self.next_request_id();
         let request = ChunkPutRequest::with_payment(address, content.to_vec(), proof);
@@ -198,9 +210,7 @@ impl Client {
             .encode()
             .map_err(|e| Error::Protocol(format!("Failed to encode PUT request: {e}")))?;
 
-        let timeout = Duration::from_secs(self.config().store_timeout_secs);
         let addr_hex = hex::encode(address);
-        let timeout_secs = self.config().store_timeout_secs;
 
         let result = send_and_await_chunk_response(
             node,
@@ -482,6 +492,13 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ant_protocol::transport::PeerId;
+    use ant_protocol::{PROOF_TAG_MERKLE, PROOF_TAG_SINGLE_NODE};
+
+    /// Arbitrary configured Merkle store timeout used by the timeout-selection tests.
+    const TEST_MERKLE_TIMEOUT_SECS: u64 = 60;
+    /// Sentinel byte used to represent an unknown/unrecognized proof tag.
+    const UNKNOWN_PROOF_TAG: u8 = 0xff;
 
     #[test]
     fn peer_pool_empty_reports_zero_len() {
@@ -492,12 +509,35 @@ mod tests {
 
     #[test]
     fn peer_pool_with_entries_reports_len() {
-        use ant_protocol::transport::PeerId;
         let peer = PeerId::random();
         let pool = PeerPool {
             peers: vec![(peer, vec![])],
         };
         assert_eq!(pool.len(), 1);
         assert!(!pool.is_empty());
+    }
+
+    #[test]
+    fn single_node_proof_uses_store_response_timeout() {
+        let timeout =
+            store_response_timeout_for_proof(&[PROOF_TAG_SINGLE_NODE], TEST_MERKLE_TIMEOUT_SECS);
+
+        assert_eq!(timeout, STORE_RESPONSE_TIMEOUT);
+    }
+
+    #[test]
+    fn unknown_proof_uses_store_response_timeout() {
+        let timeout =
+            store_response_timeout_for_proof(&[UNKNOWN_PROOF_TAG], TEST_MERKLE_TIMEOUT_SECS);
+
+        assert_eq!(timeout, STORE_RESPONSE_TIMEOUT);
+    }
+
+    #[test]
+    fn merkle_proof_uses_configured_store_timeout() {
+        let timeout =
+            store_response_timeout_for_proof(&[PROOF_TAG_MERKLE], TEST_MERKLE_TIMEOUT_SECS);
+
+        assert_eq!(timeout, Duration::from_secs(TEST_MERKLE_TIMEOUT_SECS));
     }
 }
