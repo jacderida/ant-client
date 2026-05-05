@@ -1581,15 +1581,6 @@ impl Client {
                     let prog = progress_ref.clone();
                     let limiter = fetch_limiter.clone();
                     handle.block_on(async {
-                        // Build ONE peer pool for this batch via a
-                        // single DHT walk; reuse for every chunk.
-                        let addrs: Vec<[u8; 32]> = batch_owned.iter().map(|(_, h)| h.0).collect();
-                        let pool = self.build_peer_pool_for(&addrs).await.map_err(|e| {
-                            self_encryption::Error::Generic(format!(
-                                "DataMap resolution: peer pool build failed: {e}"
-                            ))
-                        })?;
-                        let pool_ref = &pool;
                         // Clamp fan-out to batch size — self_encryption
                         // requests small batches (default 10), so a
                         // higher cap from the controller would be slots
@@ -1602,9 +1593,7 @@ impl Client {
                                 async move {
                                     let result = observe_op(
                                         &limiter,
-                                        || async move {
-                                            self.chunk_get_with_pool(&addr, pool_ref).await
-                                        },
+                                        || async move { self.chunk_get(&addr).await },
                                         classify_error,
                                     )
                                     .await;
@@ -1680,15 +1669,6 @@ impl Client {
 
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
-                    // Per-batch peer pool: one DHT walk shared across
-                    // all the chunks in this self_encryption batch.
-                    let addrs: Vec<[u8; 32]> = batch_owned.iter().map(|(_, h)| h.0).collect();
-                    let pool = self.build_peer_pool_for(&addrs).await.map_err(|e| {
-                        self_encryption::Error::Generic(format!(
-                            "Streaming decrypt: peer pool build failed: {e}"
-                        ))
-                    })?;
-                    let pool_ref = &pool;
                     // Clamp fan-out to batch size — see PERF-RESULTS.md.
                     let cap = fetch_limiter.current().min(batch_owned.len().max(1));
                     let mut stream = futures::stream::iter(batch_owned)
@@ -1696,15 +1676,12 @@ impl Client {
                             let addr = hash.0;
                             let limiter = fetch_limiter.clone();
                             async move {
-                                let result =
-                                    observe_op(
-                                        &limiter,
-                                        || async move {
-                                            self.chunk_get_with_pool(&addr, pool_ref).await
-                                        },
-                                        classify_error,
-                                    )
-                                    .await;
+                                let result = observe_op(
+                                    &limiter,
+                                    || async move { self.chunk_get(&addr).await },
+                                    classify_error,
+                                )
+                                .await;
                                 (idx, hash, result)
                             }
                         })
