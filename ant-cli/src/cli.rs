@@ -43,11 +43,17 @@ pub struct Cli {
     #[arg(long, default_value_t = 10, hide = true)]
     pub quote_timeout_secs: u64,
 
-    /// Per-op timeout for chunk store / retrieve operations (seconds).
+    /// Per-op timeout for chunk store operations (seconds).
     /// Static knob; the adaptive controller does not currently size
     /// timeouts.
-    #[arg(long, default_value_t = 60, hide = true)]
-    pub store_timeout_secs: u64,
+    #[arg(long, hide = true)]
+    pub store_timeout_secs: Option<u64>,
+
+    /// Per-peer timeout for chunk retrieve operations (seconds).
+    /// Static knob; the adaptive controller does not currently size
+    /// timeouts.
+    #[arg(long, hide = true)]
+    pub chunk_get_timeout_secs: Option<u64>,
 
     /// **Deprecated.** Adaptive controller now sizes quote
     /// concurrency from observed network signals. Setting this caps
