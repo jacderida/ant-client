@@ -92,7 +92,7 @@ rmp-serde = "1"
 # which populates a cache via `add_peer_trusted` (bypasses Sybil rate limits)
 # and then verifies reload after save. Test-only — no runtime version-pin
 # concern. Tracks ant-node's transitive saorsa-core dep.
-saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core", branch = "rc-2026.4.4" }
+saorsa-core = "0.24.2"
 
 [[example]]
 name = "start-local-devnet"
