@@ -1,3 +1,10 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
 resolver = "2"
+
+[patch.crates-io]
+saorsa-core = { git = "https://github.com/jacderida/saorsa-core.git", rev = "4e47a943ff7329856c35b8246ff1bb8cb6bcc126" }  # branch: chore-address_set_logging
+ant-protocol = { git = "https://github.com/jacderida/ant-protocol.git", rev = "7c63f5e65825bd801d62b001c99a7011f13992e6" }  # branch: chore-address_set_logging
+
+[patch."https://github.com/saorsa-labs/saorsa-core"]
+saorsa-core = { git = "https://github.com/jacderida/saorsa-core.git", rev = "4e47a943ff7329856c35b8246ff1bb8cb6bcc126" }  # branch: chore-address_set_logging
