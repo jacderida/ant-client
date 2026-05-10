@@ -562,24 +562,22 @@ impl Client {
 
             let store_limiter = self.controller().store.clone();
             let store_concurrency = store_limiter.current().min(to_retry.len().max(1));
+            // Per-peer observation lives in `spawn_chunk_put`. The
+            // chunk-level wrap was too coarse for small files — a
+            // single Outcome per chunk could not cross
+            // `min_window_ops` in time to react before retries
+            // exhausted.
             let mut upload_stream = stream::iter(to_retry)
                 .map(|chunk| {
                     let chunk_clone = chunk.clone();
-                    let limiter = store_limiter.clone();
                     async move {
-                        let result = observe_op(
-                            &limiter,
-                            || async move {
-                                self.chunk_put_to_close_group(
-                                    chunk.content,
-                                    chunk.proof_bytes,
-                                    &chunk.quoted_peers,
-                                )
-                                .await
-                            },
-                            classify_error,
-                        )
-                        .await;
+                        let result = self
+                            .chunk_put_to_close_group(
+                                chunk.content,
+                                chunk.proof_bytes,
+                                &chunk.quoted_peers,
+                            )
+                            .await;
                         (chunk_clone, result)
                     }
                 })

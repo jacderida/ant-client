@@ -82,7 +82,22 @@ pub struct ChannelMax {
     pub quote: usize,
     pub store: usize,
     pub fetch: usize,
+    /// Per-chunk peer fan-out for close-group replication. Bounded by
+    /// `CLOSE_GROUP_MAJORITY` (currently 4) — sending PUTs to more
+    /// peers than majority is wasted work since the chunk is
+    /// considered stored once majority acks. The floor is 1, which
+    /// means strictly sequential per-peer replication for a single
+    /// chunk's PUT (slow connections that saturate on parallel
+    /// streams).
+    pub replication: usize,
 }
+
+/// Hard ceiling for the replication channel. Equals
+/// `ant_protocol::CLOSE_GROUP_MAJORITY`. Defined here as a constant to
+/// avoid the `adaptive` module taking a dependency on `ant_protocol`
+/// — the wiring site (`chunk.rs`) is responsible for clamping the
+/// effective fan-out at the protocol-defined majority.
+const REPLICATION_MAX: usize = 4;
 
 impl Default for ChannelMax {
     fn default() -> Self {
@@ -94,6 +109,7 @@ impl Default for ChannelMax {
             quote: 128,
             store: 64,
             fetch: 256,
+            replication: REPLICATION_MAX,
         }
     }
 }
@@ -160,6 +176,14 @@ impl AdaptiveConfig {
         self.max.quote = self.max.quote.max(self.min_concurrency);
         self.max.store = self.max.store.max(self.min_concurrency);
         self.max.fetch = self.max.fetch.max(self.min_concurrency);
+        // Replication ceiling cannot exceed CLOSE_GROUP_MAJORITY
+        // regardless of what the user / a hand-edited config supplies
+        // — sending PUTs to more peers than majority is meaningless.
+        self.max.replication = self
+            .max
+            .replication
+            .max(self.min_concurrency)
+            .min(REPLICATION_MAX);
     }
 }
 
@@ -190,11 +214,16 @@ impl Default for AdaptiveConfig {
 ///   small (handful of chunks); occasional larger ones are capped at
 ///   `max_concurrency`. Start at 64 to keep small/medium downloads
 ///   indistinguishable from the prior unbounded behavior.
+/// - replication (per-chunk peer fan-out) starts at the ceiling
+///   (`CLOSE_GROUP_MAJORITY`) — fast connections see the prior
+///   "all majority peers in parallel" behavior. Slow uplinks halve
+///   it down via the saturation classifier.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ChannelStart {
     pub quote: usize,
     pub store: usize,
     pub fetch: usize,
+    pub replication: usize,
 }
 
 impl Default for ChannelStart {
@@ -203,6 +232,7 @@ impl Default for ChannelStart {
             quote: 32,
             store: 8,
             fetch: 64,
+            replication: REPLICATION_MAX,
         }
     }
 }
@@ -383,6 +413,57 @@ impl Limiter {
     pub fn snapshot(&self) -> usize {
         lock(&self.inner).current
     }
+
+    /// p95 latency of recent **successful** observations in the
+    /// sliding window. Returns `None` if no successful samples are in
+    /// the window yet (e.g. cold start, or a window dominated by
+    /// timeouts/errors).
+    ///
+    /// Used by the adaptive store-timeout in `chunk.rs`: the timeout
+    /// is sized as `latency_inflation_factor × p95`, so a slow uplink
+    /// that observed 20-25 s successful PUTs gets a 40-50 s timeout
+    /// instead of the default 30 s.
+    #[must_use]
+    pub fn latency_p95(&self) -> Option<Duration> {
+        let g = lock(&self.inner);
+        let mut latencies: Vec<Duration> = g
+            .window
+            .iter()
+            .filter(|s| matches!(s.outcome, Outcome::Success))
+            .map(|s| s.latency)
+            .collect();
+        p95_of(&mut latencies)
+    }
+
+    /// Read the configured `latency_inflation_factor`. Used by the
+    /// adaptive store-timeout sizing in `chunk.rs`.
+    #[must_use]
+    pub fn latency_inflation_factor(&self) -> f64 {
+        self.config.latency_inflation_factor
+    }
+
+    /// Force an immediate multiplicative decrease, bypassing the
+    /// usual `min_window_ops` decrease gate. Used by the eager
+    /// saturation classifier in `chunk.rs` when an unambiguous
+    /// stress signal is observed on a single chunk PUT (e.g. all
+    /// attempted peers timed out simultaneously — the uplink is
+    /// saturated and we already know this without needing a window
+    /// of evidence). Floors at `min_concurrency`. No-op when the
+    /// controller is disabled.
+    pub fn force_decrease(&self) {
+        if !self.config.enabled {
+            return;
+        }
+        let mut g = lock(&self.inner);
+        g.left_slow_start = true;
+        let next = (g.current / 2).max(self.config.min_concurrency);
+        if next != g.current {
+            debug!(from = g.current, to = next, "adaptive: force_decrease");
+        }
+        g.current = next;
+        g.samples_since_increase = 0;
+        g.samples_since_decrease = 0;
+    }
 }
 
 /// Outcome of evaluating one window.
@@ -541,6 +622,12 @@ pub struct AdaptiveController {
     pub quote: Limiter,
     pub store: Limiter,
     pub fetch: Limiter,
+    /// Per-chunk peer fan-out for close-group replication. Bounded
+    /// `[1, CLOSE_GROUP_MAJORITY]`. Driven by the saturation
+    /// classifier in `chunk.rs` (correlated peer-timeouts within a
+    /// single chunk's fan-out → halve), not by the per-peer store
+    /// channel observations.
+    pub replication: Limiter,
     /// `pub(crate)` so external callers cannot mutate this
     /// post-construction. Each `Limiter` snapshots its own
     /// `Arc<LimiterConfig>` at construction time, so external
@@ -548,19 +635,15 @@ pub struct AdaptiveController {
     /// `enabled` check from the limiters' frozen copies. Read via
     /// `config()`.
     pub(crate) config: AdaptiveConfig,
-    /// Per-instance cold-start values. `warm_start` floors snapshot
-    /// values against THIS, not the global `ChannelStart::default()`,
-    /// so a controller built with custom (e.g. low) starts stays
-    /// faithful to its construction parameters. Constructed-once,
-    /// never mutated.
-    cold_start: ChannelStart,
 }
 
 impl AdaptiveController {
     /// Create a controller with cold-start values per channel.
     /// Sanitizes the config (NaN guards, floor/ceiling enforcement)
-    /// before constructing limiters. The supplied `start` is captured
-    /// as the per-instance cold-start floor for `warm_start`.
+    /// before constructing limiters. Cold-start values seed the
+    /// limiters; once `warm_start` applies a persisted snapshot, the
+    /// snapshot is the source of truth (snapshot-as-truth — see
+    /// `warm_start` doc).
     #[must_use]
     pub fn new(start: ChannelStart, config: AdaptiveConfig) -> Self {
         let mut config = config;
@@ -568,12 +651,13 @@ impl AdaptiveController {
         let quote_cfg = LimiterConfig::from_adaptive(&config, config.max.quote);
         let store_cfg = LimiterConfig::from_adaptive(&config, config.max.store);
         let fetch_cfg = LimiterConfig::from_adaptive(&config, config.max.fetch);
+        let replication_cfg = LimiterConfig::from_adaptive(&config, config.max.replication);
         Self {
             quote: Limiter::new(start.quote, quote_cfg),
             store: Limiter::new(start.store, store_cfg),
             fetch: Limiter::new(start.fetch, fetch_cfg),
+            replication: Limiter::new(start.replication, replication_cfg),
             config,
-            cold_start: start,
         }
     }
 
@@ -584,6 +668,7 @@ impl AdaptiveController {
             quote: self.quote.snapshot(),
             store: self.store.snapshot(),
             fetch: self.fetch.snapshot(),
+            replication: self.replication.snapshot(),
         }
     }
 
@@ -599,14 +684,20 @@ impl AdaptiveController {
 
     /// Apply a previously-saved snapshot as the warm-start cap.
     ///
-    /// The effective warm value per channel is
-    /// `max(snapshot, self.cold_start)` — flooring at the
-    /// per-instance cold-start (NOT the global default) so:
-    /// 1. A prior bad run that pinned cap=1 doesn't pessimize this
-    ///    run forever.
-    /// 2. A controller built with custom (e.g. low) cold starts for
-    ///    benchmarking is not silently jumped above its construction
-    ///    parameters.
+    /// Snapshot-as-truth: the effective warm value per channel is the
+    /// snapshot value, clamped only to the channel's hard
+    /// `[min_concurrency, max_concurrency]` bounds. The cold-start is
+    /// **not** used as a runtime floor — it only takes effect when no
+    /// snapshot exists at all.
+    ///
+    /// Rationale: a slow-uplink user whose previous run halved the
+    /// cap to 2 must persist that across runs. Flooring at cold-start
+    /// would force every fresh process to re-experience the same
+    /// failures before halving back down. The hard `min_concurrency`
+    /// bound (default 1) and the AIMD's additive-increase recovery
+    /// keep us safe from a stale or pathological snapshot — a
+    /// previously-bad uplink that's since improved climbs back up
+    /// over a few healthy windows.
     ///
     /// Does not clear sliding windows. When `enabled = false`, this
     /// is a no-op — fixed-concurrency mode means fixed-concurrency.
@@ -614,12 +705,10 @@ impl AdaptiveController {
         if !self.config.enabled {
             return;
         }
-        self.quote
-            .warm_start(snapshot.quote.max(self.cold_start.quote));
-        self.store
-            .warm_start(snapshot.store.max(self.cold_start.store));
-        self.fetch
-            .warm_start(snapshot.fetch.max(self.cold_start.fetch));
+        self.quote.warm_start(snapshot.quote);
+        self.store.warm_start(snapshot.store);
+        self.fetch.warm_start(snapshot.fetch);
+        self.replication.warm_start(snapshot.replication);
     }
 }
 
@@ -844,7 +933,12 @@ struct PersistedState {
     channels: ChannelStart,
 }
 
-const PERSIST_SCHEMA: u32 = 1;
+/// Schema version for the on-disk snapshot file. Bumped to 2 with the
+/// addition of the `replication` channel — schema-1 snapshots
+/// (pre-replication-channel) are silently ignored on load and the
+/// controller falls back to cold-start values, then writes a schema-2
+/// snapshot at process exit.
+const PERSIST_SCHEMA: u32 = 2;
 const PERSIST_FILENAME: &str = "client_adaptive.json";
 
 /// Default persistence path: `<data_dir>/client_adaptive.json`. Falls
@@ -1005,6 +1099,7 @@ mod tests {
                 quote: l.max_concurrency,
                 store: l.max_concurrency,
                 fetch: l.max_concurrency,
+                replication: REPLICATION_MAX,
             },
             window_ops: l.window_ops,
             min_window_ops: l.min_window_ops,
@@ -1171,6 +1266,7 @@ mod tests {
                 quote: 64,
                 store: 16,
                 fetch: 64,
+                replication: REPLICATION_MAX,
             },
             adaptive_cfg_for_tests(),
         );
@@ -1206,6 +1302,7 @@ mod tests {
             quote: 24,
             store: 6,
             fetch: 12,
+            replication: REPLICATION_MAX,
         };
         save_snapshot(&path, snap);
         let loaded = load_snapshot(&path).unwrap();
@@ -1615,30 +1712,29 @@ mod tests {
         );
     }
 
-    /// Persisted higher values from a prior run must beat low cold-start
-    /// defaults. Otherwise warm-start would silently pessimize throughput.
-    /// (Values BELOW cold-start are floored — see
-    /// `warm_start_floors_at_cold_defaults`.)
+    /// Persisted values from a prior run are the source of truth on
+    /// warm-start, regardless of the controller's cold-start values
+    /// (see `warm_start_uses_snapshot_below_cold_start` for the
+    /// below-cold-start case).
     #[test]
-    fn persisted_snapshot_warm_starts_above_cold_floor() {
+    fn persisted_snapshot_is_warm_start_source_of_truth() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("client_adaptive.json");
-        // All snapshot values ABOVE the production cold-start defaults
-        // so the warm_start floor doesn't kick in.
         let saved = ChannelStart {
             quote: 64,
             store: 32,
             fetch: 128,
+            replication: REPLICATION_MAX,
         };
         save_snapshot(&path, saved);
         let loaded = load_snapshot(&path).unwrap();
 
-        // Build a controller with intentionally low cold-start values
-        // — these get overridden by warm_start.
+        // Cold-start values are intentionally below the snapshot.
         let low = ChannelStart {
             quote: 2,
             store: 2,
             fetch: 2,
+            replication: REPLICATION_MAX,
         };
         let c = AdaptiveController::new(low, AdaptiveConfig::default());
         c.warm_start(loaded);
@@ -1661,11 +1757,13 @@ mod tests {
             quote: 10,
             store: 10,
             fetch: 10,
+            replication: REPLICATION_MAX,
         };
         let snap_b = ChannelStart {
             quote: 99,
             store: 99,
             fetch: 99,
+            replication: REPLICATION_MAX,
         };
         let h_a = thread::spawn(move || {
             for _ in 0..50 {
@@ -1701,6 +1799,7 @@ mod tests {
             quote: 1,
             store: 1,
             fetch: 1,
+            replication: REPLICATION_MAX,
         };
         // No panic = pass. Function returns unit, errors are logged.
         save_snapshot(&path, snap);
@@ -1755,6 +1854,7 @@ mod tests {
                 quote: 0, // sub-min; sanitize raises to min
                 store: 0,
                 fetch: 0,
+                replication: REPLICATION_MAX,
             },
             window_ops: 10,
             min_window_ops: 50, // > window_ops; sanitize clamps
@@ -1909,6 +2009,7 @@ mod tests {
                 quote: 4,    // tightly capped
                 store: 8,    // moderate
                 fetch: 1024, // very high
+                replication: REPLICATION_MAX,
             },
             ..AdaptiveConfig::default()
         };
@@ -1917,6 +2018,7 @@ mod tests {
                 quote: 4,
                 store: 8,
                 fetch: 64,
+                replication: REPLICATION_MAX,
             },
             cfg,
         );
@@ -2028,37 +2130,38 @@ mod tests {
 
     // ---- Codex review (round 3) regression tests ----
 
-    /// Codex CRITICAL: warm_start was blindly restoring caps below the
-    /// cold-start floor. A prior bad run that drove store=1 would
-    /// pessimize every subsequent run forever. The fix floors warm
-    /// values at `ChannelStart::default()` per channel.
+    /// Snapshot-as-truth: a prior run that halved store=1 must persist
+    /// across runs. Cold-start is no longer used as a runtime floor on
+    /// warm-start — the snapshot is authoritative, bounded only by the
+    /// hard `min_concurrency` (default 1) and the per-channel max.
+    /// This is essential for slow-uplink users whose AIMD has learned
+    /// they need low fan-out: every fresh process must boot pre-tuned.
     #[test]
-    fn warm_start_floors_at_cold_defaults() {
+    fn warm_start_uses_snapshot_below_cold_start() {
         let c = AdaptiveController::default();
-        let cold = ChannelStart::default();
-        // Snapshot from a "bad prior run" — every channel pinned to 1.
-        let bad_snap = ChannelStart {
+        // Snapshot from a "previously-saturated" run — every channel
+        // halved repeatedly down to the floor.
+        let low_snap = ChannelStart {
             quote: 1,
             store: 1,
             fetch: 1,
+            replication: REPLICATION_MAX,
         };
-        c.warm_start(bad_snap);
-        // After warm_start, each channel should be AT LEAST the
-        // cold-start value, not the persisted 1.
+        c.warm_start(low_snap);
         assert_eq!(
             c.quote.current(),
-            cold.quote,
-            "quote warm_start did not floor at cold default"
+            1,
+            "quote warm_start must trust low snapshot, not floor at cold"
         );
         assert_eq!(
             c.store.current(),
-            cold.store,
-            "store warm_start did not floor at cold default"
+            1,
+            "store warm_start must trust low snapshot, not floor at cold"
         );
         assert_eq!(
             c.fetch.current(),
-            cold.fetch,
-            "fetch warm_start did not floor at cold default"
+            1,
+            "fetch warm_start must trust low snapshot, not floor at cold"
         );
     }
 
@@ -2072,6 +2175,7 @@ mod tests {
             quote: cold.quote * 2,
             store: cold.store * 4,
             fetch: cold.fetch * 2,
+            replication: REPLICATION_MAX,
         };
         c.warm_start(snap);
         assert_eq!(c.quote.current(), snap.quote);
@@ -2204,6 +2308,7 @@ mod tests {
             quote: 100,
             store: 50,
             fetch: 200,
+            replication: REPLICATION_MAX,
         };
         save_snapshot(&path, snap);
         // The file must exist immediately after save_snapshot returns.
@@ -2249,32 +2354,37 @@ mod tests {
         );
     }
 
-    /// Codex CR-3 fix: warm_start floors against the per-instance
-    /// cold-start, NOT the global ChannelStart::default. A controller
-    /// built with custom low starts must stay faithful to its
-    /// construction parameters even after warm_start.
+    /// Snapshot-as-truth: `warm_start` no longer floors against the
+    /// per-instance cold-start. The snapshot is authoritative,
+    /// bounded only by `[min_concurrency, max_concurrency]` (handled
+    /// inside `Limiter::warm_start`). A controller's construction
+    /// cold-start values are used only when no snapshot exists at
+    /// all.
     #[test]
-    fn controller_warm_start_floors_at_per_instance_cold_start() {
+    fn controller_warm_start_uses_snapshot_below_cold_start() {
         let custom_cold = ChannelStart {
             quote: 2,
-            store: 1,
+            store: 8,
             fetch: 4,
+            replication: REPLICATION_MAX,
         };
         let c = AdaptiveController::new(custom_cold, AdaptiveConfig::default());
-        // Snapshot below the per-instance cold-start floors at custom values.
+        // Snapshot below the per-instance cold-start IS HONORED now.
         c.warm_start(ChannelStart {
             quote: 1,
             store: 1,
             fetch: 1,
+            replication: REPLICATION_MAX,
         });
-        assert_eq!(c.quote.current(), 2);
+        assert_eq!(c.quote.current(), 1);
         assert_eq!(c.store.current(), 1);
-        assert_eq!(c.fetch.current(), 4);
-        // Snapshot above the per-instance cold-start uses the snapshot.
+        assert_eq!(c.fetch.current(), 1);
+        // Snapshot above the per-instance cold-start also honored.
         c.warm_start(ChannelStart {
             quote: 10,
             store: 10,
             fetch: 10,
+            replication: REPLICATION_MAX,
         });
         assert_eq!(c.quote.current(), 10);
         assert_eq!(c.store.current(), 10);
@@ -2294,12 +2404,14 @@ mod tests {
             quote: 5,
             store: 5,
             fetch: 5,
+            replication: REPLICATION_MAX,
         };
         let c = AdaptiveController::new(custom_cold, cfg);
         c.warm_start(ChannelStart {
             quote: 100,
             store: 100,
             fetch: 100,
+            replication: REPLICATION_MAX,
         });
         assert_eq!(c.quote.current(), 5, "warm_start moved cap when disabled");
         assert_eq!(c.store.current(), 5, "warm_start moved cap when disabled");
@@ -2440,6 +2552,7 @@ mod tests {
                     quote: i + 1,
                     store: i + 1,
                     fetch: i + 1,
+                    replication: REPLICATION_MAX,
                 },
             );
         }
@@ -2745,6 +2858,7 @@ mod tests {
             quote: 7,
             store: 13,
             fetch: 200,
+            replication: REPLICATION_MAX,
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: ChannelMax = serde_json::from_str(&json).unwrap();
@@ -2759,6 +2873,7 @@ mod tests {
             quote: 11,
             store: 22,
             fetch: 33,
+            replication: REPLICATION_MAX,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: ChannelStart = serde_json::from_str(&json).unwrap();
@@ -2893,6 +3008,7 @@ mod tests {
                 quote: 1,
                 store: 1,
                 fetch: 1,
+                replication: REPLICATION_MAX,
             },
         );
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -2907,6 +3023,7 @@ mod tests {
                         quote: i,
                         store: i,
                         fetch: i,
+                        replication: REPLICATION_MAX,
                     },
                 );
                 i = i.wrapping_add(1).max(1);
@@ -2949,6 +3066,7 @@ mod tests {
             quote: 1,
             store: 1,
             fetch: 1,
+            replication: REPLICATION_MAX,
         };
         let started = Instant::now();
         save_snapshot_with_timeout(path, snap, Duration::from_secs(5));
@@ -2984,6 +3102,7 @@ mod tests {
             quote: 1,
             store: 1,
             fetch: 1,
+            replication: REPLICATION_MAX,
         };
         let started = Instant::now();
         // Deadline so short that on most machines the writer is

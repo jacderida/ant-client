@@ -4,8 +4,6 @@
 //! by paying for the entire batch in a single on-chain transaction instead
 //! of one transaction per chunk.
 
-use crate::data::client::adaptive::observe_op;
-use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -544,7 +542,6 @@ impl Client {
         let mut upload_stream = stream::iter(chunk_contents.into_iter().zip(addresses).map(
             |(content, addr)| {
                 let proof_bytes = batch_result.proofs.get(&addr).cloned();
-                let limiter = store_limiter.clone();
                 async move {
                     let proof = proof_bytes.ok_or_else(|| {
                         Error::Payment(format!(
@@ -553,14 +550,8 @@ impl Client {
                         ))
                     })?;
                     let peers = self.close_group_peers(&addr).await?;
-                    observe_op(
-                        &limiter,
-                        || async move {
-                            self.chunk_put_to_close_group(content, proof, &peers).await
-                        },
-                        classify_error,
-                    )
-                    .await
+                    // Per-peer observation lives in `spawn_chunk_put`.
+                    self.chunk_put_to_close_group(content, proof, &peers).await
                 }
             },
         ))

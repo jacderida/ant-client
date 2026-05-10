@@ -1438,7 +1438,6 @@ impl Client {
             let store_concurrency = store_limiter.current().min(wave.len().max(1));
             let mut upload_stream = stream::iter(wave.into_iter().map(|(content, addr)| {
                 let proof_bytes = batch_result.proofs.get(&addr).cloned();
-                let limiter = store_limiter.clone();
                 async move {
                     let proof = proof_bytes.ok_or_else(|| {
                         (
@@ -1450,16 +1449,11 @@ impl Client {
                         )
                     })?;
                     let peers = self.close_group_peers(&addr).await.map_err(|e| (addr, e))?;
-                    observe_op(
-                        &limiter,
-                        || async move {
-                            self.chunk_put_to_close_group(content, proof, &peers).await
-                        },
-                        classify_error,
-                    )
-                    .await
-                    .map(|_| addr)
-                    .map_err(|e| (addr, e))
+                    // Per-peer observation lives in `spawn_chunk_put`.
+                    self.chunk_put_to_close_group(content, proof, &peers)
+                        .await
+                        .map(|_| addr)
+                        .map_err(|e| (addr, e))
                 }
             }))
             .buffer_unordered(store_concurrency);
