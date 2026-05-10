@@ -821,7 +821,7 @@ impl Client {
     /// Equivalent to [`Client::file_prepare_upload_with_visibility`] with
     /// [`Visibility::Private`] — see that method for details.
     pub async fn file_prepare_upload(&self, path: &Path) -> Result<PreparedUpload> {
-        self.file_prepare_upload_with_progress(path, Visibility::Private, None)
+        self.file_prepare_upload_with_progress(path, Visibility::Private, PaymentMode::Auto, None)
             .await
     }
 
@@ -834,7 +834,7 @@ impl Client {
         path: &Path,
         visibility: Visibility,
     ) -> Result<PreparedUpload> {
-        self.file_prepare_upload_with_progress(path, visibility, None)
+        self.file_prepare_upload_with_progress(path, visibility, PaymentMode::Auto, None)
             .await
     }
 
@@ -851,6 +851,13 @@ impl Client {
     /// [`Client::finalize_upload`] (or `_merkle`) succeeds, that address is
     /// surfaced via [`FileUploadResult::data_map_address`] so the uploader
     /// can share a single address from which anyone can retrieve the file.
+    ///
+    /// `mode` selects between merkle-batch and single-payment preparation.
+    /// [`PaymentMode::Auto`] (the typical choice) lets the chunk count decide,
+    /// matching the behaviour of [`Client::file_upload_with_mode`]. Pass
+    /// [`PaymentMode::Single`] to force single-payment preparation even when
+    /// the chunk count would normally trigger merkle, or [`PaymentMode::Merkle`]
+    /// to force merkle preparation.
     ///
     /// When `progress` is `Some`, [`UploadEvent`]s are emitted on the channel
     /// during encryption ([`UploadEvent::Encrypting`] / [`UploadEvent::Encrypted`])
@@ -873,10 +880,11 @@ impl Client {
         &self,
         path: &Path,
         visibility: Visibility,
+        mode: PaymentMode,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<PreparedUpload> {
         debug!(
-            "Preparing file upload for external signing (visibility={visibility:?}): {}",
+            "Preparing file upload for external signing (visibility={visibility:?}, mode={mode:?}): {}",
             path.display()
         );
 
@@ -933,7 +941,7 @@ impl Client {
                 .await;
         }
 
-        let payment_info = if should_use_merkle(chunk_count, PaymentMode::Auto) {
+        let payment_info = if should_use_merkle(chunk_count, mode) {
             // Merkle path: build tree, collect candidate pools, return for external payment.
             info!("Using merkle batch preparation for {chunk_count} file chunks");
 
