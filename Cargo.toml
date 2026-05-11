@@ -1,3 +1,12 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
 resolver = "2"
+
+# Pin ant-protocol to the perf/chunk-put-bytes branch so ChunkPutRequest's
+# `content` field is `Bytes` (not `Vec<u8>`), letting the close-group fan-out
+# in `ant-core/src/data/client/chunk.rs` share a single backing buffer across
+# peer sends instead of `to_vec()`-copying the 4 MB payload per peer.
+# Remove once https://github.com/jacderida/ant-protocol/pull/1 lands and a
+# crates.io release containing it is published.
+[patch.crates-io]
+ant-protocol = { git = "https://github.com/jacderida/ant-protocol.git", rev = "4aac7d35b69a5d0906a6f2acd5d1d0beb52dcbb8" }
