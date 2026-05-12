@@ -120,7 +120,9 @@ pub async fn start(config: &DaemonConfig) -> Result<DaemonStartResult> {
         .to_str()
         .ok_or_else(|| Error::ProcessSpawn("Executable path is not valid UTF-8".to_string()))?;
 
-    let pid = detach::spawn_detached(exe_str, &["node", "daemon", "run"])?;
+    let args = daemon_run_args(config);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let pid = detach::spawn_detached(exe_str, &arg_refs)?;
 
     // Wait briefly for the daemon to write its port file
     let mut port = None;
@@ -349,6 +351,25 @@ fn validate_daemon_process(pid: u32) -> bool {
     }
 }
 
+/// Build the arg list passed to the detached `ant node daemon run` child.
+///
+/// Overrides are forwarded explicitly so the child binds to the same address
+/// and port the caller asked for. Unset fields fall through to the child's
+/// own defaults (loopback + OS-assigned port).
+fn daemon_run_args(config: &DaemonConfig) -> Vec<String> {
+    let defaults = DaemonConfig::default();
+    let mut args = vec!["node".to_string(), "daemon".to_string(), "run".to_string()];
+    if let Some(port) = config.port {
+        args.push("--port".to_string());
+        args.push(port.to_string());
+    }
+    if config.listen_addr != defaults.listen_addr {
+        args.push("--listen-addr".to_string());
+        args.push(config.listen_addr.to_string());
+    }
+    args
+}
+
 fn read_port_file(path: &Path) -> Option<u16> {
     std::fs::read_to_string(path)
         .ok()
@@ -430,5 +451,76 @@ fn is_process_alive(pid: u32) -> bool {
         let success = GetExitCodeProcess(handle, &mut exit_code);
         CloseHandle(handle);
         success != 0 && exit_code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn run_args_default_config_has_no_overrides() {
+        let config = DaemonConfig::default();
+        let args = daemon_run_args(&config);
+        assert_eq!(args, vec!["node", "daemon", "run"]);
+    }
+
+    #[test]
+    fn run_args_forward_explicit_port() {
+        let config = DaemonConfig {
+            port: Some(8765),
+            ..DaemonConfig::default()
+        };
+        let args = daemon_run_args(&config);
+        assert_eq!(args, vec!["node", "daemon", "run", "--port", "8765"]);
+    }
+
+    #[test]
+    fn run_args_forward_explicit_listen_addr() {
+        let config = DaemonConfig {
+            listen_addr: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            ..DaemonConfig::default()
+        };
+        let args = daemon_run_args(&config);
+        assert_eq!(
+            args,
+            vec!["node", "daemon", "run", "--listen-addr", "0.0.0.0"]
+        );
+    }
+
+    #[test]
+    fn run_args_forward_both_overrides() {
+        let config = DaemonConfig {
+            port: Some(8765),
+            listen_addr: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            ..DaemonConfig::default()
+        };
+        let args = daemon_run_args(&config);
+        assert_eq!(
+            args,
+            vec![
+                "node",
+                "daemon",
+                "run",
+                "--port",
+                "8765",
+                "--listen-addr",
+                "0.0.0.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn run_args_forward_explicit_zero_port() {
+        // Explicit `--port 0` is preserved so the user's intent (OS-assigned)
+        // round-trips through the spawn, even though the child's default would
+        // produce the same bind behavior.
+        let config = DaemonConfig {
+            port: Some(0),
+            ..DaemonConfig::default()
+        };
+        let args = daemon_run_args(&config);
+        assert_eq!(args, vec!["node", "daemon", "run", "--port", "0"]);
     }
 }
