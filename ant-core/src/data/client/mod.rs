@@ -79,7 +79,28 @@ const DEFAULT_QUOTE_TIMEOUT_SECS: u64 = 10;
 /// connections with limited upload bandwidth, the default quote timeout (10 s)
 /// is far too short — a 4 MB chunk at 1 Mbps takes ~32 s just for the data
 /// transfer, before accounting for QUIC slow-start and NAT traversal overhead.
-const DEFAULT_STORE_TIMEOUT_SECS: u64 = 10;
+///
+/// For merkle batch PUTs there is an additional storer-side cost: the
+/// payment verifier runs an iterative DHT lookup
+/// (`CLOSENESS_LOOKUP_TIMEOUT` in `ant-node`, **240 s** post-PR #89)
+/// before accepting the proof.
+///
+/// This timeout MUST be >= the storer-side `CLOSENESS_LOOKUP_TIMEOUT`
+/// plus padding for the store-response round-trip and storer-local
+/// I/O. Otherwise the client gives up while the storer is still
+/// happily verifying, the storer wastes CPU/bandwidth on a chunk the
+/// client has already discarded, and the client re-targets a
+/// different close-K member — potentially double-storing the same
+/// chunk and polluting routing.
+///
+/// 270 s = 240 s (storer lookup) + 30 s padding (network RTT + LMDB
+/// put + fsync + clock skew tolerance).
+///
+/// This invariant must be re-validated if either side's timeout
+/// changes. Empirically surfaced as "every cross-region merkle chunk
+/// times out at 10 s" on a 210-node 7-region testnet run on
+/// 2026-05-12; bumping to 270 s flipped that 0/22 -> 8/8 pass rate.
+const DEFAULT_STORE_TIMEOUT_SECS: u64 = 270;
 
 /// Default quote concurrency: high because quoting is pure network I/O
 /// (DHT lookups + small request/response messages) with no CPU-bound work.
