@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
@@ -254,6 +254,11 @@ impl Client {
         let peers = self.close_group_peers(address).await?;
         let addr_hex = hex::encode(address);
 
+        let queried = peers.len();
+        let mut not_found = 0usize;
+        let mut timeout = 0usize;
+        let mut network_err = 0usize;
+
         for (peer, addrs) in &peers {
             match self.chunk_get_from_peer(address, peer, addrs).await {
                 Ok(Some(chunk)) => {
@@ -261,16 +266,28 @@ impl Client {
                     return Ok(Some(chunk));
                 }
                 Ok(None) => {
+                    not_found += 1;
                     debug!("Chunk {addr_hex} not found on peer {peer}, trying next");
                 }
-                Err(Error::Timeout(_) | Error::Network(_)) => {
+                Err(Error::Timeout(_)) => {
+                    timeout += 1;
+                    debug!("Peer {peer} timed out for chunk {addr_hex}, trying next");
+                }
+                Err(Error::Network(_)) => {
+                    network_err += 1;
                     debug!("Peer {peer} unreachable for chunk {addr_hex}, trying next");
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        // None of the close group peers had the chunk
+        // None of the close group peers had the chunk. Emit a single summary
+        // so operators can distinguish data loss (all peers responded NotFound)
+        // from a reachability problem (most peers timed out / errored).
+        info!(
+            "chunk_get exhausted close group for {addr_hex}: \
+             queried={queried} not_found={not_found} timeout={timeout} network_err={network_err}"
+        );
         Ok(None)
     }
 
