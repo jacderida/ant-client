@@ -6,6 +6,7 @@
 pub mod adaptive;
 pub mod batch;
 pub mod cache;
+pub(crate) mod cached_merkle;
 pub mod chunk;
 pub mod data;
 pub mod file;
@@ -114,7 +115,6 @@ const DEFAULT_MERKLE_STORE_TIMEOUT_SECS: u64 = 270;
 /// Default timeout for chunk GET response operations in seconds.
 const DEFAULT_CHUNK_GET_TIMEOUT_SECS: u64 = 10;
 
-
 /// Default quote concurrency: high because quoting is pure network I/O
 /// (DHT lookups + small request/response messages) with no CPU-bound work.
 const DEFAULT_QUOTE_CONCURRENCY: usize = 32;
@@ -158,14 +158,6 @@ pub struct ClientConfig {
     /// This is intentionally independent from `store_timeout_secs`: PUTs
     /// and GETs have different payload direction and performance profiles.
     pub chunk_get_timeout_secs: u64,
-    /// Per-op timeout for **merkle batch** chunk store (PUT)
-    /// operations, in seconds. Separate from `store_timeout_secs`
-    /// because merkle PUTs incur the storer-side
-    /// `CLOSENESS_LOOKUP_TIMEOUT` (240 s post-PR #89) on top of the
-    /// usual store path; the client must wait at least that long
-    /// plus padding, or the storer wastes work on a chunk the client
-    /// has already given up on. Default 270 s.
-    pub merkle_store_timeout_secs: u64,
     /// Number of closest peers to consider for routing.
     pub close_group_size: usize,
     /// **Deprecated.** Pre-adaptive ceiling for quote concurrency.
@@ -215,7 +207,6 @@ impl Default for ClientConfig {
             store_timeout_secs: DEFAULT_STORE_TIMEOUT_SECS,
             merkle_store_timeout_secs: DEFAULT_MERKLE_STORE_TIMEOUT_SECS,
             chunk_get_timeout_secs: DEFAULT_CHUNK_GET_TIMEOUT_SECS,
-            merkle_store_timeout_secs: DEFAULT_MERKLE_STORE_TIMEOUT_SECS,
             close_group_size: CLOSE_GROUP_SIZE,
             quote_concurrency: DEFAULT_QUOTE_CONCURRENCY,
             store_concurrency: DEFAULT_STORE_CONCURRENCY,

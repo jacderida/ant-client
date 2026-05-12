@@ -853,7 +853,7 @@ version = "0.2.3"
 dependencies = [
  "alloy",
  "ant-node",
- "ant-protocol",
+ "ant-protocol 2.0.3 (git+https://github.com/WithAutonomi/ant-protocol.git?rev=93e63b8a41a97c37c24d1164a3ee5525e002ddcd)",
  "anyhow",
  "async-stream",
  "axum",
@@ -871,7 +871,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rmp-serde",
- "saorsa-core 0.24.2 (git+https://github.com/saorsa-labs/saorsa-core?branch=fix%2Fstability-improvements)",
+ "saorsa-core",
  "self-replace",
  "self_encryption",
  "semver 1.0.28",
@@ -907,10 +907,10 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.11.2"
-source = "git+https://github.com/withAutonomi/ant-node?branch=fix%2Fstability-improvements#4920a473a8f9fb8ef48b8c0697b0446d44fd801e"
+source = "git+https://github.com/WithAutonomi/ant-node.git?rev=8b68b2d7f4662faf67ed7812dc6cb37de0c74a8b#8b68b2d7f4662faf67ed7812dc6cb37de0c74a8b"
 dependencies = [
  "aes-gcm-siv",
- "ant-protocol",
+ "ant-protocol 2.0.3 (git+https://github.com/WithAutonomi/ant-protocol?branch=main)",
  "blake3",
  "bytes",
  "chrono",
@@ -933,7 +933,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.13.3",
  "rmp-serde",
- "saorsa-core 0.24.2 (git+https://github.com/saorsa-labs/saorsa-core?branch=fix%2Fstability-improvements)",
+ "saorsa-core",
  "saorsa-pqc 0.5.1",
  "self-replace",
  "self_encryption",
@@ -957,7 +957,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.0.3"
-source = "git+https://github.com/jacderida/ant-protocol.git?rev=4aac7d35b69a5d0906a6f2acd5d1d0beb52dcbb8#4aac7d35b69a5d0906a6f2acd5d1d0beb52dcbb8"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=main#93e63b8a41a97c37c24d1164a3ee5525e002ddcd"
 dependencies = [
  "blake3",
  "bytes",
@@ -965,7 +965,25 @@ dependencies = [
  "hex",
  "postcard",
  "rmp-serde",
- "saorsa-core 0.24.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "saorsa-core",
+ "saorsa-pqc 0.5.1",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ant-protocol"
+version = "2.0.3"
+source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=93e63b8a41a97c37c24d1164a3ee5525e002ddcd#93e63b8a41a97c37c24d1164a3ee5525e002ddcd"
+dependencies = [
+ "blake3",
+ "bytes",
+ "evmlib",
+ "hex",
+ "postcard",
+ "rmp-serde",
+ "saorsa-core",
  "saorsa-pqc 0.5.1",
  "serde",
  "tokio",
@@ -2598,9 +2616,9 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "filetime"
-version = "0.2.28"
+version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d5b2eef6fafbf69f877e55509ce5b11a760690ac9700a2921be067aa6afaef6"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
 dependencies = [
  "cfg-if",
  "libc",
@@ -5196,38 +5214,6 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.24.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03e194874b524ad2a50d0976eb4ebcb81aea326dfb475373de9a2942a90cb2cc"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "bytes",
- "dashmap",
- "dirs 6.0.0",
- "futures",
- "hex",
- "lru",
- "once_cell",
- "parking_lot",
- "postcard",
- "rand 0.8.6",
- "saorsa-pqc 0.5.1",
- "saorsa-transport 0.34.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "wyz",
-]
-
-[[package]]
-name = "saorsa-core"
-version = "0.24.2"
 source = "git+https://github.com/saorsa-labs/saorsa-core?branch=fix%2Fstability-improvements#5586795740eafd9818e827baa2eb2677ff3ba942"
 dependencies = [
  "anyhow",
@@ -5244,7 +5230,7 @@ dependencies = [
  "postcard",
  "rand 0.8.6",
  "saorsa-pqc 0.5.1",
- "saorsa-transport 0.34.1 (git+https://github.com/saorsa-labs/saorsa-transport?branch=fix%2Fstability-improvements)",
+ "saorsa-transport",
  "serde",
  "serde_json",
  "tempfile",
@@ -5336,66 +5322,6 @@ dependencies = [
  "tokio",
  "tracing",
  "wide",
- "zeroize",
-]
-
-[[package]]
-name = "saorsa-transport"
-version = "0.34.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31ebc09fb51e2c325e61ff09892f1256c60ef4f3beb881fd2980befe3e53e9bc"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-lc-rs",
- "blake3",
- "bytes",
- "chrono",
- "clap",
- "core-foundation 0.9.4",
- "dashmap",
- "dirs 5.0.1",
- "enum_dispatch",
- "futures-util",
- "hex",
- "igd-next",
- "indexmap 2.14.0",
- "keyring",
- "libc",
- "lru-slab",
- "nix",
- "once_cell",
- "parking_lot",
- "pin-project-lite",
- "quinn-udp 0.6.1",
- "rand 0.8.6",
- "rcgen",
- "regex",
- "reqwest 0.13.3",
- "rustc-hash",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "rustls-platform-verifier 0.6.2",
- "rustls-post-quantum",
- "saorsa-pqc 0.4.2",
- "serde",
- "serde_json",
- "serde_yaml",
- "slab",
- "socket2 0.5.10",
- "system-configuration 0.6.1",
- "thiserror 2.0.18",
- "time",
- "tinyvec",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "unicode-width",
- "uuid",
- "windows 0.58.0",
- "x25519-dalek",
  "zeroize",
 ]
 
@@ -7710,9 +7636,9 @@ dependencies = [
 
 [[package]]
 name = "zerofrom"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69faa1f2a1ea75661980b013019ed6687ed0e83d069bc1114e2cc74c6c04c4df"
+checksum = "0ec05a11813ea801ff6d75110ad09cd0824ddba17dfe17128ea0d5f68e6c5272"
 dependencies = [
  "zerofrom-derive",
 ]
@@ -7857,13 +7783,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "ant-node"
-version = "0.11.2"
-source = "git+https://github.com/WithAutonomi/ant-node.git?rev=8b68b2d7f4662faf67ed7812dc6cb37de0c74a8b#8b68b2d7f4662faf67ed7812dc6cb37de0c74a8b"
-
-[[patch.unused]]
-name = "ant-protocol"
-version = "2.0.3"
-source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=93e63b8a41a97c37c24d1164a3ee5525e002ddcd#93e63b8a41a97c37c24d1164a3ee5525e002ddcd"
