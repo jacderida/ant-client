@@ -125,7 +125,7 @@ impl Client {
                 Err(e) => return Err(e),
             };
 
-            let chunks_stored = self
+            let (chunks_stored, _stats) = self
                 .merkle_upload_chunks(chunk_contents, addresses, &batch_result, None)
                 .await?;
 

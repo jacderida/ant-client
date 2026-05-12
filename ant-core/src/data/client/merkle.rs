@@ -534,8 +534,9 @@ impl Client {
         addresses: Vec<[u8; 32]>,
         batch_result: &MerkleBatchPaymentResult,
         progress: Option<&mpsc::Sender<UploadEvent>>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, crate::data::client::batch::WaveAggregateStats)> {
         let mut stored = 0usize;
+        let mut stats = crate::data::client::batch::WaveAggregateStats::default();
         let store_limiter = self.controller().store.clone();
         // Clamp fan-out to batch size — partial batches should not
         // pay for unused slots (see PERF-RESULTS.md).
@@ -546,6 +547,7 @@ impl Client {
                 let proof_bytes = batch_result.proofs.get(&addr).cloned();
                 let limiter = store_limiter.clone();
                 async move {
+                    let started = std::time::Instant::now();
                     let proof = proof_bytes.ok_or_else(|| {
                         Error::Payment(format!(
                             "Missing merkle proof for chunk {}",
@@ -561,13 +563,18 @@ impl Client {
                         classify_error,
                     )
                     .await
+                    .map(|_| started)
                 }
             },
         ))
         .buffer_unordered(store_concurrency);
 
         while let Some(result) = upload_stream.next().await {
-            result?;
+            let started = result?;
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            stats.store_durations_ms.push(duration_ms);
+            stats.chunk_attempts_total = stats.chunk_attempts_total.saturating_add(1);
+            stats.retries_histogram[0] = stats.retries_histogram[0].saturating_add(1);
             stored += 1;
             if let Some(tx) = progress {
                 let _ = tx.try_send(UploadEvent::ChunkStored {
@@ -577,7 +584,7 @@ impl Client {
             }
         }
 
-        Ok(stored)
+        Ok((stored, stats))
     }
 }
 

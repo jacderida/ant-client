@@ -279,6 +279,9 @@ async fn handle_file_upload(
                 storage_cost_atto: result.storage_cost_atto.clone(),
                 gas_cost_wei: result.gas_cost_wei.to_string(),
                 elapsed_secs: elapsed.as_secs_f64(),
+                chunk_attempts_total: result.chunk_attempts_total,
+                store_durations_ms: result.store_durations_ms.clone(),
+                retries_histogram: result.retries_histogram,
             };
             println!("{}", serde_json::to_string(&out)?);
         } else {
@@ -331,6 +334,9 @@ async fn handle_file_upload(
                 storage_cost_atto: result.storage_cost_atto.clone(),
                 gas_cost_wei: result.gas_cost_wei.to_string(),
                 elapsed_secs: elapsed.as_secs_f64(),
+                chunk_attempts_total: result.chunk_attempts_total,
+                store_durations_ms: result.store_durations_ms.clone(),
+                retries_histogram: result.retries_histogram,
             };
             println!("{}", serde_json::to_string(&out)?);
         } else {
@@ -583,6 +589,14 @@ struct UploadJsonResult {
     storage_cost_atto: String,
     gas_cost_wei: String,
     elapsed_secs: f64,
+    /// Sum of chunk-store RPC attempts; `>= chunks_stored` on success.
+    chunk_attempts_total: usize,
+    /// Per-chunk store wall-clock in ms. Empty for upload paths that
+    /// don't run the wave store loop.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    store_durations_ms: Vec<u64>,
+    /// Stored-chunk count by retry round (index 0 = first attempt).
+    retries_histogram: [usize; 4],
 }
 
 #[derive(Serialize)]

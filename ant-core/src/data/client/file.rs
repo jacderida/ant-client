@@ -11,7 +11,9 @@
 //! For in-memory data uploads, see the `data` module.
 
 use crate::data::client::adaptive::observe_op;
-use crate::data::client::batch::{finalize_batch_payment, PaymentIntent, PreparedChunk};
+use crate::data::client::batch::{
+    finalize_batch_payment, PaymentIntent, PreparedChunk, WaveAggregateStats,
+};
 use crate::data::client::classify_error;
 use crate::data::client::merkle::{
     finalize_merkle_batch, should_use_merkle, MerkleBatchPaymentResult, PaymentMode,
@@ -480,6 +482,17 @@ pub struct FileUploadResult {
     /// file uploaded before; deterministic via self-encryption), the address
     /// is still returned but no storage payment was made for it.
     pub data_map_address: Option<[u8; 32]>,
+    /// Sum of chunk-store RPC attempts across the upload
+    /// (`>= chunks_stored` on full success; more if any chunk retried).
+    /// `0` for paths that don't run the wave store loop.
+    pub chunk_attempts_total: usize,
+    /// Per-chunk store wall-clock in ms (length == `chunks_stored` on full
+    /// success, empty for paths that don't run the wave store loop).
+    pub store_durations_ms: Vec<u64>,
+    /// Count of stored chunks that succeeded on each retry round
+    /// (index 0 = first attempt, 1 = first retry, etc.). All zeros for
+    /// paths that don't run the wave store loop.
+    pub retries_histogram: [usize; 4],
 }
 
 /// Payment information for external signing — either wave-batch or merkle.
@@ -1095,6 +1108,9 @@ impl Client {
 
                 info!("External-signer upload finalized: {chunks_stored} chunks stored");
 
+                let mut stats = WaveAggregateStats::default();
+                stats.absorb(&wave_result);
+
                 Ok(FileUploadResult {
                     data_map: prepared.data_map,
                     chunks_stored,
@@ -1104,6 +1120,9 @@ impl Client {
                     storage_cost_atto: "0".into(),
                     gas_cost_wei: 0,
                     data_map_address,
+                    chunk_attempts_total: stats.chunk_attempts_total,
+                    store_durations_ms: stats.store_durations_ms,
+                    retries_histogram: stats.retries_histogram,
                 })
             }
             ExternalPaymentInfo::Merkle { .. } => Err(Error::Payment(
@@ -1156,7 +1175,7 @@ impl Client {
                 chunk_addresses,
             } => {
                 let batch_result = finalize_merkle_batch(prepared_batch, winner_pool_hash)?;
-                let chunks_stored = self
+                let (chunks_stored, stats) = self
                     .merkle_upload_chunks(
                         chunk_contents,
                         chunk_addresses,
@@ -1176,6 +1195,9 @@ impl Client {
                     storage_cost_atto: "0".into(),
                     gas_cost_wei: 0,
                     data_map_address,
+                    chunk_attempts_total: stats.chunk_attempts_total,
+                    store_durations_ms: stats.store_durations_ms,
+                    retries_histogram: stats.retries_histogram,
                 })
             }
             ExternalPaymentInfo::WaveBatch { .. } => Err(Error::Payment(
@@ -1246,7 +1268,7 @@ impl Client {
         }
 
         // Phase 2: Decide payment mode and upload in waves from disk.
-        let (chunks_stored, actual_mode, storage_cost_atto, gas_cost_wei) =
+        let (chunks_stored, actual_mode, storage_cost_atto, gas_cost_wei, stats) =
             if self.should_use_merkle(chunk_count, mode) {
                 info!("Using merkle batch payment for {chunk_count} file chunks");
 
@@ -1257,7 +1279,7 @@ impl Client {
                     Ok(result) => result,
                     Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
                         info!("Merkle needs more peers ({msg}), falling back to wave-batch");
-                        let (stored, sc, gc) =
+                        let (stored, sc, gc, fb_stats) =
                             self.upload_waves_single(&spill, progress.as_ref()).await?;
                         return Ok(FileUploadResult {
                             data_map,
@@ -1268,18 +1290,22 @@ impl Client {
                             storage_cost_atto: sc,
                             gas_cost_wei: gc,
                             data_map_address: None,
+                            chunk_attempts_total: fb_stats.chunk_attempts_total,
+                            store_durations_ms: fb_stats.store_durations_ms,
+                            retries_histogram: fb_stats.retries_histogram,
                         });
                     }
                     Err(e) => return Err(e),
                 };
 
-                let (stored, sc, gc) = self
+                let (stored, sc, gc, stats) = self
                     .upload_waves_merkle(&spill, &batch_result, progress.as_ref())
                     .await?;
-                (stored, PaymentMode::Merkle, sc, gc)
+                (stored, PaymentMode::Merkle, sc, gc, stats)
             } else {
-                let (stored, sc, gc) = self.upload_waves_single(&spill, progress.as_ref()).await?;
-                (stored, PaymentMode::Single, sc, gc)
+                let (stored, sc, gc, stats) =
+                    self.upload_waves_single(&spill, progress.as_ref()).await?;
+                (stored, PaymentMode::Single, sc, gc, stats)
             };
 
         info!(
@@ -1296,6 +1322,9 @@ impl Client {
             storage_cost_atto,
             gas_cost_wei,
             data_map_address: None,
+            chunk_attempts_total: stats.chunk_attempts_total,
+            store_durations_ms: stats.store_durations_ms,
+            retries_histogram: stats.retries_histogram,
         })
     }
 
@@ -1353,10 +1382,11 @@ impl Client {
         &self,
         spill: &ChunkSpill,
         progress: Option<&mpsc::Sender<UploadEvent>>,
-    ) -> Result<(usize, String, u128)> {
+    ) -> Result<(usize, String, u128, WaveAggregateStats)> {
         let mut total_stored = 0usize;
         let mut total_storage = Amount::ZERO;
         let mut total_gas: u128 = 0;
+        let mut agg_stats = WaveAggregateStats::default();
         let total_chunks = spill.len();
         let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
         let wave_count = waves.len();
@@ -1381,7 +1411,7 @@ impl Client {
                     })
                     .await;
             }
-            let (addresses, wave_storage, wave_gas) = self
+            let (addresses, wave_storage, wave_gas, wave_stats) = self
                 .batch_upload_chunks_with_events(wave_data, progress, total_stored, total_chunks)
                 .await?;
             total_stored += addresses.len();
@@ -1389,6 +1419,21 @@ impl Client {
                 total_storage += cost;
             }
             total_gas = total_gas.saturating_add(wave_gas);
+            // Merge per-call stats (each call already aggregates across the
+            // waves it ran internally, so a simple sum/extend is correct).
+            agg_stats.chunk_attempts_total = agg_stats
+                .chunk_attempts_total
+                .saturating_add(wave_stats.chunk_attempts_total);
+            agg_stats
+                .store_durations_ms
+                .extend(wave_stats.store_durations_ms);
+            for (slot, count) in agg_stats
+                .retries_histogram
+                .iter_mut()
+                .zip(wave_stats.retries_histogram.iter())
+            {
+                *slot = slot.saturating_add(*count);
+            }
             if let Some(tx) = progress {
                 let _ = tx
                     .send(UploadEvent::WaveComplete {
@@ -1401,7 +1446,12 @@ impl Client {
             }
         }
 
-        Ok((total_stored, total_storage.to_string(), total_gas))
+        Ok((
+            total_stored,
+            total_storage.to_string(),
+            total_gas,
+            agg_stats,
+        ))
     }
 
     /// Upload chunks from a spill using pre-computed merkle proofs.
@@ -1416,12 +1466,13 @@ impl Client {
         spill: &ChunkSpill,
         batch_result: &MerkleBatchPaymentResult,
         progress: Option<&mpsc::Sender<UploadEvent>>,
-    ) -> Result<(usize, String, u128)> {
+    ) -> Result<(usize, String, u128, WaveAggregateStats)> {
         let mut total_stored = 0usize;
         let total_chunks = spill.len();
         let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
         let wave_count = waves.len();
         let mut stored_addresses: Vec<[u8; 32]> = Vec::new();
+        let mut agg_stats = WaveAggregateStats::default();
 
         for (wave_idx, wave_addrs) in waves.into_iter().enumerate() {
             let wave_num = wave_idx + 1;
@@ -1440,6 +1491,7 @@ impl Client {
                 let proof_bytes = batch_result.proofs.get(&addr).cloned();
                 let limiter = store_limiter.clone();
                 async move {
+                    let started = std::time::Instant::now();
                     let proof = proof_bytes.ok_or_else(|| {
                         (
                             addr,
@@ -1447,9 +1499,13 @@ impl Client {
                                 "Missing merkle proof for chunk {}",
                                 hex::encode(addr)
                             )),
+                            started,
                         )
                     })?;
-                    let peers = self.close_group_peers(&addr).await.map_err(|e| (addr, e))?;
+                    let peers = self
+                        .close_group_peers(&addr)
+                        .await
+                        .map_err(|e| (addr, e, started))?;
                     observe_op(
                         &limiter,
                         || async move {
@@ -1458,15 +1514,22 @@ impl Client {
                         classify_error,
                     )
                     .await
-                    .map(|_| addr)
-                    .map_err(|e| (addr, e))
+                    .map(|_| (addr, started))
+                    .map_err(|e| (addr, e, started))
                 }
             }))
             .buffer_unordered(store_concurrency);
 
             while let Some(result) = upload_stream.next().await {
                 match result {
-                    Ok(addr) => {
+                    Ok((addr, started)) => {
+                        let duration_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        agg_stats.store_durations_ms.push(duration_ms);
+                        agg_stats.chunk_attempts_total =
+                            agg_stats.chunk_attempts_total.saturating_add(1);
+                        agg_stats.retries_histogram[0] =
+                            agg_stats.retries_histogram[0].saturating_add(1);
                         stored_addresses.push(addr);
                         total_stored += 1;
                         info!("Stored {total_stored}/{total_chunks}");
@@ -1479,7 +1542,7 @@ impl Client {
                                 .await;
                         }
                     }
-                    Err((addr, e)) => {
+                    Err((addr, e, _started)) => {
                         warn!("merkle upload failed for chunk {}: {e}", hex::encode(addr));
                         return Err(Error::PartialUpload {
                             stored: stored_addresses,
@@ -1509,6 +1572,7 @@ impl Client {
             total_stored,
             batch_result.storage_cost_atto.clone(),
             batch_result.gas_cost_wei,
+            agg_stats,
         ))
     }
 
