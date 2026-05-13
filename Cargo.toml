@@ -2,18 +2,3 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
-# Pin ant-protocol to WithAutonomi/ant-protocol `main` so ChunkPutRequest's
-# `content` field is `Bytes` (not `Vec<u8>`), letting the close-group fan-out
-# in `ant-core/src/data/client/chunk.rs` share a single backing buffer across
-# peer sends instead of `to_vec()`-copying the 4 MB payload per peer.
-# The `Bytes` change landed in https://github.com/WithAutonomi/ant-protocol/pull/6.
-# Remove once a crates.io release containing it is published.
-#
-# ant-node (a dev-dep of ant-core) was updated to the new `Bytes`-typed
-# `ChunkPutRequest::content` on `main` but no crates.io release yet exists
-# that includes it. Without this patch, the transitive `ant-node 0.11.2`
-# fails to build under `cargo clippy --all-targets` / `cargo test`.
-[patch.crates-io]
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol.git", branch = "rc-2026.5.2" }
-ant-node = { git = "https://github.com/WithAutonomi/ant-node.git", branch = "rc-2026.5.2" }
-
