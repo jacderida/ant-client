@@ -14,6 +14,6 @@ resolver = "2"
 # that includes it. Without this patch, the transitive `ant-node 0.11.2`
 # fails to build under `cargo clippy --all-targets` / `cargo test`.
 [patch.crates-io]
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol.git", rev = "93e63b8a41a97c37c24d1164a3ee5525e002ddcd" }
-ant-node = { git = "https://github.com/WithAutonomi/ant-node.git", rev = "8b68b2d7f4662faf67ed7812dc6cb37de0c74a8b" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol.git", branch = "rc-2026.5.2" }
+ant-node = { git = "https://github.com/WithAutonomi/ant-node.git", branch = "rc-2026.5.2" }
 
