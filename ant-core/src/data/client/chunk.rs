@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 const CHUNK_DATA_TYPE: u32 = 0;
 
 /// Store-response timeout for non-merkle chunk PUTs.
-const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn store_response_timeout_for_proof(proof: &[u8], merkle_timeout_secs: u64) -> Duration {
     match detect_proof_type(proof) {
@@ -313,9 +313,9 @@ impl Client {
             .encode()
             .map_err(|e| Error::Protocol(format!("Failed to encode GET request: {e}")))?;
 
-        let timeout = Duration::from_secs(self.config().store_timeout_secs);
+        let timeout = Duration::from_secs(self.config().chunk_get_timeout_secs);
         let addr_hex = hex::encode(address);
-        let timeout_secs = self.config().store_timeout_secs;
+        let timeout_secs = self.config().chunk_get_timeout_secs;
 
         let start = Instant::now();
         let result = send_and_await_chunk_response(

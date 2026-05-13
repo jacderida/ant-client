@@ -44,7 +44,10 @@ pub enum PaymentMode {
 }
 
 /// Result of a merkle batch payment.
-#[derive(Debug)]
+///
+/// Serializable so it can be persisted across runs for resume after a
+/// partial-upload failure. See `crate::data::client::cached_merkle`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MerkleBatchPaymentResult {
     /// Map of `XorName` to serialized tagged proof bytes (ready to use in PUT requests).
     pub proofs: HashMap<[u8; 32], Vec<u8>>,
@@ -54,6 +57,12 @@ pub struct MerkleBatchPaymentResult {
     pub storage_cost_atto: String,
     /// Total gas cost in wei.
     pub gas_cost_wei: u128,
+    /// Unix timestamp (seconds) used for the on-chain merkle payment.
+    /// Persisted so resume can check whether the on-chain payment has
+    /// aged out beyond the merkle expiration window and the cached
+    /// receipt must be discarded.
+    #[serde(default)]
+    pub merkle_payment_timestamp: u64,
 }
 
 /// Prepared merkle batch ready for external payment.
@@ -252,6 +261,10 @@ impl Client {
         let mut all_proofs = HashMap::with_capacity(addresses.len());
         let mut total_storage = Amount::ZERO;
         let mut total_gas: u128 = 0;
+        // Track the oldest sub-batch timestamp so the overall receipt
+        // expires when the *first* sub-batch's on-chain payment ages
+        // out (worst case for resume).
+        let mut oldest_ts: u64 = 0;
 
         for (i, chunk) in sub_batches.into_iter().enumerate() {
             match self
@@ -263,6 +276,12 @@ impl Client {
                         total_storage += cost;
                     }
                     total_gas = total_gas.saturating_add(sub_result.gas_cost_wei);
+                    if oldest_ts == 0
+                        || (sub_result.merkle_payment_timestamp > 0
+                            && sub_result.merkle_payment_timestamp < oldest_ts)
+                    {
+                        oldest_ts = sub_result.merkle_payment_timestamp;
+                    }
                     all_proofs.extend(sub_result.proofs);
                 }
                 Err(e) => {
@@ -282,6 +301,7 @@ impl Client {
                         proofs: all_proofs,
                         storage_cost_atto: total_storage.to_string(),
                         gas_cost_wei: total_gas,
+                        merkle_payment_timestamp: oldest_ts,
                     });
                 }
             }
@@ -292,6 +312,7 @@ impl Client {
             proofs: all_proofs,
             storage_cost_atto: total_storage.to_string(),
             gas_cost_wei: total_gas,
+            merkle_payment_timestamp: oldest_ts,
         })
     }
 
@@ -640,6 +661,7 @@ pub fn finalize_merkle_batch(
         chunk_count,
         storage_cost_atto: "0".to_string(),
         gas_cost_wei: 0,
+        merkle_payment_timestamp: prepared.merkle_payment_timestamp,
     })
 }
 

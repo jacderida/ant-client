@@ -78,6 +78,7 @@ async fn run() -> anyhow::Result<()> {
         ipv4_only,
         quote_timeout_secs,
         store_timeout_secs,
+        chunk_get_timeout_secs,
         verbose: _,
         evm_network,
         quote_concurrency,
@@ -92,6 +93,7 @@ async fn run() -> anyhow::Result<()> {
         ipv4_only,
         quote_timeout_secs,
         store_timeout_secs,
+        chunk_get_timeout_secs,
         evm_network,
         quote_concurrency,
         store_concurrency,
@@ -170,7 +172,8 @@ struct DataCliContext {
     allow_loopback: bool,
     ipv4_only: bool,
     quote_timeout_secs: u64,
-    store_timeout_secs: u64,
+    store_timeout_secs: Option<u64>,
+    chunk_get_timeout_secs: Option<u64>,
     evm_network: String,
     quote_concurrency: Option<usize>,
     store_concurrency: Option<usize>,
@@ -256,9 +259,14 @@ async fn build_data_client(
 
     let mut config = ClientConfig {
         quote_timeout_secs: ctx.quote_timeout_secs,
-        store_timeout_secs: ctx.store_timeout_secs,
         ..Default::default()
     };
+    if let Some(t) = ctx.store_timeout_secs {
+        config.store_timeout_secs = t;
+    }
+    if let Some(t) = ctx.chunk_get_timeout_secs {
+        config.chunk_get_timeout_secs = t;
+    }
     // Legacy default values are treated as "not pinned" by build_controller
     // (so the default ClientConfig doesn't silently lower the new
     // adaptive ceilings). Mirror that here so the deprecation warning
