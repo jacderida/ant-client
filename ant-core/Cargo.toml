@@ -1,6 +1,6 @@
 [package]
 name = "ant-core"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Headless Rust library for the Autonomi network: data storage and retrieval with self-encryption and EVM payments, plus node lifecycle management."
 license = "MIT OR Apache-2.0"
@@ -36,7 +36,7 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "93e63b8a41a97c37c24d1164a3ee5525e002ddcd" }
+ant-protocol = "2.1.0"
 xor_name = "5"
 self_encryption = "0.35.0"
 futures = "0.3"
@@ -56,7 +56,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # ant-node is optional. It is only linked for the `LocalDevnet` wrapper
 # that spawns a local in-process network for development and testing.
 # Enable with `--features devnet`.
-ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "8b68b2d7f4662faf67ed7812dc6cb37de0c74a8b", optional = true }
+ant-node = { version = "0.11.3", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -82,7 +82,7 @@ devnet = ["dep:ant-node"]
 # in-process to exercise the wire protocol end-to-end. ant-node is a
 # dev-dep here (separate from the optional runtime dep above) so tests
 # always compile even without the `devnet` feature.
-ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "8b68b2d7f4662faf67ed7812dc6cb37de0c74a8b" }
+ant-node = "0.11.3"
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
@@ -92,7 +92,7 @@ rmp-serde = "1"
 # which populates a cache via `add_peer_trusted` (bypasses Sybil rate limits)
 # and then verifies reload after save. Test-only — no runtime version-pin
 # concern. Tracks ant-node's transitive saorsa-core dep.
-saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core", branch = "fix/stability-improvements" }
+saorsa-core = "0.24.3"
 
 [[example]]
 name = "start-local-devnet"
