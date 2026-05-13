@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.2.2"
+version = "0.2.3-rc.1"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -849,11 +849,11 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.2.3"
+version = "0.2.4-rc.1"
 dependencies = [
  "alloy",
  "ant-node",
- "ant-protocol 2.0.3 (git+https://github.com/WithAutonomi/ant-protocol.git?rev=93e63b8a41a97c37c24d1164a3ee5525e002ddcd)",
+ "ant-protocol 2.1.0-rc.1",
  "anyhow",
  "async-stream",
  "axum",
@@ -871,7 +871,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rmp-serde",
- "saorsa-core",
+ "saorsa-core 0.24.2",
  "self-replace",
  "self_encryption",
  "semver 1.0.28",
@@ -910,7 +910,7 @@ version = "0.11.2"
 source = "git+https://github.com/WithAutonomi/ant-node.git?rev=8b68b2d7f4662faf67ed7812dc6cb37de0c74a8b#8b68b2d7f4662faf67ed7812dc6cb37de0c74a8b"
 dependencies = [
  "aes-gcm-siv",
- "ant-protocol 2.0.3 (git+https://github.com/WithAutonomi/ant-protocol?branch=main)",
+ "ant-protocol 2.0.3",
  "blake3",
  "bytes",
  "chrono",
@@ -933,7 +933,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.13.3",
  "rmp-serde",
- "saorsa-core",
+ "saorsa-core 0.24.2",
  "saorsa-pqc 0.5.1",
  "self-replace",
  "self_encryption",
@@ -965,7 +965,7 @@ dependencies = [
  "hex",
  "postcard",
  "rmp-serde",
- "saorsa-core",
+ "saorsa-core 0.24.2",
  "saorsa-pqc 0.5.1",
  "serde",
  "tokio",
@@ -974,8 +974,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.0.3"
-source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=93e63b8a41a97c37c24d1164a3ee5525e002ddcd#93e63b8a41a97c37c24d1164a3ee5525e002ddcd"
+version = "2.1.0-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.5.2#971c7778840f647cdb76e6e03f4aeffd79e703ea"
 dependencies = [
  "blake3",
  "bytes",
@@ -983,7 +983,7 @@ dependencies = [
  "hex",
  "postcard",
  "rmp-serde",
- "saorsa-core",
+ "saorsa-core 0.24.3-rc.1",
  "saorsa-pqc 0.5.1",
  "serde",
  "tokio",
@@ -5230,7 +5230,38 @@ dependencies = [
  "postcard",
  "rand 0.8.6",
  "saorsa-pqc 0.5.1",
- "saorsa-transport",
+ "saorsa-transport 0.34.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "wyz",
+]
+
+[[package]]
+name = "saorsa-core"
+version = "0.24.3-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.5.2#8293fa50ca1397c9619b8d2de8ef5eb4e78c53c4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "dashmap",
+ "dirs 6.0.0",
+ "futures",
+ "hex",
+ "lru",
+ "once_cell",
+ "parking_lot",
+ "postcard",
+ "rand 0.8.6",
+ "saorsa-pqc 0.5.1",
+ "saorsa-transport 0.34.2-rc.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -5329,6 +5360,65 @@ dependencies = [
 name = "saorsa-transport"
 version = "0.34.1"
 source = "git+https://github.com/saorsa-labs/saorsa-transport?branch=fix%2Fstability-improvements#55f423ca5e3312e31ba22475b68a76f4ffd50285"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-lc-rs",
+ "blake3",
+ "bytes",
+ "chrono",
+ "clap",
+ "core-foundation 0.9.4",
+ "dashmap",
+ "dirs 5.0.1",
+ "enum_dispatch",
+ "futures-util",
+ "hex",
+ "igd-next",
+ "indexmap 2.14.0",
+ "keyring",
+ "libc",
+ "lru-slab",
+ "nix",
+ "once_cell",
+ "parking_lot",
+ "pin-project-lite",
+ "quinn-udp 0.6.1",
+ "rand 0.8.6",
+ "rcgen",
+ "regex",
+ "reqwest 0.13.3",
+ "rustc-hash",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "rustls-platform-verifier 0.6.2",
+ "rustls-post-quantum",
+ "saorsa-pqc 0.4.2",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "slab",
+ "socket2 0.5.10",
+ "system-configuration 0.6.1",
+ "thiserror 2.0.18",
+ "time",
+ "tinyvec",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width",
+ "uuid",
+ "windows 0.58.0",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "saorsa-transport"
+version = "0.34.2-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-transport?branch=rc-2026.5.2#0e0de4d8992b06ef2c93701024ce509527db05e0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7783,3 +7873,8 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "ant-protocol"
+version = "2.0.3"
+source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=93e63b8a41a97c37c24d1164a3ee5525e002ddcd#93e63b8a41a97c37c24d1164a3ee5525e002ddcd"
