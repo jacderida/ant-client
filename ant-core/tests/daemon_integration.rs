@@ -111,6 +111,37 @@ async fn port_and_pid_files_written() {
 }
 
 #[tokio::test]
+async fn server_binds_to_pinned_port() {
+    // Reserve a free port by binding to 0, then drop the listener so the
+    // server can claim it. A tiny TOCTOU race is acceptable in tests.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let pinned_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = DaemonConfig {
+        port: Some(pinned_port),
+        ..test_config(&dir)
+    };
+    let port_file = config.port_file_path.clone();
+    let registry = NodeRegistry::load(&config.registry_path).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let addr = server::start(config, registry, shutdown.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(addr.port(), pinned_port, "server bound to the wrong port");
+
+    let port_contents = std::fs::read_to_string(&port_file).unwrap();
+    let written_port: u16 = port_contents.trim().parse().unwrap();
+    assert_eq!(written_port, pinned_port);
+
+    shutdown.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
 async fn console_returns_html() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(&dir);

@@ -224,12 +224,32 @@ Manage Autonomi network nodes via a local daemon process. The daemon runs in the
 
 #### `ant node daemon start`
 
-Launch the daemon as a detached background process.
+Launch the daemon as a detached background process. By default it binds to a random free port on `127.0.0.1` and writes the chosen port to `daemon.port` for discovery.
 
 ```
 $ ant node daemon start
 Daemon started (pid: 12345, port: 48532)
 ```
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--port <PORT>` | Pin the HTTP port. `0` means OS-assigned (the default behavior). |
+| `--listen-addr <IP>` | Bind address. Defaults to `127.0.0.1`. |
+
+Pin the port and bind on all interfaces — useful when the daemon runs inside a container and the API needs to be reachable through a port mapping:
+
+```
+$ ant node daemon start --listen-addr 0.0.0.0 --port 8765
+```
+
+```
+$ docker run -d -p 8765:8765 my/ant-image \
+    ant node daemon start --listen-addr 0.0.0.0 --port 8765
+```
+
+> **Warning:** the daemon has no authentication. Binding to a non-loopback address exposes node management — start, stop, reset, registry mutation — to anyone who can reach the port. Only do this when the network path is controlled (e.g. a container with an explicit port mapping or a trusted private network).
 
 #### `ant node daemon stop`
 

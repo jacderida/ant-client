@@ -3,9 +3,11 @@
 //! Chunks are immutable, content-addressed data blocks where the address
 //! is the BLAKE3 hash of the content.
 
+use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
 use crate::data::client::peer_cache::record_peer_outcome;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
+use ant_protocol::evm::{QuoteHash, TxHash};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{
     compute_address, detect_proof_type, send_and_await_chunk_response, ChunkGetRequest,
@@ -14,6 +16,7 @@ use ant_protocol::{
 };
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -381,6 +384,43 @@ impl Client {
     /// Returns an error if the network operation fails.
     pub async fn chunk_exists(&self, address: &XorName) -> Result<bool> {
         self.chunk_get(address).await.map(|opt| opt.is_some())
+    }
+
+    /// Finalize a single-chunk publish after an external signer has paid.
+    ///
+    /// Single-chunk analogue of [`Client::finalize_upload`]. Takes a
+    /// [`PreparedChunk`] (from [`Client::prepare_chunk_payment`]) and a
+    /// `quote_hash -> tx_hash` map containing receipts for every non-zero
+    /// quote in the chunk's payment. Builds the `PaymentProof` and stores
+    /// the chunk on `CLOSE_GROUP_MAJORITY` peers, returning its address.
+    ///
+    /// Wave-batch payment shape only. Single-chunk publishes don't need
+    /// Merkle batching: one chunk's worth of quotes is well below the
+    /// wave-batch threshold.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the proof construction fails (e.g. missing
+    /// `tx_hash` for a non-zero quote) or if fewer than
+    /// `CLOSE_GROUP_MAJORITY` peers accept the chunk.
+    pub async fn finalize_chunk(
+        &self,
+        prepared: PreparedChunk,
+        tx_hash_map: &HashMap<QuoteHash, TxHash>,
+    ) -> Result<XorName> {
+        let mut paid = finalize_batch_payment(vec![prepared], tx_hash_map)?;
+        // finalize_batch_payment returns one PaidChunk per PreparedChunk
+        // input; we passed exactly one. If that invariant is ever violated
+        // it's an upstream bug — fail loudly rather than silently address-0.
+        let chunk = paid.pop().ok_or_else(|| {
+            Error::Payment(
+                "finalize_batch_payment returned no paid chunks for a single \
+                 prepared chunk — internal invariant violated"
+                    .into(),
+            )
+        })?;
+        self.chunk_put_to_close_group(chunk.content, chunk.proof_bytes, &chunk.quoted_peers)
+            .await
     }
 }
 

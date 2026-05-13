@@ -1,13 +1,33 @@
-use clap::Subcommand;
+use std::net::IpAddr;
+
+use clap::{Args, Subcommand};
 use colored::Colorize;
 
 use ant_core::node::daemon::client;
 use ant_core::node::types::DaemonConfig;
 
+/// Bind overrides shared by `daemon start` and `daemon run`.
+#[derive(Args, Clone, Debug, Default)]
+pub struct BindArgs {
+    /// Pin the daemon's HTTP port. Unset (default) lets the OS assign one;
+    /// `0` is also accepted as an explicit OS-assigned request.
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
+
+    /// Address the daemon binds to. Defaults to `127.0.0.1`.
+    ///
+    /// Binding to a non-loopback address (e.g. `0.0.0.0`) exposes node
+    /// management to anyone who can reach the port. The daemon has no
+    /// authentication — only do this when the network path is controlled
+    /// (e.g. inside a container with an explicit port mapping).
+    #[arg(long, value_name = "IP")]
+    pub listen_addr: Option<IpAddr>,
+}
+
 #[derive(Subcommand)]
 pub enum DaemonCommand {
     /// Launch the daemon as a detached background process
-    Start,
+    Start(BindArgs),
     /// Shut down the running daemon
     Stop,
     /// Show whether the daemon is running and summary stats
@@ -16,7 +36,19 @@ pub enum DaemonCommand {
     Info,
     /// Run the daemon in the foreground (used internally)
     #[command(hide = true)]
-    Run,
+    Run(BindArgs),
+}
+
+/// Overlay user-provided bind overrides onto `DaemonConfig::default()`.
+fn apply_bind_args(args: &BindArgs) -> DaemonConfig {
+    let mut config = DaemonConfig::default();
+    if let Some(port) = args.port {
+        config.port = Some(port);
+    }
+    if let Some(addr) = args.listen_addr {
+        config.listen_addr = addr;
+    }
+    config
 }
 
 fn format_uptime(secs: u64) -> String {
@@ -50,10 +82,13 @@ fn resolve_port(config: &DaemonConfig, status_port: Option<u16>) -> Option<u16> 
 
 impl DaemonCommand {
     pub async fn execute(self, json_output: bool) -> anyhow::Result<()> {
-        let config = DaemonConfig::default();
+        let config = match &self {
+            DaemonCommand::Start(args) | DaemonCommand::Run(args) => apply_bind_args(args),
+            _ => DaemonConfig::default(),
+        };
 
         match self {
-            DaemonCommand::Start => {
+            DaemonCommand::Start(args) => {
                 let result = client::start(&config).await?;
                 if json_output {
                     println!("{}", serde_json::to_string(&result)?);
@@ -66,6 +101,13 @@ impl DaemonCommand {
                     );
                     if let Some(p) = port {
                         println!("  {} http://127.0.0.1:{p}/console", "Console".dimmed());
+                    }
+                    if args.port.is_some() || args.listen_addr.is_some() {
+                        println!(
+                            "  {} the running daemon was started with different settings; \
+                             stop it first to apply --port / --listen-addr",
+                            "Note:".yellow()
+                        );
                     }
                 } else {
                     let pid = result.pid.to_string().bold();
@@ -179,7 +221,7 @@ impl DaemonCommand {
                     }
                 }
             }
-            DaemonCommand::Run => {
+            DaemonCommand::Run(_) => {
                 client::run(config).await?;
             }
         }

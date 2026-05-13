@@ -83,6 +83,27 @@ Verify: `running` is `true`, `api_base` contains a URL like `http://127.0.0.1:<p
 
 Save the `api_base` URL for REST API checks later.
 
+**Step 5.4 — Pinned-port flag round-trip:**
+
+Verify `--port` is honored end-to-end. Stop the daemon, restart it with an explicit port, confirm the bound port matches, then restore the OS-assigned default for the rest of the test.
+
+```
+ant node daemon stop --json
+ant node daemon start --port 18765 --json
+ant node daemon status --json
+```
+
+Verify on the status response: `running` is `true` and `port` is exactly `18765`. If port 18765 is already in use on the test host, the daemon will fail to start — choose a different free high port and re-run.
+
+Then restore the baseline so the rest of the phases use the default OS-assigned port:
+
+```
+ant node daemon stop --json
+ant node daemon start --json
+```
+
+Re-run `ant node daemon info --json` and update the saved `api_base` URL (the port will have changed).
+
 ### Phase 6: Node management
 
 **Step 6.1 — Add nodes:**
@@ -403,6 +424,7 @@ Phase 5: Daemon Lifecycle
   [PASS] 5.1 Daemon start
   [PASS] 5.2 Daemon status
   [PASS] 5.3 Daemon info
+  [PASS] 5.4 Pinned-port flag round-trip
 
 Phase 6: Node Management
   [PASS] 6.1 Add 3 nodes
