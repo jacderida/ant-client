@@ -166,7 +166,8 @@ impl Client {
     ) -> Result<XorName> {
         let address = compute_address(&content);
         let node = self.network().node();
-        let timeout = store_response_timeout_for_proof(&proof, self.config().store_timeout_secs);
+        let timeout =
+            store_response_timeout_for_proof(&proof, self.config().merkle_store_timeout_secs);
         let timeout_secs = timeout.as_secs();
 
         let request_id = self.next_request_id();
@@ -415,5 +416,47 @@ mod tests {
             store_response_timeout_for_proof(&[PROOF_TAG_MERKLE], TEST_MERKLE_TIMEOUT_SECS);
 
         assert_eq!(timeout, Duration::from_secs(TEST_MERKLE_TIMEOUT_SECS));
+    }
+
+    /// Regression: the default `merkle_store_timeout_secs` must be at
+    /// least the storer-side `CLOSENESS_LOOKUP_TIMEOUT` (240 s) plus
+    /// padding. If either side moves and this invariant breaks, the
+    /// client will give up on chunks the storer is still verifying.
+    /// See `DEFAULT_MERKLE_STORE_TIMEOUT_SECS` doc comment for the
+    /// derivation.
+    #[test]
+    fn default_merkle_store_timeout_satisfies_storer_invariant() {
+        use crate::data::client::ClientConfig;
+        const STORER_CLOSENESS_LOOKUP_TIMEOUT_SECS: u64 = 240;
+        const MIN_PADDING_SECS: u64 = 30;
+        let config = ClientConfig::default();
+        assert!(
+            config.merkle_store_timeout_secs
+                >= STORER_CLOSENESS_LOOKUP_TIMEOUT_SECS + MIN_PADDING_SECS,
+            "merkle_store_timeout_secs ({}) must be >= storer CLOSENESS_LOOKUP_TIMEOUT ({}) + padding ({})",
+            config.merkle_store_timeout_secs,
+            STORER_CLOSENESS_LOOKUP_TIMEOUT_SECS,
+            MIN_PADDING_SECS,
+        );
+    }
+
+    /// Regression: the non-merkle PUT path uses the hardcoded
+    /// `STORE_RESPONSE_TIMEOUT` constant, not the per-config
+    /// `merkle_store_timeout_secs`. If a future refactor accidentally
+    /// routes non-merkle PUTs through the merkle field they'd inherit
+    /// the 270 s value and silently regress non-merkle latency.
+    /// `store_response_timeout_for_proof` with a non-merkle proof tag
+    /// must return the const regardless of what merkle timeout is
+    /// passed.
+    #[test]
+    fn non_merkle_put_ignores_merkle_timeout_value() {
+        let absurd_merkle_timeout = 9_999;
+        for tag in [PROOF_TAG_SINGLE_NODE, UNKNOWN_PROOF_TAG] {
+            let timeout = store_response_timeout_for_proof(&[tag], absurd_merkle_timeout);
+            assert_eq!(
+                timeout, STORE_RESPONSE_TIMEOUT,
+                "non-merkle proof tag {tag:#x} should ignore merkle timeout {absurd_merkle_timeout}",
+            );
+        }
     }
 }

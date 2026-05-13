@@ -73,13 +73,43 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
 /// Default timeout for lightweight network operations (quotes, DHT lookups) in seconds.
 const DEFAULT_QUOTE_TIMEOUT_SECS: u64 = 10;
 
-/// Default timeout for chunk store operations in seconds.
+/// Default timeout for the per-peer chunk GET response and any other
+/// caller that explicitly reads `store_timeout_secs`, in seconds.
 ///
-/// Chunk PUTs transfer multi-MB payloads to multiple peers. On residential
-/// connections with limited upload bandwidth, the default quote timeout (10 s)
-/// is far too short — a 4 MB chunk at 1 Mbps takes ~32 s just for the data
-/// transfer, before accounting for QUIC slow-start and NAT traversal overhead.
+/// Note despite the name: this knob does **not** govern the non-merkle
+/// chunk PUT response timeout — that path uses the
+/// `STORE_RESPONSE_TIMEOUT` constant in `chunk.rs` directly. Nor does
+/// it govern the merkle batch PUT timeout — see
+/// `DEFAULT_MERKLE_STORE_TIMEOUT_SECS`.
+///
+/// 10 s matches the pre-existing `main` default and intentionally
+/// excludes residential-upload tuning, which is Mick's PR #78
+/// territory (splitting GET into its own field).
 const DEFAULT_STORE_TIMEOUT_SECS: u64 = 10;
+
+/// Default timeout for **merkle batch** chunk store operations in seconds.
+///
+/// Separate from `DEFAULT_STORE_TIMEOUT_SECS` because merkle PUTs carry
+/// an extra storer-side cost: the payment verifier runs an iterative
+/// DHT lookup (`CLOSENESS_LOOKUP_TIMEOUT` in `ant-node`, **240 s**
+/// post-PR #89) before accepting the proof.
+///
+/// This timeout MUST be >= the storer-side `CLOSENESS_LOOKUP_TIMEOUT`
+/// plus padding for the store-response round-trip and storer-local
+/// I/O. Otherwise the client gives up while the storer is still
+/// happily verifying, the storer wastes CPU/bandwidth on a chunk the
+/// client has already discarded, and the client re-targets a
+/// different close-K member — potentially double-storing the same
+/// chunk and polluting routing.
+///
+/// 270 s = 240 s (storer lookup) + 30 s padding (network RTT + LMDB
+/// put + fsync + clock skew tolerance).
+///
+/// This invariant must be re-validated if either side's timeout
+/// changes. Empirically surfaced as "every cross-region merkle chunk
+/// times out at 10 s" on a 210-node 7-region testnet run on
+/// 2026-05-12; bumping to 270 s flipped that 0/22 -> 9/9 pass rate.
+const DEFAULT_MERKLE_STORE_TIMEOUT_SECS: u64 = 270;
 
 /// Default quote concurrency: high because quoting is pure network I/O
 /// (DHT lookups + small request/response messages) with no CPU-bound work.
@@ -98,11 +128,28 @@ pub struct ClientConfig {
     /// DHT lookups), in seconds. The adaptive controller does NOT
     /// currently size timeouts; this remains a static knob.
     pub quote_timeout_secs: u64,
-    /// Per-op timeout for chunk store (PUT) operations, in seconds.
-    /// Should be larger than `quote_timeout_secs` because chunk PUTs
-    /// transfer multi-MB payloads. The adaptive controller does NOT
-    /// currently size timeouts; this remains a static knob.
+    /// Per-op timeout, in seconds, for the chunk GET response path
+    /// (`chunk_get_from_peer`) and any other caller that reads this
+    /// field directly.
+    ///
+    /// Note despite the historical name `store_timeout_secs`: this
+    /// knob does **not** govern the non-merkle chunk PUT response
+    /// timeout (that path uses the `STORE_RESPONSE_TIMEOUT` constant
+    /// in `chunk.rs`) and does **not** govern the merkle batch PUT
+    /// timeout (see `merkle_store_timeout_secs`). Rename pending in
+    /// Mick's PR #78 which adds a dedicated `chunk_get_timeout_secs`.
+    ///
+    /// The adaptive controller does NOT currently size timeouts;
+    /// this remains a static knob.
     pub store_timeout_secs: u64,
+    /// Per-op timeout for **merkle batch** chunk store (PUT)
+    /// operations, in seconds. Separate from `store_timeout_secs`
+    /// because merkle PUTs incur the storer-side
+    /// `CLOSENESS_LOOKUP_TIMEOUT` (240 s post-PR #89) on top of the
+    /// usual store path; the client must wait at least that long
+    /// plus padding, or the storer wastes work on a chunk the client
+    /// has already given up on. Default 270 s.
+    pub merkle_store_timeout_secs: u64,
     /// Number of closest peers to consider for routing.
     pub close_group_size: usize,
     /// **Deprecated.** Pre-adaptive ceiling for quote concurrency.
@@ -150,6 +197,7 @@ impl Default for ClientConfig {
         Self {
             quote_timeout_secs: DEFAULT_QUOTE_TIMEOUT_SECS,
             store_timeout_secs: DEFAULT_STORE_TIMEOUT_SECS,
+            merkle_store_timeout_secs: DEFAULT_MERKLE_STORE_TIMEOUT_SECS,
             close_group_size: CLOSE_GROUP_SIZE,
             quote_concurrency: DEFAULT_QUOTE_CONCURRENCY,
             store_concurrency: DEFAULT_STORE_CONCURRENCY,

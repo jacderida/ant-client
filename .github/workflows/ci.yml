@@ -64,10 +64,33 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: nightly
+      - name: Install Foundry (direct release download)
+        # foundry-rs/foundry-toolchain calls foundryup which curls
+        # api.github.com unauthenticated to resolve the nightly tag.
+        # macOS runners on shared egress IPs hit the 60/h anonymous
+        # rate limit and the install 403s. Setting GITHUB_TOKEN does
+        # NOT help because foundryup ignores it. Instead: pull the
+        # pinned release tarball directly from the GitHub Releases CDN
+        # (no API call, no rate limit) and unpack to /usr/local/bin.
+        shell: bash
+        env:
+          FOUNDRY_VERSION: v1.7.1
+        run: |
+          set -euo pipefail
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m)"
+          case "$os-$arch" in
+            linux-x86_64)  asset="foundry_${FOUNDRY_VERSION}_linux_amd64.tar.gz" ;;
+            darwin-arm64)  asset="foundry_${FOUNDRY_VERSION}_darwin_arm64.tar.gz" ;;
+            darwin-x86_64) asset="foundry_${FOUNDRY_VERSION}_darwin_amd64.tar.gz" ;;
+            *) echo "unsupported runner: $os-$arch"; exit 1 ;;
+          esac
+          url="https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/${asset}"
+          echo "downloading $url"
+          curl -sSL --retry 5 --retry-delay 5 "$url" -o /tmp/foundry.tar.gz
+          sudo tar -xzf /tmp/foundry.tar.gz -C /usr/local/bin anvil forge cast chisel
+          anvil --version
+          forge --version
       - name: Run E2E tests (serial)
         run: cargo test -p ant-core --test e2e_chunk --test e2e_data --test e2e_file --test e2e_payment --test e2e_security --test e2e_cost_estimate -- --test-threads=1
 
@@ -89,10 +112,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: nightly
+      - name: Install Foundry (direct release download)
+        # Bypass foundry-toolchain / foundryup because they 403 on
+        # macOS runners against the anonymous 60/h api.github.com
+        # rate limit (see e2e step above for full rationale).
+        shell: bash
+        env:
+          FOUNDRY_VERSION: v1.7.1
+        run: |
+          set -euo pipefail
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m)"
+          case "$os-$arch" in
+            linux-x86_64)  asset="foundry_${FOUNDRY_VERSION}_linux_amd64.tar.gz" ;;
+            darwin-arm64)  asset="foundry_${FOUNDRY_VERSION}_darwin_arm64.tar.gz" ;;
+            darwin-x86_64) asset="foundry_${FOUNDRY_VERSION}_darwin_amd64.tar.gz" ;;
+            *) echo "unsupported runner: $os-$arch"; exit 1 ;;
+          esac
+          url="https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/${asset}"
+          echo "downloading $url"
+          curl -sSL --retry 5 --retry-delay 5 "$url" -o /tmp/foundry.tar.gz
+          sudo tar -xzf /tmp/foundry.tar.gz -C /usr/local/bin anvil forge cast chisel
+          anvil --version
+          forge --version
       - name: Run merkle E2E tests (35-node testnet)
         run: cargo test -p ant-core --test e2e_merkle -- --test-threads=1
         env:
