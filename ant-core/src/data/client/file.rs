@@ -130,9 +130,18 @@ const DISK_SPACE_HEADROOM_PERCENT: u64 = 10;
 /// During file encryption, chunks are written to a temp directory so that
 /// only their 32-byte addresses stay in memory. At upload time chunks are
 /// read back one wave at a time, keeping peak RAM at ~`UPLOAD_WAVE_SIZE × 4 MB`.
-/// Maximum age (in seconds) for orphaned spill directories.
-/// Dirs older than this are cleaned up if they have no active lockfile.
-const SPILL_MAX_AGE_SECS: u64 = 24 * 60 * 60; // 24 hours
+/// Grace period (in seconds) before a spill dir is eligible for stale cleanup.
+///
+/// This is a small TOCTOU guard covering the sub-millisecond window inside
+/// [`ChunkSpill::new`] between `create_dir` and `try_lock_exclusive`. Once a
+/// dir is older than this and its lockfile is releasable, the owning process
+/// is gone and the dir is safe to reap — regardless of how old it is.
+///
+/// The previous policy waited 24 h before reaping any orphan, which meant
+/// that any non-graceful exit (SIGKILL, kernel OOM, panic abort) leaked its
+/// spill dir until the next day's upload — and on a host being restart-looped
+/// by systemd, orphans could fill the disk well within that window.
+const SPILL_STALE_GRACE_SECS: u64 = 30;
 
 /// Prefix for spill directory names to distinguish from user files.
 const SPILL_DIR_PREFIX: &str = "spill_";
@@ -210,11 +219,16 @@ impl ChunkSpill {
 
     /// Clean up stale spill directories. Best-effort, errors are logged.
     ///
-    /// Only removes directories that:
-    /// 1. Start with `SPILL_DIR_PREFIX` (ignores unrelated files)
-    /// 2. Are actual directories (not symlinks -- prevents symlink attacks)
-    /// 3. Have a timestamp older than `SPILL_MAX_AGE_SECS`
-    /// 4. Do NOT have an active lockfile (prevents deleting in-progress uploads)
+    /// A spill dir is reaped when:
+    /// 1. Its name starts with `SPILL_DIR_PREFIX` (ignores unrelated files)
+    /// 2. It is an actual directory, not a symlink (prevents symlink attacks)
+    /// 3. Its timestamp is older than `SPILL_STALE_GRACE_SECS` (TOCTOU guard)
+    /// 4. Its lockfile is releasable — i.e. no live process holds it
+    ///
+    /// The lockfile is the primary correctness gate: a releasable lock means
+    /// the owning `ChunkSpill` has been dropped or the process is gone, so
+    /// the dir is fair game. The grace period covers only the brief window
+    /// inside [`Self::new`] between `create_dir` and `try_lock_exclusive`.
     ///
     /// Safe to call concurrently from multiple processes.
     fn cleanup_stale(root: &Path) {
@@ -251,7 +265,7 @@ impl ChunkSpill {
                 None => continue,
             };
 
-            if now.saturating_sub(timestamp) <= SPILL_MAX_AGE_SECS {
+            if now.saturating_sub(timestamp) < SPILL_STALE_GRACE_SECS {
                 continue;
             }
 
