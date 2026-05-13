@@ -170,7 +170,10 @@ impl Client {
         let timeout_secs = timeout.as_secs();
 
         let request_id = self.next_request_id();
-        let request = ChunkPutRequest::with_payment(address, content.to_vec(), proof);
+        // `content` is a refcounted `Bytes` shared with the sibling
+        // close-group sends; pass it through directly so each peer shares
+        // the same backing buffer instead of deep-copying the 4 MB payload.
+        let request = ChunkPutRequest::with_payment(address, content, proof);
         let message = ChunkMessage {
             request_id,
             body: ChunkMessageBody::PutRequest(request),

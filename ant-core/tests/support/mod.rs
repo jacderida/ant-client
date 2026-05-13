@@ -329,6 +329,7 @@ impl MiniTestnet {
                         topic,
                         source: Some(source_peer),
                         data,
+                        ..
                     }) => {
                         let protocol = Arc::clone(&handler_protocol);
                         let node = Arc::clone(&handler_node);
