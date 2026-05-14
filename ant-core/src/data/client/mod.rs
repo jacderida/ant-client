@@ -283,19 +283,11 @@ fn build_controller(config: &ClientConfig) -> (AdaptiveController, Option<PathBu
         adaptive::default_persist_path()
     };
 
-    // Note: self_encryption's `STREAM_DECRYPT_BATCH_SIZE` is a
-    // `LazyLock<usize>` populated from the env var at first access
-    // and frozen for the process lifetime. Setting the env var from
-    // Rust would require `std::env::set_var`, which is `unsafe`
-    // since Rust 1.80 (it races against concurrent reads in any
-    // other thread); per project policy, `unsafe` is banned.
-    //
-    // The adaptive controller still drives fan-out *inside* each
-    // batch — we re-read `controller.fetch.current()` in the
-    // `streaming_decrypt` callback. The upstream batch size only
-    // controls how many chunks `self_encryption` asks us for at a
-    // time (default 10). For larger batch sizes export
-    // `STREAM_DECRYPT_BATCH_SIZE` before launching the process.
+    // File downloads choose a stream-decrypt batch size per download
+    // from the current fetch cap and usable RAM, then pass it into
+    // self_encryption's runtime batch-size API. The adaptive controller
+    // still drives fan-out inside each batch by re-reading
+    // `controller.fetch.current()` in the decrypt callback.
 
     (controller, persist_path)
 }

@@ -873,7 +873,7 @@ dependencies = [
  "rmp-serde",
  "saorsa-core",
  "self-replace",
- "self_encryption",
+ "self_encryption 0.36.0",
  "semver 1.0.28",
  "serde",
  "serde_json",
@@ -937,7 +937,7 @@ dependencies = [
  "saorsa-core",
  "saorsa-pqc 0.5.1",
  "self-replace",
- "self_encryption",
+ "self_encryption 0.35.0",
  "semver 1.0.28",
  "serde",
  "serde_json",
@@ -5499,6 +5499,26 @@ name = "self_encryption"
 version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c11020d59e8e663ba591026c2b45a08caa74a3a654ac12b2532d5a7c5b97e510"
+dependencies = [
+ "bincode",
+ "blake3",
+ "brotli",
+ "bytes",
+ "chacha20poly1305",
+ "hex",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "rayon",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "xor_name",
+]
+
+[[package]]
+name = "self_encryption"
+version = "0.36.0"
 dependencies = [
  "bincode",
  "blake3",
