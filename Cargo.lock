@@ -857,6 +857,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "blake3",
  "bytes",
  "flate2",
  "fs2",

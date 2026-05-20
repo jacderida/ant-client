@@ -7,6 +7,7 @@ pub mod adaptive;
 pub mod batch;
 pub mod cache;
 pub(crate) mod cached_merkle;
+pub(crate) mod cached_single;
 pub mod chunk;
 pub mod data;
 pub mod file;

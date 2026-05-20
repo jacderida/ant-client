@@ -1370,9 +1370,17 @@ impl Client {
         //
         // For the merkle path, attempt to resume from a cached
         // receipt before paying again. The cache is keyed by the
-        // source file path; a successful upload deletes the cache so
-        // a subsequent re-upload of the same path will pay anew.
-        let file_path_key = path.display().to_string();
+        // CANONICAL source path so `./foo`, `/abs/foo`, and any
+        // symlink alias all resolve to the same cache entry — a
+        // crash-and-retry from a different cwd or via a different
+        // alias still hits the receipt. Canonicalize may fail (the
+        // file could have been moved between phase 1 and here); we
+        // fall back to the display string in that case, which
+        // preserves pre-fix behaviour rather than dropping cache
+        // resume entirely.
+        let file_path_key = std::fs::canonicalize(path)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
         let (chunks_stored, actual_mode, storage_cost_atto, gas_cost_wei, stats) = if self
             .should_use_merkle(chunk_count, mode)
         {
@@ -1429,8 +1437,13 @@ impl Client {
                 Ok(result) => result,
                 Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
                     info!("Merkle needs more peers ({msg}), falling back to wave-batch");
-                    let (stored, sc, gc, fb_stats) =
-                        self.upload_waves_single(&spill, progress.as_ref()).await?;
+                    let (stored, sc, gc, fb_stats) = self
+                        .upload_waves_single(&spill, progress.as_ref(), Some(&file_path_key))
+                        .await?;
+                    // Full file success on the single-node fallback path:
+                    // the cached single-node receipt (if any) is no longer
+                    // needed.
+                    crate::data::client::cached_single::try_delete_for_file(&file_path_key);
                     return Ok(FileUploadResult {
                         data_map,
                         chunks_stored: stored,
@@ -1456,8 +1469,11 @@ impl Client {
             crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
             (stored, PaymentMode::Merkle, sc, gc, stats)
         } else {
-            let (stored, sc, gc, stats) =
-                self.upload_waves_single(&spill, progress.as_ref()).await?;
+            let (stored, sc, gc, stats) = self
+                .upload_waves_single(&spill, progress.as_ref(), Some(&file_path_key))
+                .await?;
+            // Full file success: drop any cached single-node receipt.
+            crate::data::client::cached_single::try_delete_for_file(&file_path_key);
             (stored, PaymentMode::Single, sc, gc, stats)
         };
 
@@ -1535,6 +1551,7 @@ impl Client {
         &self,
         spill: &ChunkSpill,
         progress: Option<&mpsc::Sender<UploadEvent>>,
+        resume_key: Option<&str>,
     ) -> Result<(usize, String, u128, WaveAggregateStats)> {
         let mut total_stored = 0usize;
         let mut total_storage = Amount::ZERO;
@@ -1565,7 +1582,13 @@ impl Client {
                     .await;
             }
             let (addresses, wave_storage, wave_gas, wave_stats) = self
-                .batch_upload_chunks_with_events(wave_data, progress, total_stored, total_chunks)
+                .batch_upload_chunks_with_events(
+                    wave_data,
+                    progress,
+                    total_stored,
+                    total_chunks,
+                    resume_key,
+                )
                 .await?;
             total_stored += addresses.len();
             if let Ok(cost) = wave_storage.parse::<Amount>() {
