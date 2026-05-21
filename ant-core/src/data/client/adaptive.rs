@@ -93,14 +93,22 @@ const FETCH_MIN_FLOOR: usize = 4;
 /// (+1 per healthy window).
 ///
 /// Reasoning: with cold-start=8, reaching a useful steady-state cap
-/// requires several doublings (8 -> 16 -> 32 -> ...). On the
-/// production network even a single transient peer-timeout in the
-/// first few seconds of a download fires Decrease, ending slow-start
-/// permanently and leaving the controller doing +1 per window from a
-/// tiny cap — observed as 25/min steady state on a fat-pipe droplet
-/// that should be doing 130+. Protecting slow-start until cap >= 32
-/// lets the doubling phase finish before normal AIMD takes over.
-const SLOW_START_RAMP_THRESHOLD: usize = 32;
+/// on a fat pipe requires several doublings (8 -> 16 -> 32 -> 64
+/// -> 128). On the production network even a single transient
+/// peer-timeout in the first few seconds of a download fires
+/// Decrease, and at threshold=32 the controller exits slow-start
+/// after just two healthy doublings — settling around the 32
+/// boundary at ~25-30/min steady state on a droplet that should be
+/// doing 130+. Raised to 128 so the doubling phase can ride out
+/// intermittent stress all the way to a steady-state useful cap on a
+/// fat pipe. Once cap reaches 128, AIMD additive growth is enough.
+///
+/// Residential behaviour is unaffected: sustained timeout pressure
+/// holds the cap at FETCH_MIN_FLOOR=4, which is well below this
+/// threshold anyway, so slow-start being "alive" doesn't change the
+/// observed cap — it just means the controller doesn't have to
+/// re-learn the slow-start state if conditions improve.
+const SLOW_START_RAMP_THRESHOLD: usize = 128;
 
 /// Per-channel concurrency ceilings. Each channel has its own cap so
 /// that constraining one (e.g. user pinned a low store concurrency for
