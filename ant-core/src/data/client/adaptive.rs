@@ -180,16 +180,25 @@ impl Default for AdaptiveConfig {
 }
 
 /// Suggested starting concurrency per channel for a brand-new client
-/// with no persisted state. Intentionally matches or exceeds the prior
-/// static defaults so the cold path is not slower:
+/// with no persisted state:
 ///
 /// - quote was statically 32 — start at 32.
 /// - store was statically 8 — start at 8.
-/// - fetch was previously unbounded (the entire self_encryption batch
-///   was fired at once via `FuturesUnordered`). Typical batches are
-///   small (handful of chunks); occasional larger ones are capped at
-///   `max_concurrency`. Start at 64 to keep small/medium downloads
-///   indistinguishable from the prior unbounded behavior.
+/// - fetch was previously 64. Dropped to 8 because the cold-start
+///   burst dominates residential download outcomes: the first batch
+///   of `fetch` concurrent chunk_gets fires before any per-peer
+///   observation has landed, so if `fetch` exceeds what the link can
+///   sustain, the entire first burst saturates the connection and
+///   typically fails before the AIMD controller can shrink the cap.
+///   Reproduced on PROD-LOCAL-DL-03 with fetch=64: 60 of 64
+///   in-flight chunks failed both first attempt and retry; only the
+///   first ~13 seconds of the download (4 chunks) saw any
+///   successful completions. With fetch=8, only 8 chunks compete in
+///   the initial burst; on a fat pipe with healthy outcomes the
+///   AIMD increase logic grows it back to the channel's
+///   `max_concurrency` (256) within a window or two — measured
+///   cost on the droplet is a one-off ~30-60s slow-start delay on
+///   the very first download.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ChannelStart {
     pub quote: usize,
@@ -202,7 +211,7 @@ impl Default for ChannelStart {
         Self {
             quote: 32,
             store: 8,
-            fetch: 64,
+            fetch: 8,
         }
     }
 }
@@ -1256,10 +1265,17 @@ mod tests {
     // These exist primarily to prove the controller never silently regresses
     // upload/download throughput and never panics under hostile workloads.
 
-    /// Cold-start defaults must equal-or-exceed the prior static knobs so
-    /// the very first batch on a fresh install is no slower than before
-    /// the adaptive controller existed. Hard-coded literals are intentional
-    /// — this is a guard against future commits accidentally lowering them.
+    /// Cold-start defaults must equal-or-exceed the values we have
+    /// deliberately committed to. Hard-coded literals are intentional
+    /// — this is a guard against future commits accidentally drifting
+    /// the cold-start values away from the policy decisions documented
+    /// on `ChannelStart`'s comment.
+    ///
+    /// `fetch` was historically 64, lowered to 8 after PROD-LOCAL-DL-03
+    /// showed a 64-wide initial burst saturated residential links
+    /// before the AIMD controller could shrink the cap. Do NOT raise
+    /// this back without a network-side justification — see the
+    /// `ChannelStart` doc.
     #[test]
     fn no_regression_cold_start_at_least_static_defaults() {
         let s = ChannelStart::default();
@@ -1274,8 +1290,9 @@ mod tests {
             s.store,
         );
         assert!(
-            s.fetch >= 64,
-            "fetch cold-start regressed: got {}, prior static was 64 (unbounded before)",
+            s.fetch >= 8,
+            "fetch cold-start regressed below the residential-saturation floor: \
+             got {}, current policy floor is 8 (see ChannelStart doc)",
             s.fetch,
         );
     }
@@ -1943,18 +1960,18 @@ mod tests {
 
     /// Cold-start equals the prior static defaults so the FIRST batch
     /// on a fresh install behaves identically. Guards against future
-    /// commits silently dropping cold-start values below the prior
-    /// statics.
+    /// commits silently dropping cold-start values below the current
+    /// policy floor.
     #[test]
     fn cold_start_at_least_prior_static_defaults() {
         let cs = ChannelStart::default();
-        // Prior statics: quote=32, store=8. Fetch was effectively
-        // unbounded (the entire self_encryption batch was fired at
-        // once); we picked 64 as a conservative substitute so the
-        // first batch of <= 64 chunks is indistinguishable.
+        // Policy floors: quote=32, store=8 (both match the pre-adaptive
+        // statics). Fetch was 64 historically; lowered to 8 to keep the
+        // initial burst from saturating residential downlinks (see
+        // `ChannelStart` doc).
         assert!(cs.quote >= 32, "quote cold-start regressed: {}", cs.quote);
         assert!(cs.store >= 8, "store cold-start regressed: {}", cs.store);
-        assert!(cs.fetch >= 64, "fetch cold-start regressed: {}", cs.fetch);
+        assert!(cs.fetch >= 8, "fetch cold-start regressed: {}", cs.fetch);
     }
 
     /// Reviewer N-M5 guard: with the new gated-decrease semantics
