@@ -222,7 +222,17 @@ impl Default for ChannelStart {
         Self {
             quote: 32,
             store: 8,
-            fetch: 8,
+            // Experimentally trying 32. 8 is safe on residential but
+            // makes the first download on a fat pipe take 5–10× longer
+            // than before the adaptive series (5+ slow-start doublings
+            // before reaching healthy cap, with any early stress
+            // signal exiting slow-start permanently). 32 cuts the
+            // warm-up to ~3 doublings while staying below the 64 that
+            // historically saturated residential links — and the
+            // safety net (rebucketed_unordered + observe-per-peer +
+            // retry-on-unanimous-NotFound + FETCH_MIN_FLOOR) that
+            // wasn't in place when 64 broke home is now active.
+            fetch: 32,
         }
     }
 }
