@@ -340,15 +340,12 @@ impl Client {
             &fetch_limiter,
             addresses.into_iter().enumerate(),
             |(idx, address)| {
-                let limiter = fetch_limiter.clone();
                 async move {
-                    let chunk = observe_op(
-                        &limiter,
-                        || async move { self.chunk_get(&address).await },
-                        classify_error,
-                    )
-                    .await?
-                    .ok_or_else(|| {
+                    // chunk_get does its own per-peer observation against
+                    // the fetch limiter — do not wrap with observe_op
+                    // here or the outer Ok(_) will mask per-peer timeouts
+                    // as Success.
+                    let chunk = self.chunk_get(&address).await?.ok_or_else(|| {
                         Error::InvalidData(format!(
                             "Missing chunk {} required for data reconstruction",
                             hex::encode(address)

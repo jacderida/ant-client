@@ -3,6 +3,7 @@
 //! Chunks are immutable, content-addressed data blocks where the address
 //! is the BLAKE3 hash of the content.
 
+use crate::data::client::adaptive::Outcome;
 use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
 use crate::data::client::peer_cache::record_peer_outcome;
 use crate::data::client::Client;
@@ -31,6 +32,33 @@ fn store_response_timeout_for_proof(proof: &[u8], merkle_timeout_secs: u64) -> D
     match detect_proof_type(proof) {
         Some(ProofType::Merkle) => Duration::from_secs(merkle_timeout_secs),
         _ => STORE_RESPONSE_TIMEOUT,
+    }
+}
+
+/// Map a single per-peer chunk GET attempt to an adaptive `Outcome`.
+///
+/// Capacity signals (`Timeout`, `NetworkError`) must reach the limiter
+/// so it can shrink the cap under saturation. Application-level results
+/// (`Success`, `ApplicationError`) are also recorded but do not push the
+/// cap down.
+///
+/// `Ok(None)` is `ApplicationError`, not `Success`: an authoritative
+/// NotFound from one peer is a statement about that peer's store, not
+/// a signal that the network is healthy at the current cap. Counting it
+/// as Success would let a stream of close-group exhaustions silently
+/// raise the cap on a saturated link — exactly the blindness we're
+/// fixing here.
+///
+/// Unexpected `Err` variants (anything not `Timeout` or `Network`)
+/// classify as `ApplicationError`: they propagate out of `chunk_get`
+/// to the caller and are not capacity signals.
+fn per_peer_outcome(result: &Result<Option<DataChunk>>) -> Outcome {
+    match result {
+        Ok(Some(_)) => Outcome::Success,
+        Ok(None) => Outcome::ApplicationError,
+        Err(Error::Timeout(_)) => Outcome::Timeout,
+        Err(Error::Network(_)) => Outcome::NetworkError,
+        Err(_) => Outcome::ApplicationError,
     }
 }
 
@@ -239,6 +267,20 @@ impl Client {
     /// where the storing peer differs from the first peer returned by
     /// DHT routing.
     ///
+    /// ## Adaptive controller feedback
+    ///
+    /// Each per-peer GET attempt is fed individually to the adaptive
+    /// fetch limiter via `controller().fetch.observe(...)`. This is
+    /// deliberately finer-grained than wrapping the outer `chunk_get`
+    /// with `observe_op`: when a chunk takes 6 peer tries to land,
+    /// 5 of them are real capacity signals (timeouts / network errors)
+    /// that should pull the cap down even if the chunk eventually
+    /// succeeds. The outer `Ok(_)` would mask all five as a single
+    /// `Outcome::Success`. See `adaptive::Outcome` for the per-attempt
+    /// classification rules used below.
+    ///
+    /// Callers should therefore NOT wrap `chunk_get` in `observe_op`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the network operation fails.
@@ -265,9 +307,15 @@ impl Client {
         let mut not_found = 0usize;
         let mut timeout = 0usize;
         let mut network_err = 0usize;
+        let limiter = &self.controller().fetch;
 
         for (peer, addrs) in &peers {
-            match self.chunk_get_from_peer(address, peer, addrs).await {
+            let started = Instant::now();
+            let outcome = self.chunk_get_from_peer(address, peer, addrs).await;
+            let latency = started.elapsed();
+            limiter.observe(per_peer_outcome(&outcome), latency);
+
+            match outcome {
                 Ok(Some(chunk)) => {
                     self.chunk_cache().put(chunk.address, chunk.content.clone());
                     return Ok(Some(chunk));
@@ -433,6 +481,44 @@ mod tests {
     const TEST_MERKLE_TIMEOUT_SECS: u64 = 60;
     /// Sentinel byte used to represent an unknown/unrecognized proof tag.
     const UNKNOWN_PROOF_TAG: u8 = 0xff;
+
+    #[test]
+    fn per_peer_outcome_classifies_each_result_kind() {
+        // Success path: peer returned the chunk.
+        let chunk = DataChunk::new([0u8; 32], Bytes::from_static(b"x"));
+        assert_eq!(
+            per_peer_outcome(&Ok(Some(chunk))),
+            Outcome::Success,
+            "found-chunk must be Success",
+        );
+
+        // Authoritative NotFound: peer is healthy, doesn't store it.
+        // Must NOT be Success — that's the bug we are fixing here:
+        // counting close-group NotFound as Success let saturation
+        // failures inflate the cap.
+        assert_eq!(
+            per_peer_outcome(&Ok(None)),
+            Outcome::ApplicationError,
+            "Ok(None) must be ApplicationError, not Success",
+        );
+
+        // Capacity signals.
+        assert_eq!(
+            per_peer_outcome(&Err(Error::Timeout("t".into()))),
+            Outcome::Timeout,
+        );
+        assert_eq!(
+            per_peer_outcome(&Err(Error::Network("n".into()))),
+            Outcome::NetworkError,
+        );
+
+        // Unexpected error variant (e.g. Protocol) — propagates out
+        // of chunk_get, not a capacity signal.
+        assert_eq!(
+            per_peer_outcome(&Err(Error::Protocol("p".into()))),
+            Outcome::ApplicationError,
+        );
+    }
 
     #[test]
     fn single_node_proof_uses_store_response_timeout() {
