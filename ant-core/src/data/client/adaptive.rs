@@ -217,7 +217,17 @@ impl Default for AdaptiveConfig {
             min_window_ops: 8,
             success_target: 0.95,
             timeout_ceiling: 0.10,
-            latency_inflation_factor: 2.0,
+            // 2.0 -> 4.0. With observe-per-peer the controller sees
+            // many more latency samples per chunk, including peers
+            // that the close-group iteration falls through to after a
+            // first NotFound — those are 1-2 s slower than the
+            // first-peer success path, so p95 routinely doubles vs
+            // the baseline EWMA. Factor 2.0 treats that as stress and
+            // fires Decrease. 4.0 was validated on PROD-DL-02 (the
+            // tune-latency-inflation-factor branch) as the value
+            // where natural close-group fallback latency stops being
+            // a capacity signal — same reasoning applies here.
+            latency_inflation_factor: 4.0,
             latency_ewma_alpha: 0.2,
         }
     }
