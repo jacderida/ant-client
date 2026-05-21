@@ -74,6 +74,17 @@ pub enum Outcome {
     ApplicationError,
 }
 
+/// Lower bound on the `fetch` channel's adaptive cap.
+///
+/// AIMD will not shrink fetch concurrency below this even under
+/// sustained timeout pressure. Specific to fetch because residential
+/// downloads exhibit a noise floor of peer-side timeouts (NAT path
+/// issues, peers in the close group not storing the chunk) that look
+/// like client saturation to the controller, causing it to fully
+/// serialize and collapse throughput. Quote and store channels keep
+/// the global `min_concurrency` floor of 1.
+const FETCH_MIN_FLOOR: usize = 4;
+
 /// Per-channel concurrency ceilings. Each channel has its own cap so
 /// that constraining one (e.g. user pinned a low store concurrency for
 /// a slow uplink) never bleeds into another (download).
@@ -576,7 +587,28 @@ impl AdaptiveController {
         config.sanitize();
         let quote_cfg = LimiterConfig::from_adaptive(&config, config.max.quote);
         let store_cfg = LimiterConfig::from_adaptive(&config, config.max.store);
-        let fetch_cfg = LimiterConfig::from_adaptive(&config, config.max.fetch);
+        let mut fetch_cfg = LimiterConfig::from_adaptive(&config, config.max.fetch);
+        // Lift the fetch channel's floor above the global
+        // `min_concurrency`. Reasoning is specific to download: on
+        // residential links, residual peer-side timeouts (NAT path
+        // issues, peers in the close group that don't store the chunk,
+        // peers under temporary load) continuously push the
+        // controller's timeout_rate above ceiling. A global floor of 1
+        // means the controller fully serializes chunk fetches on that
+        // noise floor and gets stuck — observed on PROD-LOCAL-DL-03
+        // where the download stayed stable but throughput collapsed to
+        // ~330 KB/s on a multi-MB/s link.
+        //
+        // 4 is the smallest floor that keeps the download from fully
+        // serializing while staying well below the cold-start
+        // (ChannelStart::fetch = 8) that the home retest tolerated.
+        // Floor `quote` and `store` separately if a corresponding
+        // pathology is identified for them; today's evidence is
+        // download-only.
+        fetch_cfg.min_concurrency = fetch_cfg.min_concurrency.max(FETCH_MIN_FLOOR);
+        // Re-establish max >= min after the bump in case the channel
+        // ceiling was somehow lower than the new floor.
+        fetch_cfg.max_concurrency = fetch_cfg.max_concurrency.max(fetch_cfg.min_concurrency);
         Self {
             quote: Limiter::new(start.quote, quote_cfg),
             store: Limiter::new(start.store, store_cfg),
