@@ -152,7 +152,7 @@ impl AdaptiveConfig {
         }
         self.timeout_ceiling = self.timeout_ceiling.clamp(0.0, 1.0);
         if !self.latency_inflation_factor.is_finite() || self.latency_inflation_factor <= 0.0 {
-            self.latency_inflation_factor = 2.0;
+            self.latency_inflation_factor = 4.0;
         }
         self.min_concurrency = self.min_concurrency.max(1);
         self.window_ops = self.window_ops.max(1);
@@ -173,7 +173,13 @@ impl Default for AdaptiveConfig {
             min_window_ops: 8,
             success_target: 0.95,
             timeout_ceiling: 0.10,
-            latency_inflation_factor: 2.0,
+            // p95 doubling is the normal signal on a per-chunk fetch with
+            // close-group fallback (one slow peer in a chunk's close group
+            // adds ~10s on top of a sub-second median); 2.0 mis-classified
+            // that as stress and halved the fetch cap mid-download. 4.0
+            // means p95 has to quadruple before we treat the network as
+            // degraded.
+            latency_inflation_factor: 4.0,
             latency_ewma_alpha: 0.2,
         }
     }
@@ -266,7 +272,7 @@ impl LimiterConfig {
         }
         self.timeout_ceiling = self.timeout_ceiling.clamp(0.0, 1.0);
         if !self.latency_inflation_factor.is_finite() || self.latency_inflation_factor <= 0.0 {
-            self.latency_inflation_factor = 2.0;
+            self.latency_inflation_factor = 4.0;
         }
         self.min_concurrency = self.min_concurrency.max(1);
         self.window_ops = self.window_ops.max(1);
