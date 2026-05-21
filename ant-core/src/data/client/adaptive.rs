@@ -180,7 +180,15 @@ impl Default for AdaptiveConfig {
             enabled: true,
             min_concurrency: 1,
             max: ChannelMax::default(),
-            window_ops: 32,
+            // Halved from 32. AIMD Increase decisions are gated on
+            // `samples_since_increase >= window_ops`, so at 16 the
+            // controller doubles (in slow-start) or +1 (post-slow-
+            // start) twice as often. From cold-start=8, reaching the
+            // 256 ceiling now needs ~5 doublings × 16 = 80 healthy
+            // observations of warm-up, vs ~160 at window_ops=32.
+            // Decrease decisions remain gated on min_window_ops=8 so
+            // shrinking responsiveness is unchanged.
+            window_ops: 16,
             min_window_ops: 8,
             success_target: 0.95,
             timeout_ceiling: 0.10,
@@ -222,17 +230,14 @@ impl Default for ChannelStart {
         Self {
             quote: 32,
             store: 8,
-            // Experimentally trying 32. 8 is safe on residential but
-            // makes the first download on a fat pipe take 5–10× longer
-            // than before the adaptive series (5+ slow-start doublings
-            // before reaching healthy cap, with any early stress
-            // signal exiting slow-start permanently). 32 cuts the
-            // warm-up to ~3 doublings while staying below the 64 that
-            // historically saturated residential links — and the
-            // safety net (rebucketed_unordered + observe-per-peer +
-            // retry-on-unanimous-NotFound + FETCH_MIN_FLOOR) that
-            // wasn't in place when 64 broke home is now active.
-            fetch: 32,
+            // 8 is the highest value confirmed safe on residential
+            // links. 16, 32, 64 all saturate the home connection so
+            // hard that even subsequent warm-started runs at
+            // FETCH_MIN_FLOOR=4 cannot recover (the residual transport
+            // state damage outlasts the cap shrink). Faster fat-pipe
+            // warm-up is now done via window_ops=16 (halved from 32)
+            // rather than by raising the initial burst.
+            fetch: 8,
         }
     }
 }
