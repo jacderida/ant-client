@@ -29,10 +29,11 @@ const CHUNK_DATA_TYPE: u32 = 0;
 ///
 /// Either we got the chunk from some peer, or every peer in the group
 /// returned NotFound, timed out, or hit a transport error. The counts
-/// are used to decide whether to retry: a quorum of authoritative
-/// NotFound responses means the chunk really isn't there and we should
-/// give up; anything else looks like reachability and is worth one
-/// retry against a freshly re-walked close group.
+/// are used to decide whether to retry: only a *unanimous* NotFound
+/// response from every queried peer counts as authoritative data
+/// absence — anything else leaves room for the actual storer to be in
+/// the timeout / network-error bucket and is worth one retry against a
+/// freshly re-walked close group.
 struct CloseGroupOutcome {
     chunk: Option<DataChunk>,
     queried: usize,
@@ -41,14 +42,24 @@ struct CloseGroupOutcome {
     network_err: usize,
 }
 
-/// `true` if a majority of queried peers actively responded NotFound.
+/// `true` if every peer we managed to query responded with an
+/// authoritative NotFound. Only then is it safe to conclude the chunk
+/// is genuinely absent from this close group.
 ///
-/// This is the signal that the chunk is genuinely absent from the close
-/// group: peers that respond NotFound are reachable and authoritative
-/// about what they store. Anything else (timeout, transport error) is
-/// reachability noise.
-fn is_authoritative_not_found(not_found: usize, quorum: usize) -> bool {
-    not_found >= quorum
+/// An earlier version of this check used a majority quorum
+/// (`not_found >= close_group_size / 2 + 1`), but production traffic
+/// disproved that threshold: on the production network the storage
+/// replication target is `CLOSE_GROUP_MAJORITY` (4) of the K=7
+/// close-group peers — so up to 3 peers legitimately don't store any
+/// given chunk. A saturated client that sees `not_found=4 timeout=3`
+/// is almost certainly looking at "3 storers we couldn't reach" plus
+/// "4 non-storers that responded promptly," not authoritative data
+/// loss. Reproduced on PROD-LOCAL-DL-03: a chunk that failed at the
+/// quorum threshold during `ant file download` was successfully
+/// retrieved on the same host moments later via a single
+/// `ant chunk get`. Only `not_found == queried` is a safe stop.
+fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
+    queried > 0 && not_found == queried
 }
 
 /// Store-response timeout for non-merkle chunk PUTs.
@@ -327,7 +338,6 @@ impl Client {
         }
 
         let addr_hex = hex::encode(address);
-        let quorum = self.config().close_group_size / 2 + 1;
 
         // First attempt against the current close-group view.
         let first = self.chunk_get_try_close_group(address).await?;
@@ -336,12 +346,14 @@ impl Client {
             return Ok(Some(chunk));
         }
 
-        // A quorum of NotFound responses is authoritative — the chunk
-        // really isn't on the close group. Don't retry; surface Ok(None).
-        if is_authoritative_not_found(first.not_found, quorum) {
+        // Only treat as authoritative absence when *every* queried peer
+        // responded NotFound. Anything less leaves the actual storer
+        // possibly in the timeout / network-error bucket, which a retry
+        // could reach.
+        if is_authoritative_not_found(first.not_found, first.queried) {
             info!(
-                "chunk_get giving up on {addr_hex} (authoritative NotFound): \
-                 queried={} not_found={} timeout={} network_err={} quorum={quorum}",
+                "chunk_get giving up on {addr_hex} (unanimous NotFound): \
+                 queried={} not_found={} timeout={} network_err={}",
                 first.queried, first.not_found, first.timeout, first.network_err
             );
             return Ok(None);
@@ -594,19 +606,32 @@ mod tests {
     const UNKNOWN_PROOF_TAG: u8 = 0xff;
 
     #[test]
-    fn authoritative_not_found_requires_quorum() {
-        // Standard close-group-size 7: quorum is 4.
-        let quorum = 7 / 2 + 1;
-        assert_eq!(quorum, 4);
+    fn authoritative_not_found_requires_unanimous_response() {
+        // Unanimous: every queried peer (7 of 7) said NotFound. This is
+        // the only safe stop.
+        assert!(is_authoritative_not_found(7, 7));
 
-        // 4-of-7 is the threshold.
-        assert!(is_authoritative_not_found(4, quorum));
-        assert!(is_authoritative_not_found(7, quorum));
+        // 4-of-7 looks like authoritative absence on paper, but with
+        // CLOSE_GROUP_MAJORITY=4 replicas on the production network the
+        // expected response shape for a healthy chunk fetched from a
+        // saturated client is 3 NotFound (the non-storers) + 4 Timeout
+        // (the storers we couldn't reach in time). The mirror — 4
+        // NotFound + 3 Timeout — is the same shape with one extra
+        // storer rotated out and one extra non-storer happening to be
+        // reachable. Refusing to retry that case was the regression
+        // PROD-LOCAL-DL-03 surfaced; it must NOT be treated as
+        // authoritative.
+        assert!(!is_authoritative_not_found(4, 7));
+        assert!(!is_authoritative_not_found(6, 7));
 
-        // 3-of-7 is still reachability-shaped — must retry.
-        assert!(!is_authoritative_not_found(3, quorum));
-        // All reachability failures, zero NotFound — must retry.
-        assert!(!is_authoritative_not_found(0, quorum));
+        // Pure-reachability failure — must retry.
+        assert!(!is_authoritative_not_found(0, 7));
+
+        // Defensive: queried == 0 should never reach this check
+        // (close_group_peers would have errored earlier), but if it
+        // does, return false so we don't claim authoritative absence
+        // based on no evidence.
+        assert!(!is_authoritative_not_found(0, 0));
     }
 
     #[test]
