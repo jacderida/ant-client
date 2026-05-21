@@ -1829,14 +1829,13 @@ impl Client {
                         let mut stream = futures::stream::iter(batch_owned)
                             .map(|(idx, hash)| {
                                 let addr = hash.0;
-                                let limiter = limiter.clone();
                                 async move {
-                                    let result = observe_op(
-                                        &limiter,
-                                        || async move { self.chunk_get(&addr).await },
-                                        classify_error,
-                                    )
-                                    .await;
+                                    // chunk_get does its own per-peer
+                                    // observation against the fetch
+                                    // limiter — do not wrap with observe_op
+                                    // here or the outer Ok(_) will mask
+                                    // per-peer timeouts as Success.
+                                    let result = self.chunk_get(&addr).await;
                                     (idx, hash, result)
                                 }
                             })
@@ -1934,14 +1933,13 @@ impl Client {
                         let mut stream = futures::stream::iter(batch_owned)
                             .map(|(idx, hash)| {
                                 let addr = hash.0;
-                                let limiter = fetch_limiter.clone();
                                 async move {
-                                    let result = observe_op(
-                                        &limiter,
-                                        || async move { self.chunk_get(&addr).await },
-                                        classify_error,
-                                    )
-                                    .await;
+                                    // chunk_get does its own per-peer
+                                    // observation against the fetch
+                                    // limiter — do not wrap with observe_op
+                                    // here or the outer Ok(_) will mask
+                                    // per-peer timeouts as Success.
+                                    let result = self.chunk_get(&addr).await;
                                     (idx, hash, result)
                                 }
                             })
