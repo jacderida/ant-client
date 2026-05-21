@@ -85,6 +85,23 @@ pub enum Outcome {
 /// the global `min_concurrency` floor of 1.
 const FETCH_MIN_FLOOR: usize = 4;
 
+/// Cap below which slow-start (doubling on healthy windows) survives
+/// stress signals. A single Decrease at cap < this still halves the
+/// cap (responsiveness preserved) but does NOT flip
+/// `left_slow_start`, so the next healthy window can double the cap
+/// back up. Above this, the controller transitions to standard AIMD
+/// (+1 per healthy window).
+///
+/// Reasoning: with cold-start=8, reaching a useful steady-state cap
+/// requires several doublings (8 -> 16 -> 32 -> ...). On the
+/// production network even a single transient peer-timeout in the
+/// first few seconds of a download fires Decrease, ending slow-start
+/// permanently and leaving the controller doing +1 per window from a
+/// tiny cap — observed as 25/min steady state on a fat-pipe droplet
+/// that should be doing 130+. Protecting slow-start until cap >= 32
+/// lets the doubling phase finish before normal AIMD takes over.
+const SLOW_START_RAMP_THRESHOLD: usize = 32;
+
 /// Per-channel concurrency ceilings. Each channel has its own cap so
 /// that constraining one (e.g. user pinned a low store concurrency for
 /// a slow uplink) never bleeds into another (download).
@@ -520,7 +537,21 @@ fn apply_decision(inner: &mut LimiterInner, decision: Decision, cfg: &LimiterCon
             if inner.samples_since_decrease < cfg.min_window_ops {
                 return;
             }
-            inner.left_slow_start = true;
+            // Slow-start (doubling on healthy windows) exits when the
+            // controller has had a real stress signal AND the current
+            // cap is high enough that linear AIMD growth becomes
+            // useful. Below SLOW_START_RAMP_THRESHOLD we still halve
+            // the cap on this Decrease (responsiveness is preserved),
+            // but slow-start stays armed so the next healthy window
+            // can double back. This protects the ramp-up phase from
+            // a single early peer-side timeout on the production
+            // network that would otherwise pin the controller into
+            // +1-per-window growth from a tiny cap — observed as
+            // 25/min steady state on a fat-pipe droplet that should
+            // be doing 130+.
+            if inner.current >= SLOW_START_RAMP_THRESHOLD {
+                inner.left_slow_start = true;
+            }
             let next = (inner.current / 2).max(cfg.min_concurrency);
             if next != inner.current {
                 debug!(from = inner.current, to = next, "adaptive: decrease");
