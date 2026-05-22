@@ -340,15 +340,12 @@ impl Client {
             &fetch_limiter,
             addresses.into_iter().enumerate(),
             |(idx, address)| {
-                let limiter = fetch_limiter.clone();
                 async move {
-                    let chunk = observe_op(
-                        &limiter,
-                        || async move { self.chunk_get(&address).await },
-                        classify_error,
-                    )
-                    .await?
-                    .ok_or_else(|| {
+                    // chunk_get_observed feeds the adaptive fetch
+                    // limiter once per call via chunk_get_outcome
+                    // (Ok(None) -> Timeout is the load-shedding
+                    // signal for sustained close-group exhaustion).
+                    let chunk = self.chunk_get_observed(&address).await?.ok_or_else(|| {
                         Error::InvalidData(format!(
                             "Missing chunk {} required for data reconstruction",
                             hex::encode(address)

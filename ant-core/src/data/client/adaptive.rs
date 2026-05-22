@@ -74,6 +74,17 @@ pub enum Outcome {
     ApplicationError,
 }
 
+/// Lower bound on the `fetch` channel's adaptive cap.
+///
+/// AIMD will not shrink fetch concurrency below this even under
+/// sustained timeout pressure. Specific to fetch because residential
+/// downloads exhibit a noise floor of peer-side timeouts (NAT path
+/// issues, peers in the close group not storing the chunk) that look
+/// like client saturation to the controller, causing it to fully
+/// serialize and collapse throughput. Quote and store channels keep
+/// the global `min_concurrency` floor of 1.
+const FETCH_MIN_FLOOR: usize = 4;
+
 /// Per-channel concurrency ceilings. Each channel has its own cap so
 /// that constraining one (e.g. user pinned a low store concurrency for
 /// a slow uplink) never bleeds into another (download).
@@ -152,7 +163,7 @@ impl AdaptiveConfig {
         }
         self.timeout_ceiling = self.timeout_ceiling.clamp(0.0, 1.0);
         if !self.latency_inflation_factor.is_finite() || self.latency_inflation_factor <= 0.0 {
-            self.latency_inflation_factor = 2.0;
+            self.latency_inflation_factor = 4.0;
         }
         self.min_concurrency = self.min_concurrency.max(1);
         self.window_ops = self.window_ops.max(1);
@@ -173,23 +184,38 @@ impl Default for AdaptiveConfig {
             min_window_ops: 8,
             success_target: 0.95,
             timeout_ceiling: 0.10,
-            latency_inflation_factor: 2.0,
+            // p95 doubling is the normal signal on a per-chunk fetch with
+            // close-group fallback (one slow peer in a chunk's close group
+            // adds ~10s on top of a sub-second median); 2.0 mis-classified
+            // that as stress and halved the fetch cap mid-download. 4.0
+            // means p95 has to quadruple before we treat the network as
+            // degraded.
+            latency_inflation_factor: 4.0,
             latency_ewma_alpha: 0.2,
         }
     }
 }
 
 /// Suggested starting concurrency per channel for a brand-new client
-/// with no persisted state. Intentionally matches or exceeds the prior
-/// static defaults so the cold path is not slower:
+/// with no persisted state:
 ///
 /// - quote was statically 32 — start at 32.
 /// - store was statically 8 — start at 8.
-/// - fetch was previously unbounded (the entire self_encryption batch
-///   was fired at once via `FuturesUnordered`). Typical batches are
-///   small (handful of chunks); occasional larger ones are capped at
-///   `max_concurrency`. Start at 64 to keep small/medium downloads
-///   indistinguishable from the prior unbounded behavior.
+/// - fetch was previously 64. Dropped to 8 because the cold-start
+///   burst dominates residential download outcomes: the first batch
+///   of `fetch` concurrent chunk_gets fires before any per-peer
+///   observation has landed, so if `fetch` exceeds what the link can
+///   sustain, the entire first burst saturates the connection and
+///   typically fails before the AIMD controller can shrink the cap.
+///   Reproduced on PROD-LOCAL-DL-03 with fetch=64: 60 of 64
+///   in-flight chunks failed both first attempt and retry; only the
+///   first ~13 seconds of the download (4 chunks) saw any
+///   successful completions. With fetch=8, only 8 chunks compete in
+///   the initial burst; on a fat pipe with healthy outcomes the
+///   AIMD increase logic grows it back to the channel's
+///   `max_concurrency` (256) within a window or two — measured
+///   cost on the droplet is a one-off ~30-60s slow-start delay on
+///   the very first download.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ChannelStart {
     pub quote: usize,
@@ -202,7 +228,18 @@ impl Default for ChannelStart {
         Self {
             quote: 32,
             store: 8,
-            fetch: 64,
+            // 4 is the residential-saturation floor we have validated:
+            // 8 still firehose-saturated a real home link enough to
+            // disrupt the operator's general internet usage on the
+            // initial burst (the controller has not yet seen any
+            // observation by the time those 8 concurrent chunk_gets
+            // launch). 16, 32, 64 are progressively worse. Per the
+            // PROD-DL-03 run on 83bcbdb, the droplet pays the cost
+            // for cold-start once — a one-off ~8 min warm-up on the
+            // first 2.5 GB file — and persisted-snapshot warm_start
+            // then runs subsequent downloads at cap=256 (the
+            // ChannelMax::fetch ceiling).
+            fetch: 4,
         }
     }
 }
@@ -266,7 +303,7 @@ impl LimiterConfig {
         }
         self.timeout_ceiling = self.timeout_ceiling.clamp(0.0, 1.0);
         if !self.latency_inflation_factor.is_finite() || self.latency_inflation_factor <= 0.0 {
-            self.latency_inflation_factor = 2.0;
+            self.latency_inflation_factor = 4.0;
         }
         self.min_concurrency = self.min_concurrency.max(1);
         self.window_ops = self.window_ops.max(1);
@@ -567,7 +604,28 @@ impl AdaptiveController {
         config.sanitize();
         let quote_cfg = LimiterConfig::from_adaptive(&config, config.max.quote);
         let store_cfg = LimiterConfig::from_adaptive(&config, config.max.store);
-        let fetch_cfg = LimiterConfig::from_adaptive(&config, config.max.fetch);
+        let mut fetch_cfg = LimiterConfig::from_adaptive(&config, config.max.fetch);
+        // Lift the fetch channel's floor above the global
+        // `min_concurrency`. Reasoning is specific to download: on
+        // residential links, residual peer-side timeouts (NAT path
+        // issues, peers in the close group that don't store the chunk,
+        // peers under temporary load) continuously push the
+        // controller's timeout_rate above ceiling. A global floor of 1
+        // means the controller fully serializes chunk fetches on that
+        // noise floor and gets stuck — observed on PROD-LOCAL-DL-03
+        // where the download stayed stable but throughput collapsed to
+        // ~330 KB/s on a multi-MB/s link.
+        //
+        // 4 is the smallest floor that keeps the download from fully
+        // serializing while staying well below the cold-start
+        // (ChannelStart::fetch = 8) that the home retest tolerated.
+        // Floor `quote` and `store` separately if a corresponding
+        // pathology is identified for them; today's evidence is
+        // download-only.
+        fetch_cfg.min_concurrency = fetch_cfg.min_concurrency.max(FETCH_MIN_FLOOR);
+        // Re-establish max >= min after the bump in case the channel
+        // ceiling was somehow lower than the new floor.
+        fetch_cfg.max_concurrency = fetch_cfg.max_concurrency.max(fetch_cfg.min_concurrency);
         Self {
             quote: Limiter::new(start.quote, quote_cfg),
             store: Limiter::new(start.store, store_cfg),
@@ -1256,10 +1314,17 @@ mod tests {
     // These exist primarily to prove the controller never silently regresses
     // upload/download throughput and never panics under hostile workloads.
 
-    /// Cold-start defaults must equal-or-exceed the prior static knobs so
-    /// the very first batch on a fresh install is no slower than before
-    /// the adaptive controller existed. Hard-coded literals are intentional
-    /// — this is a guard against future commits accidentally lowering them.
+    /// Cold-start defaults must equal-or-exceed the values we have
+    /// deliberately committed to. Hard-coded literals are intentional
+    /// — this is a guard against future commits accidentally drifting
+    /// the cold-start values away from the policy decisions documented
+    /// on `ChannelStart`'s comment.
+    ///
+    /// `fetch` was historically 64, lowered to 8 after PROD-LOCAL-DL-03
+    /// showed a 64-wide initial burst saturated residential links
+    /// before the AIMD controller could shrink the cap. Do NOT raise
+    /// this back without a network-side justification — see the
+    /// `ChannelStart` doc.
     #[test]
     fn no_regression_cold_start_at_least_static_defaults() {
         let s = ChannelStart::default();
@@ -1274,8 +1339,9 @@ mod tests {
             s.store,
         );
         assert!(
-            s.fetch >= 64,
-            "fetch cold-start regressed: got {}, prior static was 64 (unbounded before)",
+            s.fetch >= 4,
+            "fetch cold-start regressed below the residential-saturation floor: \
+             got {}, current policy floor is 4 (see ChannelStart doc)",
             s.fetch,
         );
     }
@@ -1943,18 +2009,18 @@ mod tests {
 
     /// Cold-start equals the prior static defaults so the FIRST batch
     /// on a fresh install behaves identically. Guards against future
-    /// commits silently dropping cold-start values below the prior
-    /// statics.
+    /// commits silently dropping cold-start values below the current
+    /// policy floor.
     #[test]
     fn cold_start_at_least_prior_static_defaults() {
         let cs = ChannelStart::default();
-        // Prior statics: quote=32, store=8. Fetch was effectively
-        // unbounded (the entire self_encryption batch was fired at
-        // once); we picked 64 as a conservative substitute so the
-        // first batch of <= 64 chunks is indistinguishable.
+        // Policy floors: quote=32, store=8 (both match the pre-adaptive
+        // statics). Fetch was 64 historically; lowered to 4 to keep the
+        // initial burst from saturating residential downlinks (see
+        // `ChannelStart` doc).
         assert!(cs.quote >= 32, "quote cold-start regressed: {}", cs.quote);
         assert!(cs.store >= 8, "store cold-start regressed: {}", cs.store);
-        assert!(cs.fetch >= 64, "fetch cold-start regressed: {}", cs.fetch);
+        assert!(cs.fetch >= 4, "fetch cold-start regressed: {}", cs.fetch);
     }
 
     /// Reviewer N-M5 guard: with the new gated-decrease semantics
