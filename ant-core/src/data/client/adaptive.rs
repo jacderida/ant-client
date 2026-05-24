@@ -267,6 +267,30 @@ pub struct LimiterConfig {
     pub timeout_ceiling: f64,
     pub latency_inflation_factor: f64,
     pub latency_ewma_alpha: f64,
+    /// While `current < slow_start_ramp_threshold`, a Decrease halves
+    /// the cap but does NOT permanently exit slow-start — the next
+    /// healthy window can double the cap back up. Above the threshold,
+    /// a Decrease exits slow-start and the controller transitions to
+    /// classic AIMD (+1 per healthy window).
+    ///
+    /// 0 (the default) reproduces the original behaviour: any Decrease
+    /// at any cap permanently exits slow-start. The fetch channel sets
+    /// this to its `max_concurrency` so download concurrency keeps
+    /// doubling toward the ceiling instead of crawling +1 per window —
+    /// additive growth simply cannot reach a useful cap on a
+    /// fast-but-lossy link before the file finishes. See
+    /// `AdaptiveController::new`.
+    pub slow_start_ramp_threshold: usize,
+    /// When `false`, the p95-latency-vs-baseline comparison never
+    /// triggers a Decrease (it still updates the baseline). The fetch
+    /// channel disables it because `chunk_get`'s observed latency
+    /// includes the internal retry sleep and slow retry-sweep for the
+    /// chunks that needed one, so a window with a couple of retry-path
+    /// chunks has a wildly inflated p95 that is retry variance, not
+    /// congestion. Genuine fetch congestion still surfaces as a rising
+    /// `Ok(None)` (Timeout) rate, which the timeout_ceiling check
+    /// catches.
+    pub latency_decrease_enabled: bool,
 }
 
 impl LimiterConfig {
@@ -281,6 +305,10 @@ impl LimiterConfig {
             timeout_ceiling: cfg.timeout_ceiling,
             latency_inflation_factor: cfg.latency_inflation_factor,
             latency_ewma_alpha: cfg.latency_ewma_alpha,
+            // Defaults preserve the original AIMD behaviour; the fetch
+            // channel overrides both in `AdaptiveController::new`.
+            slow_start_ramp_threshold: 0,
+            latency_decrease_enabled: true,
         }
     }
 
@@ -471,10 +499,12 @@ fn evaluate(
     }
 
     if let Some(p95) = p95_of(&mut latencies) {
-        if let Some(base) = baseline {
-            let limit = base.mul_f64(cfg.latency_inflation_factor);
-            if p95 > limit {
-                return Decision::Decrease;
+        if cfg.latency_decrease_enabled {
+            if let Some(base) = baseline {
+                let limit = base.mul_f64(cfg.latency_inflation_factor);
+                if p95 > limit {
+                    return Decision::Decrease;
+                }
             }
         }
         Decision::Increase
@@ -522,7 +552,15 @@ fn apply_decision(inner: &mut LimiterInner, decision: Decision, cfg: &LimiterCon
             if inner.samples_since_decrease < cfg.min_window_ops {
                 return;
             }
-            inner.left_slow_start = true;
+            // Below the ramp threshold we still halve (responsiveness is
+            // preserved) but keep slow-start armed, so the next healthy
+            // window can double the cap back up rather than crawling +1.
+            // Above the threshold a Decrease is the signal to settle into
+            // classic AIMD. With threshold=0 (quote/store) this is the
+            // original behaviour: any Decrease exits slow-start.
+            if inner.current >= cfg.slow_start_ramp_threshold {
+                inner.left_slow_start = true;
+            }
             let next = (inner.current / 2).max(cfg.min_concurrency);
             if next != inner.current {
                 debug!(from = inner.current, to = next, "adaptive: decrease");
@@ -626,6 +664,27 @@ impl AdaptiveController {
         // Re-establish max >= min after the bump in case the channel
         // ceiling was somehow lower than the new floor.
         fetch_cfg.max_concurrency = fetch_cfg.max_concurrency.max(fetch_cfg.min_concurrency);
+        // Download-specific growth/decision tuning (see the field docs
+        // on `LimiterConfig`):
+        //
+        // - Keep slow-start armed all the way to the channel ceiling.
+        //   Classic AIMD additive growth (+1 per healthy window) cannot
+        //   reach a useful cap from a low base before a multi-GB file
+        //   finishes — a fast-but-lossy connection (e.g. a VPS with a
+        //   steady ~4% close-group-exhaustion trickle) was observed
+        //   stuck at cap ~13-24 across 36 files because every transient
+        //   Decrease permanently dropped it to additive growth. With
+        //   the threshold at the ceiling, a Decrease still halves the
+        //   cap but the next healthy window doubles it back, so the cap
+        //   tracks the connection's real capacity instead of crawling.
+        // - Disable the p95-latency Decrease. chunk_get's observed
+        //   latency includes the internal retry sleep + slow retry
+        //   sweep for chunks that needed one, so a window with a couple
+        //   of retry-path chunks shows a hugely inflated p95 that is
+        //   retry variance, not congestion. Genuine fetch congestion
+        //   still drives Decrease via the Ok(None) -> Timeout rate.
+        fetch_cfg.slow_start_ramp_threshold = fetch_cfg.max_concurrency;
+        fetch_cfg.latency_decrease_enabled = false;
         Self {
             quote: Limiter::new(start.quote, quote_cfg),
             store: Limiter::new(start.store, store_cfg),
@@ -1047,6 +1106,8 @@ mod tests {
             timeout_ceiling: 0.2,
             latency_inflation_factor: 2.0,
             latency_ewma_alpha: 0.5,
+            slow_start_ramp_threshold: 0,
+            latency_decrease_enabled: true,
         }
     }
 
@@ -1071,6 +1132,112 @@ mod tests {
             latency_inflation_factor: l.latency_inflation_factor,
             latency_ewma_alpha: l.latency_ewma_alpha,
         }
+    }
+
+    #[test]
+    fn protected_slow_start_recovers_faster_than_additive() {
+        // After identical stress + recovery, a limiter with slow-start
+        // protected to the ceiling (fetch behaviour) must end at a
+        // higher cap than one that exits slow-start on first Decrease
+        // (quote/store behaviour): doubling outpaces +1-per-window.
+        let base = LimiterConfig {
+            max_concurrency: 256,
+            latency_decrease_enabled: false,
+            ..cfg_for_tests()
+        };
+        let protected = Limiter::new(
+            64,
+            LimiterConfig {
+                slow_start_ramp_threshold: 256,
+                ..base.clone()
+            },
+        );
+        let unprotected = Limiter::new(
+            64,
+            LimiterConfig {
+                slow_start_ramp_threshold: 0,
+                ..base.clone()
+            },
+        );
+
+        // Identical stress: a window of timeouts forces decreases on both.
+        for l in [&protected, &unprotected] {
+            for _ in 0..base.window_ops {
+                l.observe(Outcome::Timeout, Duration::from_millis(10));
+            }
+        }
+        // Identical recovery: a long stretch of healthy windows. The
+        // protected limiter doubles each window; the unprotected one
+        // only adds 1.
+        for l in [&protected, &unprotected] {
+            for _ in 0..(base.window_ops * 10) {
+                l.observe(Outcome::Success, Duration::from_millis(10));
+            }
+        }
+        assert!(
+            protected.current() > unprotected.current(),
+            "protected slow-start ({}) should recover faster than additive ({})",
+            protected.current(),
+            unprotected.current(),
+        );
+    }
+
+    #[test]
+    fn latency_decrease_disabled_ignores_p95_inflation() {
+        // With latency_decrease_enabled=false, a window of successes
+        // whose p95 latency is far above the baseline must NOT trigger
+        // a Decrease — only success/timeout rate can. (Fetch disables
+        // this because chunk_get's observed latency is polluted by
+        // retry-path variance.)
+        let cfg = LimiterConfig {
+            max_concurrency: 256,
+            slow_start_ramp_threshold: 256,
+            latency_decrease_enabled: false,
+            ..cfg_for_tests()
+        };
+        let l = Limiter::new(16, cfg.clone());
+        // Establish a fast baseline.
+        for _ in 0..cfg.window_ops {
+            l.observe(Outcome::Success, Duration::from_millis(5));
+        }
+        let after_baseline = l.current();
+        // Now a window of successes with 100x the latency. With the
+        // latency check disabled this is still a healthy window, so the
+        // cap must not drop.
+        for _ in 0..cfg.window_ops {
+            l.observe(Outcome::Success, Duration::from_millis(500));
+        }
+        assert!(
+            l.current() >= after_baseline,
+            "latency inflation must not shrink the cap when the check is disabled: {} < {}",
+            l.current(),
+            after_baseline,
+        );
+    }
+
+    #[test]
+    fn controller_sets_fetch_channel_download_tuning() {
+        // AdaptiveController::new must apply the download-specific
+        // tuning to fetch only, leaving quote/store on classic AIMD.
+        let c = AdaptiveController::new(ChannelStart::default(), AdaptiveConfig::default());
+        assert!(
+            !c.fetch.config.latency_decrease_enabled,
+            "fetch latency-decrease must be disabled",
+        );
+        assert_eq!(
+            c.fetch.config.slow_start_ramp_threshold, c.fetch.config.max_concurrency,
+            "fetch slow-start must be protected to the ceiling",
+        );
+        assert!(
+            c.quote.config.latency_decrease_enabled,
+            "quote must keep the latency-decrease check",
+        );
+        assert_eq!(
+            c.quote.config.slow_start_ramp_threshold, 0,
+            "quote must keep classic AIMD slow-start exit",
+        );
+        assert!(c.store.config.latency_decrease_enabled);
+        assert_eq!(c.store.config.slow_start_ramp_threshold, 0);
     }
 
     #[test]

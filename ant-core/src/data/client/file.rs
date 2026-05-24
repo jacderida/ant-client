@@ -2001,88 +2001,111 @@ impl Client {
                             }
                         }
 
-                        // Deferred retry pass: if any chunks were
-                        // deferred, retry them serially with sleeps
-                        // between attempts. The point is to ride out
-                        // transient saturation events that hit
-                        // multiple in-flight chunks at once — by the
-                        // time the rest of the batch has drained and
-                        // we sleep, the link has usually settled.
-                        // Each chunk gets up to DEFERRED_RETRY_ATTEMPTS
-                        // tries.
+                        // Deferred retry pass: retry the deferred chunks
+                        // in CONCURRENT rounds (reusing the fetch
+                        // limiter's cap), not serially. The first round
+                        // fires immediately — most deferrals on a
+                        // healthy-but-lossy link are peer-side noise
+                        // that clears in well under a second, and
+                        // serializing them behind mandatory multi-second
+                        // sleeps was the single biggest throughput sink
+                        // on such links (a batch deferring ~20 chunks
+                        // burned minutes of near-zero throughput even
+                        // though every chunk succeeded on its first
+                        // retry). Only chunks that survive a round get a
+                        // longer back-off before the next, so genuine
+                        // saturation still gets time to settle.
                         if !deferred.is_empty() {
-                            const DEFERRED_RETRY_ATTEMPTS: usize = 3;
-                            const DEFERRED_RETRY_DELAYS_SECS: [u64; 3] = [10, 30, 60];
+                            // Round delays in seconds. Round 0 is
+                            // immediate; later rounds back off to ride
+                            // out sustained saturation.
+                            const DEFERRED_ROUND_DELAYS_SECS: [u64; 3] = [0, 15, 45];
                             info!(
-                                "Deferring {} chunk(s) for retry after batch settles",
+                                "Deferring {} chunk(s) for concurrent retry after batch settles",
                                 deferred.len()
                             );
-
-                            for (idx, hash) in deferred {
-                                let addr = hash.0;
-                                let addr_hex = hex::encode(addr);
-                                let mut got: Option<bytes::Bytes> = None;
-                                for (attempt, &delay_secs) in DEFERRED_RETRY_DELAYS_SECS
-                                    .iter()
-                                    .enumerate()
-                                    .take(DEFERRED_RETRY_ATTEMPTS)
-                                {
+                            let mut remaining = deferred;
+                            for (round, &delay_secs) in DEFERRED_ROUND_DELAYS_SECS
+                                .iter()
+                                .enumerate()
+                            {
+                                if remaining.is_empty() {
+                                    break;
+                                }
+                                if delay_secs > 0 {
                                     tokio::time::sleep(std::time::Duration::from_secs(
                                         delay_secs,
                                     ))
                                     .await;
-                                    info!(
-                                        "Deferred retry attempt {}/{} for {addr_hex}",
-                                        attempt + 1,
-                                        DEFERRED_RETRY_ATTEMPTS,
-                                    );
-                                    match self.chunk_get_observed(&addr).await {
-                                        Ok(Some(chunk)) => {
-                                            got = Some(chunk.content);
-                                            break;
+                                }
+                                info!(
+                                    "Deferred retry round {}/{}: {} chunk(s)",
+                                    round + 1,
+                                    DEFERRED_ROUND_DELAYS_SECS.len(),
+                                    remaining.len(),
+                                );
+                                let round_input = std::mem::take(&mut remaining);
+                                let round_results: Vec<BatchEntry> = rebucketed_unordered(
+                                    &fetch_limiter,
+                                    round_input,
+                                    |(idx, hash): (usize, XorName)| {
+                                        let fetched_ref = fetched_ref.clone();
+                                        let progress_ref = progress_ref.clone();
+                                        async move {
+                                            let addr = hash.0;
+                                            // Both Ok(None) and a transient
+                                            // Err re-defer the chunk to the
+                                            // next round rather than
+                                            // aborting; only the final
+                                            // round's leftovers are fatal.
+                                            match self.chunk_get_observed(&addr).await {
+                                                Ok(Some(chunk)) => {
+                                                    let fetched = fetched_ref.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    ) + 1;
+                                                    info!(
+                                                        "Downloaded {fetched}/{total_chunks} (deferred retry)"
+                                                    );
+                                                    if let Some(ref tx) = progress_ref {
+                                                        let _ = tx.try_send(
+                                                            DownloadEvent::ChunksFetched {
+                                                                fetched,
+                                                                total: total_chunks,
+                                                            },
+                                                        );
+                                                    }
+                                                    Ok::<BatchEntry, self_encryption::Error>((
+                                                        idx,
+                                                        Ok(chunk.content),
+                                                    ))
+                                                }
+                                                Ok(None) => Ok((idx, Err(hash))),
+                                                Err(e) => {
+                                                    info!(
+                                                        "Deferred retry for {} hit transient error: {e}; re-deferring",
+                                                        hex::encode(addr)
+                                                    );
+                                                    Ok((idx, Err(hash)))
+                                                }
+                                            }
                                         }
-                                        Ok(None) => continue,
-                                        // Per-attempt errors here (e.g.
-                                        // `Error::InsufficientPeers` when
-                                        // `close_group_peers` returns empty
-                                        // because the DHT walk hasn't
-                                        // settled) must NOT abort the
-                                        // download — they are transient and
-                                        // the next attempt's longer sleep
-                                        // is the right thing to ride them
-                                        // out. Log and fall through to the
-                                        // next attempt.
-                                        Err(e) => {
-                                            info!(
-                                                "Deferred retry attempt {}/{} for {addr_hex} hit transient error: {e}; \
-                                                 will fall through to next attempt",
-                                                attempt + 1,
-                                                DEFERRED_RETRY_ATTEMPTS,
-                                            );
-                                            continue;
-                                        }
+                                    },
+                                )
+                                .await?;
+                                for (idx, inner) in round_results {
+                                    match inner {
+                                        Ok(bytes) => results.push((idx, bytes)),
+                                        Err(hash) => remaining.push((idx, hash)),
                                     }
                                 }
-                                let content = got.ok_or_else(|| {
-                                    self_encryption::Error::Generic(format!(
-                                        "Chunk not found after {} deferred retry attempts: {addr_hex}",
-                                        DEFERRED_RETRY_ATTEMPTS
-                                    ))
-                                })?;
-                                let fetched = fetched_ref.fetch_add(
-                                    1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                ) + 1;
-                                info!(
-                                    "Downloaded {fetched}/{total_chunks} (deferred retry)"
-                                );
-                                if let Some(ref tx) = progress_ref {
-                                    let _ = tx.try_send(DownloadEvent::ChunksFetched {
-                                        fetched,
-                                        total: total_chunks,
-                                    });
-                                }
-                                results.push((idx, content));
+                            }
+                            if let Some((_, hash)) = remaining.first() {
+                                return Err(self_encryption::Error::Generic(format!(
+                                    "Chunk not found after {} deferred retry rounds: {}",
+                                    DEFERRED_ROUND_DELAYS_SECS.len(),
+                                    hex::encode(hash.0),
+                                )));
                             }
                         }
 
