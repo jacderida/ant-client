@@ -693,6 +693,11 @@ pub fn build_node_args(config: &NodeConfig) -> Vec<String> {
         args.push(peer.clone());
     }
 
+    if let Some(channel) = config.upgrade_channel {
+        args.push("--upgrade-channel".to_string());
+        args.push(channel.to_string());
+    }
+
     // The daemon's supervisor is the service manager. Tell ant-node not to spawn its own
     // replacement on auto-upgrade; instead, exit cleanly and let us respawn. Without this,
     // ant-node's default spawn-grandchild-then-exit flow races for the node's port during
@@ -1135,6 +1140,7 @@ fn is_process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::types::UpgradeChannel;
 
     #[test]
     fn build_node_args_basic() {
@@ -1151,6 +1157,7 @@ mod tests {
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
             bootstrap_peers: vec!["peer1".to_string(), "peer2".to_string()],
+            upgrade_channel: None,
         };
 
         let args = build_node_args(&config);
@@ -1170,6 +1177,39 @@ mod tests {
         assert!(args.contains(&"peer1".to_string()));
         assert!(args.contains(&"peer2".to_string()));
         assert!(args.contains(&"--stop-on-upgrade".to_string()));
+        // No upgrade channel configured -> no --upgrade-channel argument.
+        assert!(!args.contains(&"--upgrade-channel".to_string()));
+    }
+
+    #[test]
+    fn build_node_args_includes_upgrade_channel() {
+        let mut config = NodeConfig {
+            id: 1,
+            service_name: "node1".to_string(),
+            rewards_address: "0xabc".to_string(),
+            data_dir: "/data/node-1".into(),
+            log_dir: None,
+            node_port: None,
+            metrics_port: None,
+            network_id: None,
+            binary_path: "/bin/node".into(),
+            version: "0.1.0".to_string(),
+            env_variables: HashMap::new(),
+            bootstrap_peers: vec![],
+            upgrade_channel: Some(UpgradeChannel::Beta),
+        };
+
+        let args = build_node_args(&config);
+        let idx = args
+            .iter()
+            .position(|a| a == "--upgrade-channel")
+            .expect("--upgrade-channel should be present");
+        assert_eq!(args[idx + 1], "beta");
+
+        config.upgrade_channel = Some(UpgradeChannel::Stable);
+        let args = build_node_args(&config);
+        let idx = args.iter().position(|a| a == "--upgrade-channel").unwrap();
+        assert_eq!(args[idx + 1], "stable");
     }
 
     #[test]
@@ -1187,6 +1227,7 @@ mod tests {
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
+            upgrade_channel: None,
         };
 
         let args = build_node_args(&config);

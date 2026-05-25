@@ -108,6 +108,7 @@ pub async fn add_nodes(
             version: version.clone(),
             env_variables: env_map.clone(),
             bootstrap_peers: opts.bootstrap_peers.clone(),
+            upgrade_channel: opts.upgrade_channel,
         };
 
         let assigned_id = registry.add(config);
@@ -494,6 +495,7 @@ mod tests {
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
+            upgrade_channel: None,
         });
         registry.save().unwrap();
         drop(_lock);
@@ -578,6 +580,7 @@ mod tests {
             version: "0.110.0".to_string(),
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
+            upgrade_channel: None,
         });
         registry.add(NodeConfig {
             id: 0,
@@ -592,6 +595,7 @@ mod tests {
             version: "0.110.0".to_string(),
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
+            upgrade_channel: None,
         });
         registry.save().unwrap();
         drop(_lock);
