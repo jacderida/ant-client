@@ -427,12 +427,27 @@ impl Limiter {
     }
 
     /// Replace the current cap with `start`, clamped. Used for warm
-    /// loads from persisted state. Marks the limiter as having
-    /// already-left-slow-start so a single healthy window doesn't
-    /// double the cap (an over-aggressive cold-start from a warm
-    /// value). Subsequent increases are +1 per healthy window.
-    /// Does not clear the sliding window — fresh observations remain
-    /// authoritative for adaptation decisions.
+    /// loads from persisted state. Does not clear the sliding window —
+    /// fresh observations remain authoritative for adaptation
+    /// decisions.
+    ///
+    /// Slow-start state after a warm load depends on the channel's
+    /// `slow_start_ramp_threshold`:
+    ///
+    /// - Default (threshold 0, i.e. quote/store): mark slow-start as
+    ///   already-left so a single healthy window doesn't *double* a
+    ///   learned warm value — an over-aggressive jump. Subsequent
+    ///   increases are +1 per healthy window.
+    /// - Protected (threshold > clamped, i.e. fetch below the ceiling):
+    ///   keep slow-start armed. This is critical for the CLI usage
+    ///   pattern where every `ant file download` is a fresh process
+    ///   that warm-starts from the snapshot: if warm_start always
+    ///   exited slow-start, the fetch cap could only ever grow
+    ///   additively from the persisted value, which cannot climb back
+    ///   to the ceiling against an intermittent Decrease trickle (the
+    ///   exact pin-at-~20 behaviour observed on a fast-but-lossy VPS).
+    ///   Keeping slow-start armed lets the cap double back toward the
+    ///   capacity the connection can actually sustain.
     pub fn warm_start(&self, start: usize) {
         let clamped = start.clamp(
             self.config.min_concurrency,
@@ -440,7 +455,7 @@ impl Limiter {
         );
         let mut g = lock(&self.inner);
         g.current = clamped;
-        g.left_slow_start = true;
+        g.left_slow_start = clamped >= self.config.slow_start_ramp_threshold;
     }
 
     /// Snapshot of the current cap for persistence. Cheap, lock-only.
@@ -1132,6 +1147,54 @@ mod tests {
             latency_inflation_factor: l.latency_inflation_factor,
             latency_ewma_alpha: l.latency_ewma_alpha,
         }
+    }
+
+    #[test]
+    fn warm_start_keeps_slow_start_armed_below_protected_threshold() {
+        // Regression guard for the CLI multi-file pattern: each
+        // `ant file download` is a fresh process that warm-starts from
+        // the persisted snapshot. If warm_start exited slow-start, the
+        // fetch cap could only grow additively from the warm value and
+        // could never climb back to the ceiling against an intermittent
+        // Decrease trickle. A protected limiter (threshold == max) that
+        // warm-starts BELOW the ceiling must keep slow-start armed so it
+        // doubles back up.
+        let cfg = LimiterConfig {
+            max_concurrency: 256,
+            slow_start_ramp_threshold: 256,
+            latency_decrease_enabled: false,
+            ..cfg_for_tests()
+        };
+        let l = Limiter::new(64, cfg.clone());
+        l.warm_start(20);
+        assert_eq!(l.current(), 20);
+        // A single healthy window should DOUBLE (slow-start armed),
+        // proving warm_start did not exit slow-start.
+        for _ in 0..cfg.window_ops {
+            l.observe(Outcome::Success, Duration::from_millis(10));
+        }
+        assert_eq!(
+            l.current(),
+            40,
+            "protected channel must double after warm_start, not crawl +1",
+        );
+
+        // Default channel (threshold 0): warm_start exits slow-start,
+        // so the same window only adds 1.
+        let default_cfg = LimiterConfig {
+            max_concurrency: 256,
+            ..cfg_for_tests()
+        };
+        let d = Limiter::new(64, default_cfg.clone());
+        d.warm_start(20);
+        for _ in 0..default_cfg.window_ops {
+            d.observe(Outcome::Success, Duration::from_millis(10));
+        }
+        assert_eq!(
+            d.current(),
+            21,
+            "default channel must stay additive after warm_start",
+        );
     }
 
     #[test]
