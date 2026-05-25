@@ -16,12 +16,12 @@ use ant_protocol::evm::{
 use ant_protocol::payment::{serialize_merkle_proof, verify_merkle_candidate_signature};
 use ant_protocol::transport::PeerId;
 use ant_protocol::{
-    send_and_await_chunk_response, ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest,
-    MerkleCandidateQuoteResponse,
+    compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
+    MerkleCandidateQuoteRequest, MerkleCandidateQuoteResponse,
 };
 use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -84,6 +84,29 @@ pub struct PreparedMerkleBatch {
     addresses: Vec<[u8; 32]>,
 }
 
+/// Result of checking a merkle upload batch before payment.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MerkleUploadPlan {
+    /// Chunks already confirmed by their close group.
+    pub already_stored: Vec<[u8; 32]>,
+    /// Chunks that still need payment and storage.
+    pub to_upload: Vec<[u8; 32]>,
+    /// Total byte size of chunks in `to_upload`.
+    to_upload_total_bytes: u64,
+}
+
+impl MerkleUploadPlan {
+    /// Average byte size of chunks that still need upload.
+    #[must_use]
+    pub fn to_upload_avg_size(&self) -> u64 {
+        if self.to_upload.is_empty() {
+            return 0;
+        }
+
+        self.to_upload_total_bytes / self.to_upload.len() as u64
+    }
+}
+
 impl std::fmt::Debug for PreparedMerkleBatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedMerkleBatch")
@@ -94,6 +117,81 @@ impl std::fmt::Debug for PreparedMerkleBatch {
             .field("addresses", &self.addresses.len())
             .finish()
     }
+}
+
+/// Select chunk contents that correspond to `addresses`, preserving address order.
+///
+/// Extra chunk contents are ignored; missing contents for any requested address
+/// are treated as corrupted upload state.
+pub(crate) fn chunk_contents_for_upload_addresses(
+    chunk_contents: Vec<Bytes>,
+    addresses: &[[u8; 32]],
+) -> Result<Vec<Bytes>> {
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut needed_by_address: HashMap<[u8; 32], usize> = HashMap::new();
+    for address in addresses {
+        *needed_by_address.entry(*address).or_default() += 1;
+    }
+
+    let mut chunks_by_address: HashMap<[u8; 32], VecDeque<Bytes>> =
+        HashMap::with_capacity(needed_by_address.len());
+    let mut remaining = addresses.len();
+    for chunk in chunk_contents {
+        let address = compute_address(&chunk);
+        if let Some(needed) = needed_by_address.get_mut(&address) {
+            if *needed > 0 {
+                chunks_by_address
+                    .entry(address)
+                    .or_default()
+                    .push_back(chunk);
+                *needed -= 1;
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    for (address, needed) in &needed_by_address {
+        if *needed == 0 {
+            continue;
+        }
+
+        if chunks_by_address.contains_key(address) {
+            return Err(Error::InvalidData(format!(
+                "missing duplicate chunk content for merkle address {}",
+                hex::encode(address)
+            )));
+        }
+
+        return Err(Error::InvalidData(format!(
+            "missing chunk content for merkle address {}",
+            hex::encode(address)
+        )));
+    }
+
+    let mut selected = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let chunks = chunks_by_address.get_mut(address).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "missing chunk content for merkle address {}",
+                hex::encode(address)
+            ))
+        })?;
+        let chunk = chunks.pop_front().ok_or_else(|| {
+            Error::InvalidData(format!(
+                "missing duplicate chunk content for merkle address {}",
+                hex::encode(address)
+            ))
+        })?;
+        selected.push(chunk);
+    }
+
+    Ok(selected)
 }
 
 /// Determine whether to use merkle payments for a given batch size.
@@ -119,8 +217,9 @@ impl Client {
     /// Builds a merkle tree, collects candidate pools, pays on-chain in one tx,
     /// and returns per-chunk proofs. Splits into sub-batches if > `MAX_LEAVES`.
     ///
-    /// Does NOT pre-filter already-stored chunks (nodes handle `AlreadyExists`
-    /// gracefully on PUT). This avoids N sequential GET round-trips before payment.
+    /// This low-level helper assumes the caller has already selected the
+    /// addresses that need payment. User-facing upload paths first run the
+    /// merkle upload planner to skip chunks already stored on the network.
     ///
     /// # Errors
     ///
@@ -147,6 +246,125 @@ impl Client {
 
         self.pay_for_merkle_single_batch(addresses, data_type, data_size)
             .await
+    }
+
+    /// Check which chunks in a merkle upload still need payment/storage.
+    ///
+    /// Uses the normal per-chunk quote path because it already has the
+    /// close-group majority rule for `AlreadyStored`. Non-stored chunks only
+    /// use the quote response as a probe; their actual payment still happens
+    /// through the merkle batch.
+    ///
+    /// `chunks` contains `(address, data_size)` pairs.
+    pub(crate) async fn plan_merkle_upload(
+        &self,
+        chunks: Vec<([u8; 32], u64)>,
+        data_type: u32,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+    ) -> Result<MerkleUploadPlan> {
+        let total_chunks = chunks.len();
+        if total_chunks == 0 {
+            return Ok(MerkleUploadPlan::default());
+        }
+
+        info!("Checking {total_chunks} merkle chunks for existing storage before payment");
+
+        let quote_limiter = self.controller().quote.clone();
+        let quote_concurrency = quote_limiter.current().min(total_chunks.max(1));
+        let mut check_stream = stream::iter(chunks.into_iter().enumerate())
+            .map(|(index, (address, data_size))| {
+                let limiter = quote_limiter.clone();
+                async move {
+                    let result = observe_op(
+                        &limiter,
+                        || async move {
+                            self.chunk_already_stored_for_merkle(&address, data_type, data_size)
+                                .await
+                        },
+                        classify_error,
+                    )
+                    .await;
+                    (index, address, data_size, result)
+                }
+            })
+            .buffer_unordered(quote_concurrency);
+
+        let mut already_stored: Vec<(usize, [u8; 32])> = Vec::new();
+        let mut to_upload: Vec<(usize, [u8; 32], u64)> = Vec::new();
+        let mut checked = 0usize;
+
+        while let Some((index, address, data_size, result)) = check_stream.next().await {
+            let is_already_stored = result?;
+            checked += 1;
+
+            if let Some(tx) = progress {
+                let _ = tx.try_send(UploadEvent::ChunkQuoted {
+                    quoted: checked,
+                    total: total_chunks,
+                });
+            }
+
+            if is_already_stored {
+                debug!(
+                    "Merkle preflight {checked}/{total_chunks}: chunk {} already stored",
+                    hex::encode(address)
+                );
+                already_stored.push((index, address));
+                if let Some(tx) = progress {
+                    let _ = tx.try_send(UploadEvent::ChunkStored {
+                        stored: already_stored.len(),
+                        total: total_chunks,
+                    });
+                }
+            } else {
+                debug!(
+                    "Merkle preflight {checked}/{total_chunks}: chunk {} needs upload",
+                    hex::encode(address)
+                );
+                to_upload.push((index, address, data_size));
+            }
+        }
+
+        already_stored.sort_by_key(|(index, _)| *index);
+        to_upload.sort_by_key(|(index, _, _)| *index);
+
+        let to_upload_total_bytes = to_upload.iter().fold(0u64, |acc, (_, _, data_size)| {
+            acc.saturating_add(*data_size)
+        });
+
+        let already_stored = already_stored
+            .into_iter()
+            .map(|(_, address)| address)
+            .collect::<Vec<_>>();
+        let to_upload = to_upload
+            .into_iter()
+            .map(|(_, address, _)| address)
+            .collect::<Vec<_>>();
+
+        info!(
+            "Merkle preflight complete: {} already stored, {} need upload",
+            already_stored.len(),
+            to_upload.len()
+        );
+
+        Ok(MerkleUploadPlan {
+            already_stored,
+            to_upload,
+            to_upload_total_bytes,
+        })
+    }
+
+    async fn chunk_already_stored_for_merkle(
+        &self,
+        address: &[u8; 32],
+        data_type: u32,
+        data_size: u64,
+    ) -> Result<bool> {
+        match self.get_store_quotes(address, data_size, data_type).await {
+            Ok(_) => Ok(false),
+            Err(Error::AlreadyStored) => Ok(true),
+            Err(e) => Err(e),
+        }
     }
 
     /// Phase 1 of external-signer merkle payment: prepare batch without paying.
@@ -555,13 +773,21 @@ impl Client {
         addresses: Vec<[u8; 32]>,
         batch_result: &MerkleBatchPaymentResult,
         progress: Option<&mpsc::Sender<UploadEvent>>,
+        stored_offset: usize,
+        total_chunks: usize,
     ) -> Result<(usize, crate::data::client::batch::WaveAggregateStats)> {
-        let mut stored = 0usize;
+        let mut stored = stored_offset;
         let mut stats = crate::data::client::batch::WaveAggregateStats::default();
         let store_limiter = self.controller().store.clone();
         // Clamp fan-out to batch size — partial batches should not
         // pay for unused slots (see PERF-RESULTS.md).
         let batch_size = chunk_contents.len();
+        if batch_size != addresses.len() {
+            return Err(Error::InvalidData(format!(
+                "merkle upload has {batch_size} chunk contents but {} addresses",
+                addresses.len()
+            )));
+        }
         let store_concurrency = store_limiter.current().min(batch_size.max(1));
         let mut upload_stream = stream::iter(chunk_contents.into_iter().zip(addresses).map(
             |(content, addr)| {
@@ -600,7 +826,7 @@ impl Client {
             if let Some(tx) = progress {
                 let _ = tx.try_send(UploadEvent::ChunkStored {
                     stored,
-                    total: batch_size,
+                    total: total_chunks,
                 });
             }
         }
@@ -681,7 +907,7 @@ mod send_assertions {
     )]
     async fn _merkle_upload_chunks_is_send(client: &Client) {
         let batch_result: MerkleBatchPaymentResult = todo!();
-        let fut = client.merkle_upload_chunks(Vec::new(), Vec::new(), &batch_result, None);
+        let fut = client.merkle_upload_chunks(Vec::new(), Vec::new(), &batch_result, None, 0, 0);
         _assert_send(&fut);
     }
 }
@@ -732,6 +958,68 @@ mod tests {
     #[test]
     fn test_threshold_value() {
         assert_eq!(DEFAULT_MERKLE_THRESHOLD, 64);
+    }
+
+    #[test]
+    fn chunk_contents_for_upload_addresses_preserves_requested_order() {
+        let first = Bytes::from_static(b"first");
+        let second = Bytes::from_static(b"second");
+        let first_addr = compute_address(&first);
+        let second_addr = compute_address(&second);
+
+        let selected = chunk_contents_for_upload_addresses(
+            vec![first.clone(), second.clone()],
+            &[second_addr, first_addr],
+        )
+        .unwrap();
+
+        assert_eq!(selected, vec![second, first]);
+    }
+
+    #[test]
+    fn chunk_contents_for_upload_addresses_preserves_duplicate_requests() {
+        let repeated = Bytes::from_static(b"same-content");
+        let other = Bytes::from_static(b"other-content");
+        let repeated_addr = compute_address(&repeated);
+
+        let selected = chunk_contents_for_upload_addresses(
+            vec![repeated.clone(), other, repeated.clone()],
+            &[repeated_addr, repeated_addr],
+        )
+        .unwrap();
+
+        assert_eq!(selected, vec![repeated.clone(), repeated]);
+    }
+
+    #[test]
+    fn chunk_contents_for_upload_addresses_ignores_unrequested_duplicates() {
+        let requested = Bytes::from_static(b"requested-content");
+        let unrequested = Bytes::from_static(b"unrequested-content");
+        let requested_addr = compute_address(&requested);
+
+        let selected = chunk_contents_for_upload_addresses(
+            vec![
+                unrequested.clone(),
+                requested.clone(),
+                unrequested.clone(),
+                unrequested,
+            ],
+            &[requested_addr],
+        )
+        .unwrap();
+
+        assert_eq!(selected, vec![requested]);
+    }
+
+    #[test]
+    fn chunk_contents_for_upload_addresses_errors_for_missing_content() {
+        let present = Bytes::from_static(b"present-content");
+        let missing = Bytes::from_static(b"missing-content");
+        let missing_addr = compute_address(&missing);
+
+        let result = chunk_contents_for_upload_addresses(vec![present], &[missing_addr]);
+
+        assert!(matches!(result, Err(Error::InvalidData(_))));
     }
 
     // =========================================================================
