@@ -1,4 +1,5 @@
 use std::io::{Read as _, Write as _};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use bytes::Bytes;
@@ -23,12 +24,15 @@ pub enum ChunkAction {
         /// Output file (writes to stdout if omitted).
         #[arg(long, short)]
         output: Option<PathBuf>,
-        /// Try every close-group peer and print ranked per-peer results.
+        /// Try every selected closest peer and print ranked per-peer results.
         ///
         /// In this diagnostic mode chunk bytes are only written when
         /// -o/--output is supplied.
         #[arg(long, alias = "try-all-peers")]
         all_peers: bool,
+        /// Number of closest peers to try (defaults to the configured close-group size).
+        #[arg(long, alias = "peers")]
+        peer_count: Option<NonZeroUsize>,
     },
 }
 
@@ -52,18 +56,23 @@ impl ChunkAction {
                 address,
                 output,
                 all_peers,
+                peer_count,
             } => {
                 let addr = parse_address(&address)?;
                 info!("Retrieving chunk {address}");
+                let peer_count = peer_count.map(NonZeroUsize::get);
 
                 if all_peers {
-                    return get_chunk_from_all_peers(client, &addr, &address, output).await;
+                    return get_chunk_from_all_peers(client, &addr, &address, output, peer_count)
+                        .await;
                 }
 
-                let result = client
-                    .chunk_get(&addr)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Chunk get failed: {e}"))?;
+                let result = if let Some(peer_count) = peer_count {
+                    client.chunk_get_from_closest_peers(&addr, peer_count).await
+                } else {
+                    client.chunk_get(&addr).await
+                }
+                .map_err(|e| anyhow::anyhow!("Chunk get failed: {e}"))?;
 
                 match result {
                     Some(chunk) => {
@@ -127,11 +136,16 @@ async fn get_chunk_from_all_peers(
     addr: &[u8; XORNAME_BYTE_LEN],
     address: &str,
     output: Option<PathBuf>,
+    peer_count: Option<usize>,
 ) -> anyhow::Result<()> {
-    let results = client
-        .chunk_get_from_close_group(addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("Chunk get failed: {e}"))?;
+    let results = if let Some(peer_count) = peer_count {
+        client
+            .chunk_get_from_closest_peer_group(addr, peer_count)
+            .await
+    } else {
+        client.chunk_get_from_close_group(addr).await
+    }
+    .map_err(|e| anyhow::anyhow!("Chunk get failed: {e}"))?;
 
     let summary = print_peer_get_results(address, &results);
 
@@ -163,7 +177,7 @@ async fn get_chunk_from_all_peers(
 fn print_peer_get_results(address: &str, results: &[ChunkPeerGetResult]) -> PeerGetSummary {
     let mut summary = PeerGetSummary::default();
 
-    println!("Close group GET results for {address}:");
+    println!("Closest peer GET results for {address}:");
     for (index, result) in results.iter().enumerate() {
         let rank = index + 1;
         let distance = xor_distance_decimal(&result.xor_distance);

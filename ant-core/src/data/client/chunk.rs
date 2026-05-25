@@ -371,6 +371,25 @@ impl Client {
     ///
     /// Returns an error if the network operation fails.
     pub async fn chunk_get(&self, address: &XorName) -> Result<Option<DataChunk>> {
+        self.chunk_get_from_closest_peers(address, self.config().close_group_size)
+            .await
+    }
+
+    /// Retrieve a chunk from the requested number of closest peers.
+    ///
+    /// Queries peers in XOR-distance order for the chunk address,
+    /// returning the first successful response. This handles the case
+    /// where the storing peer differs from the first peer returned by
+    /// DHT routing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the network operation fails.
+    pub async fn chunk_get_from_closest_peers(
+        &self,
+        address: &XorName,
+        peer_count: usize,
+    ) -> Result<Option<DataChunk>> {
         // Check cache first, with integrity verification.
         if let Some(cached) = self.chunk_cache().get(address) {
             let computed = compute_address(&cached);
@@ -397,7 +416,10 @@ impl Client {
         // chunk would fail an entire multi-hundred-chunk download. A
         // zeroed outcome (queried=0) is never authoritative, so it flows
         // straight to the retry below.
-        let first = match self.chunk_get_try_close_group(address).await {
+        let first = match self
+            .chunk_get_try_closest_peers(address, peer_count)
+            .await
+        {
             Ok(outcome) => outcome,
             Err(e) => {
                 info!("chunk_get first close-group lookup failed for {addr_hex}: {e}; will retry");
@@ -454,7 +476,10 @@ impl Client {
         // If the retry's DHT lookup itself fails, treat that as "still
         // couldn't find" rather than escalating the error — matches the
         // semantics of the first attempt when peers are unreachable.
-        let retry = match self.chunk_get_try_close_group(address).await {
+        let retry = match self
+            .chunk_get_try_closest_peers(address, peer_count)
+            .await
+        {
             Ok(o) => o,
             Err(e) => {
                 info!(
@@ -493,11 +518,15 @@ impl Client {
         Ok(None)
     }
 
-    /// One sweep of the current close group: fetch the K closest peers
+    /// One sweep of the requested closest peers: fetch the closest peers
     /// for `address` from the DHT and ask each for the chunk in turn,
     /// returning on the first success.
-    async fn chunk_get_try_close_group(&self, address: &XorName) -> Result<CloseGroupOutcome> {
-        let peers = self.close_group_peers(address).await?;
+    async fn chunk_get_try_closest_peers(
+        &self,
+        address: &XorName,
+        peer_count: usize,
+    ) -> Result<CloseGroupOutcome> {
+        let peers = self.closest_peers(address, peer_count).await?;
         let addr_hex = hex::encode(address);
         let queried = peers.len();
         let mut not_found = 0usize;
@@ -570,7 +599,26 @@ impl Client {
         &self,
         address: &XorName,
     ) -> Result<Vec<ChunkPeerGetResult>> {
-        let mut peers = self.close_group_peers(address).await?;
+        self.chunk_get_from_closest_peer_group(address, self.config().close_group_size)
+            .await
+    }
+
+    /// Retrieve a chunk from the requested number of closest peers.
+    ///
+    /// Unlike [`Client::chunk_get_from_closest_peers`], this method does
+    /// not return early after the first successful response. It returns
+    /// one result per queried peer, sorted from closest XOR distance to
+    /// furthest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DHT lookup fails.
+    pub async fn chunk_get_from_closest_peer_group(
+        &self,
+        address: &XorName,
+        peer_count: usize,
+    ) -> Result<Vec<ChunkPeerGetResult>> {
+        let mut peers = self.closest_peers(address, peer_count).await?;
         peers.sort_by_key(|(peer, _)| peer_xor_distance(peer, address));
 
         let mut get_futures = FuturesUnordered::new();

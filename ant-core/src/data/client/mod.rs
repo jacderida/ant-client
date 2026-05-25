@@ -479,10 +479,20 @@ impl Client {
         &self,
         target: &XorName,
     ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
-        let peers = self
-            .network()
-            .find_closest_peers(target, self.config().close_group_size)
-            .await?;
+        self.closest_peers(target, self.config().close_group_size)
+            .await
+    }
+
+    /// Return the requested number of closest peers for a target address.
+    ///
+    /// Queries the DHT for peers by XOR distance. Returns each peer
+    /// paired with its known network addresses.
+    pub(crate) async fn closest_peers(
+        &self,
+        target: &XorName,
+        count: usize,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
+        let peers = self.network().find_closest_peers(target, count).await?;
 
         if peers.is_empty() {
             return Err(Error::InsufficientPeers(
