@@ -6,6 +6,7 @@
 use crate::data::client::adaptive::Outcome;
 use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
 use crate::data::client::peer_cache::record_peer_outcome;
+use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{QuoteHash, TxHash};
@@ -79,6 +80,18 @@ fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
 
 /// Store-response timeout for non-merkle chunk PUTs.
 const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Result of fetching one chunk address from one close-group peer.
+pub struct ChunkPeerGetResult {
+    /// Peer queried for the chunk.
+    pub peer_id: PeerId,
+    /// Known network addresses used for the peer.
+    pub peer_addrs: Vec<MultiAddr>,
+    /// XOR distance from `peer_id` to the chunk address.
+    pub xor_distance: [u8; 32],
+    /// Per-peer fetch result.
+    pub chunk_result: Result<Option<DataChunk>>,
+}
 
 fn store_response_timeout_for_proof(proof: &[u8], merkle_timeout_secs: u64) -> Duration {
     match detect_proof_type(proof) {
@@ -542,6 +555,57 @@ impl Client {
             network_err,
             protocol_err,
         })
+    }
+
+    /// Retrieve a chunk from every peer in the close group.
+    ///
+    /// Unlike [`Client::chunk_get`], this method does not return early
+    /// after the first successful response. It returns one result per
+    /// close-group peer, sorted from closest XOR distance to furthest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the close-group lookup fails.
+    pub async fn chunk_get_from_close_group(
+        &self,
+        address: &XorName,
+    ) -> Result<Vec<ChunkPeerGetResult>> {
+        let mut peers = self.close_group_peers(address).await?;
+        peers.sort_by_key(|(peer, _)| peer_xor_distance(peer, address));
+
+        let mut get_futures = FuturesUnordered::new();
+        for (peer, addrs) in &peers {
+            let peer_id = *peer;
+            let peer_addrs = addrs.clone();
+            let xor_distance = peer_xor_distance(peer, address);
+
+            let get_future = async move {
+                let chunk_result = self
+                    .chunk_get_from_peer(address, &peer_id, &peer_addrs)
+                    .await;
+
+                if let Ok(Some(chunk)) = &chunk_result {
+                    self.chunk_cache().put(chunk.address, chunk.content.clone());
+                }
+
+                ChunkPeerGetResult {
+                    peer_id,
+                    peer_addrs,
+                    xor_distance,
+                    chunk_result,
+                }
+            };
+
+            get_futures.push(get_future);
+        }
+
+        let mut results = Vec::with_capacity(peers.len());
+        while let Some(result) = get_futures.next().await {
+            results.push(result);
+        }
+
+        results.sort_by_key(|result| result.xor_distance);
+        Ok(results)
     }
 
     /// Fetch a chunk from a specific peer.
