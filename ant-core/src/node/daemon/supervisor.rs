@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -194,6 +194,11 @@ pub struct Supervisor {
     event_tx: broadcast::Sender<NodeEvent>,
     /// Runtime status of each node, keyed by node ID.
     node_states: HashMap<u32, NodeRuntime>,
+    /// Nodes adopted from a previous daemon instance, which have no owning `monitor_node`
+    /// task (their `Child` handle died with the previous daemon). Exit detection and, on
+    /// auto-upgrade, respawn for these nodes happen in the liveness monitor instead. A node
+    /// leaves this set once this daemon (re)spawns it and owns a `monitor_node` for it.
+    adopted: HashSet<u32>,
 }
 
 struct NodeRuntime {
@@ -211,7 +216,20 @@ impl Supervisor {
         Self {
             event_tx,
             node_states: HashMap::new(),
+            adopted: HashSet::new(),
         }
+    }
+
+    /// Whether `node_id` was adopted from a previous daemon instance and is therefore not
+    /// backed by an owning `monitor_node` task in this daemon.
+    pub fn is_adopted(&self, node_id: u32) -> bool {
+        self.adopted.contains(&node_id)
+    }
+
+    /// Mark a node as owned by this daemon (i.e. it now has a `monitor_node` task). Clears
+    /// any adopted flag so the liveness monitor leaves its exit handling to `monitor_node`.
+    fn mark_owned(&mut self, node_id: u32) {
+        self.adopted.remove(&node_id);
     }
 
     /// Start a node by spawning the actual process.
@@ -290,6 +308,9 @@ impl Supervisor {
                 pending_version: None,
             },
         );
+        // This daemon now owns the process and spawns a `monitor_node` for it below, so it is
+        // no longer (or never was) an adopted node the liveness monitor must respawn.
+        self.mark_owned(node_id);
 
         let _ = self.event_tx.send(NodeEvent::NodeStarted { node_id, pid });
 
@@ -538,6 +559,9 @@ impl Supervisor {
                     pending_version: None,
                 },
             );
+            // No owning `monitor_node` exists for an adopted process (its `Child` died with the
+            // previous daemon), so flag it for the liveness monitor to handle its exit/respawn.
+            self.adopted.insert(config.id);
             let _ = self.event_tx.send(NodeEvent::NodeStarted {
                 node_id: config.id,
                 pid,
@@ -1023,6 +1047,61 @@ pub fn spawn_liveness_monitor(
                 if is_process_alive(pid) {
                     continue;
                 }
+
+                // Adopted nodes have no owning `monitor_node`, so this poll is their only
+                // supervisor. If such a node's process died and the on-disk binary version has
+                // drifted from the registry, the exit was an auto-upgrade — `--stop-on-upgrade`
+                // expects the service manager (us) to restart it. Respawn it on the new binary
+                // and hand it a `monitor_node`, rather than leaving it dead and flagged Stopped.
+                if supervisor.read().await.is_adopted(node_id) {
+                    let config = {
+                        let reg = registry.read().await;
+                        reg.get(node_id).ok().cloned()
+                    };
+                    if let Some(mut config) = config {
+                        let drifted = matches!(
+                            extract_version(&config.binary_path).await,
+                            Ok(disk_version) if disk_version != config.version
+                        );
+                        if drifted {
+                            match respawn_upgraded_node(
+                                &mut config,
+                                &supervisor,
+                                &registry,
+                                &event_tx,
+                            )
+                            .await
+                            {
+                                Ok(child) => {
+                                    // Now owned by this daemon: clear the adopted flag and give
+                                    // it a monitor_node so future exits are handled there.
+                                    supervisor.write().await.mark_owned(node_id);
+                                    let sup_ref = Arc::clone(&supervisor);
+                                    let reg_ref = Arc::clone(&registry);
+                                    let ev = event_tx.clone();
+                                    tokio::spawn(async move {
+                                        monitor_node(child, config, sup_ref, reg_ref, ev).await;
+                                    });
+                                    continue;
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(NodeEvent::NodeErrored {
+                                        node_id,
+                                        message: format!(
+                                            "Failed to respawn adopted node after upgrade: {e}"
+                                        ),
+                                    });
+                                    let mut sup = supervisor.write().await;
+                                    sup.update_state(node_id, NodeStatus::Errored, None);
+                                    sup.mark_owned(node_id);
+                                    remove_node_pid(&data_dir);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let mut sup = supervisor.write().await;
                 // Re-check under the write lock to avoid racing with a concurrent
                 // start/stop that flipped the state between the snapshot and now.
@@ -1141,6 +1220,24 @@ fn is_process_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
     use crate::node::types::UpgradeChannel;
+
+    #[test]
+    fn adopted_flag_lifecycle() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut sup = Supervisor::new(tx);
+
+        // Nodes are not adopted by default.
+        assert!(!sup.is_adopted(1));
+
+        // adopt_from_registry flags nodes carried over from a previous daemon.
+        sup.adopted.insert(1);
+        assert!(sup.is_adopted(1));
+
+        // Once this daemon (re)spawns the node and owns a monitor_node for it, the flag
+        // clears so the liveness monitor stops treating its exit as needing a respawn.
+        sup.mark_owned(1);
+        assert!(!sup.is_adopted(1));
+    }
 
     #[test]
     fn build_node_args_basic() {
