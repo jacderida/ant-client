@@ -3,6 +3,7 @@
 //! Chunks are immutable, content-addressed data blocks where the address
 //! is the BLAKE3 hash of the content.
 
+use crate::data::client::adaptive::Outcome;
 use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
 use crate::data::client::peer_cache::record_peer_outcome;
 use crate::data::client::Client;
@@ -24,6 +25,58 @@ use tracing::{debug, info, warn};
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
 
+/// Result of one sweep over a chunk's close group.
+///
+/// Either we got the chunk from some peer, or every peer in the group
+/// returned NotFound, timed out, or hit a transport / protocol error.
+/// The counts feed the retry decision (`is_authoritative_not_found`):
+/// only a *unanimous* NotFound from a *well-sampled* close group counts
+/// as authoritative data absence — anything else (a non-unanimous
+/// result, or a thin/under-sampled DHT walk) leaves room for the actual
+/// storer to be in the timeout / network-error / protocol-error bucket
+/// or outside the sampled view, and is worth a retry against a freshly
+/// re-walked close group.
+struct CloseGroupOutcome {
+    chunk: Option<DataChunk>,
+    queried: usize,
+    not_found: usize,
+    timeout: usize,
+    network_err: usize,
+    /// Counts peers that responded with a remote `Error` (e.g.
+    /// "Chunk verification failed") or any other protocol-level error
+    /// that classifies as `Error::Protocol`. Treated the same as
+    /// `timeout` / `network_err` for retry decisions: one peer's bad
+    /// response must not abort the whole close-group sweep — the
+    /// remaining peers might still have a clean copy.
+    protocol_err: usize,
+}
+
+/// `true` if the close-group sweep is strong enough evidence to
+/// conclude the chunk is genuinely absent, so retrying is pointless.
+///
+/// Two conditions, both required:
+///
+/// 1. *Unanimous*: every peer we managed to query responded with an
+///    authoritative NotFound (`not_found == queried`). An earlier
+///    version used a majority quorum (`not_found >= close_group_size /
+///    2 + 1`), but production traffic disproved that: storage
+///    replicates to `CLOSE_GROUP_MAJORITY` (4) of the K=7 close-group
+///    peers, so up to 3 peers legitimately don't store any given chunk
+///    and a `not_found=4 timeout=3` result is "3 storers we couldn't
+///    reach" plus "4 non-storers," not data loss.
+///
+/// 2. *Well-sampled*: at least `CLOSE_GROUP_MAJORITY` peers were
+///    queried. `close_group_peers` (via `find_closest_peers`) accepts
+///    any non-empty DHT result, so a thin/under-sampled walk can return
+///    1 or 2 peers. A `1/1` or `3/3` NotFound from such a walk is NOT
+///    authoritative — the real replica majority may sit entirely
+///    outside that narrow view. Requiring a majority-sized sample means
+///    a thin lookup falls through to the retry (which re-walks the DHT)
+///    instead of being declared a final absence.
+fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
+    queried >= CLOSE_GROUP_MAJORITY && not_found == queried
+}
+
 /// Store-response timeout for non-merkle chunk PUTs.
 const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -31,6 +84,54 @@ fn store_response_timeout_for_proof(proof: &[u8], merkle_timeout_secs: u64) -> D
     match detect_proof_type(proof) {
         Some(ProofType::Merkle) => Duration::from_secs(merkle_timeout_secs),
         _ => STORE_RESPONSE_TIMEOUT,
+    }
+}
+
+impl Client {
+    /// Run `chunk_get` and feed one observation per call to the
+    /// adaptive fetch limiter. Use this from any consumer that drives
+    /// chunk-fetch concurrency from `controller().fetch.current()` —
+    /// the controller's window relies on every call along the hot
+    /// path producing an observation.
+    ///
+    /// Classifier semantics: see `chunk_get_outcome`. Most importantly,
+    /// `Ok(None)` is treated as `Outcome::Timeout`, not Success, so a
+    /// sustained run of close-group exhaustions correctly drives the
+    /// cap down rather than silently inflating it.
+    pub(crate) async fn chunk_get_observed(&self, address: &XorName) -> Result<Option<DataChunk>> {
+        let started = Instant::now();
+        let result = self.chunk_get(address).await;
+        let latency = started.elapsed();
+        self.controller()
+            .fetch
+            .observe(chunk_get_outcome(&result), latency);
+        result
+    }
+}
+
+/// Map a `chunk_get` outcome to an adaptive controller `Outcome`.
+///
+/// This is the result-aware classifier used by the file-download paths.
+/// It differs from `classify_error` in one critical way: an `Ok(None)`
+/// from `chunk_get` is `Outcome::Timeout`, not `Outcome::Success`. By
+/// the time `chunk_get` returns `Ok(None)` it has already exhausted
+/// the close group across its first attempt + retry sweep, so
+/// `Ok(None)` is the controller's load-shedding signal — a sustained
+/// run of them on a saturated home link is exactly the case where the
+/// cap should shrink.
+///
+/// Healthy returns (`Ok(Some(_))`) are Success regardless of how many
+/// internal peer attempts the chunk_get had to make. The controller
+/// does not need to see internal peer noise; that's noise about the
+/// production network's natural peer-side variability, not about the
+/// client's effective capacity.
+pub(crate) fn chunk_get_outcome(result: &Result<Option<DataChunk>>) -> Outcome {
+    match result {
+        Ok(Some(_)) => Outcome::Success,
+        Ok(None) => Outcome::Timeout,
+        Err(Error::Timeout(_)) => Outcome::Timeout,
+        Err(Error::Network(_)) => Outcome::NetworkError,
+        Err(_) => Outcome::ApplicationError,
     }
 }
 
@@ -239,6 +340,20 @@ impl Client {
     /// where the storing peer differs from the first peer returned by
     /// DHT routing.
     ///
+    /// ## Adaptive controller feedback
+    ///
+    /// Each per-peer GET attempt is fed individually to the adaptive
+    /// fetch limiter via `controller().fetch.observe(...)`. This is
+    /// deliberately finer-grained than wrapping the outer `chunk_get`
+    /// with `observe_op`: when a chunk takes 6 peer tries to land,
+    /// 5 of them are real capacity signals (timeouts / network errors)
+    /// that should pull the cap down even if the chunk eventually
+    /// succeeds. The outer `Ok(_)` would mask all five as a single
+    /// `Outcome::Success`. See `adaptive::Outcome` for the per-attempt
+    /// classification rules used below.
+    ///
+    /// Callers should therefore NOT wrap `chunk_get` in `observe_op`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the network operation fails.
@@ -258,19 +373,136 @@ impl Client {
             self.chunk_cache().remove(address);
         }
 
-        let peers = self.close_group_peers(address).await?;
         let addr_hex = hex::encode(address);
 
+        // First attempt against the current close-group view. A
+        // lookup/transport error here (e.g. close_group_peers' DHT walk
+        // momentarily returning an error, or InsufficientPeers from a
+        // thin routing table) is NOT fatal: fall through to the retry
+        // path exactly as a non-authoritative miss would. Otherwise one
+        // transient error on the *initial* close-group walk for a single
+        // chunk would fail an entire multi-hundred-chunk download. A
+        // zeroed outcome (queried=0) is never authoritative, so it flows
+        // straight to the retry below.
+        let first = match self.chunk_get_try_close_group(address).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                info!("chunk_get first close-group lookup failed for {addr_hex}: {e}; will retry");
+                CloseGroupOutcome {
+                    chunk: None,
+                    queried: 0,
+                    not_found: 0,
+                    timeout: 0,
+                    network_err: 0,
+                    protocol_err: 0,
+                }
+            }
+        };
+        if let Some(chunk) = first.chunk {
+            self.chunk_cache().put(chunk.address, chunk.content.clone());
+            return Ok(Some(chunk));
+        }
+
+        // Only treat as authoritative absence when *every* queried peer
+        // responded NotFound. Anything less leaves the actual storer
+        // possibly in the timeout / network-error bucket, which a retry
+        // could reach.
+        if is_authoritative_not_found(first.not_found, first.queried) {
+            info!(
+                "chunk_get giving up on {addr_hex} (unanimous NotFound): \
+                 queried={} not_found={} timeout={} network_err={} protocol_err={}",
+                first.queried,
+                first.not_found,
+                first.timeout,
+                first.network_err,
+                first.protocol_err,
+            );
+            return Ok(None);
+        }
+
+        // Otherwise the failure looks like reachability (most peers timed out
+        // or hit transport errors). The chunk is most likely still on the
+        // network but the current close-group view either (a) caught a
+        // transient transport blip or (b) converged on the wrong neighbourhood
+        // because the routing table is thin. One retry against a freshly
+        // re-walked close group is the cheapest defence against both.
+        info!(
+            "chunk_get retrying {addr_hex} after reachability failure: \
+             queried={} not_found={} timeout={} network_err={} protocol_err={}",
+            first.queried, first.not_found, first.timeout, first.network_err, first.protocol_err,
+        );
+
+        // Brief settle so any in-flight transport state can quiesce before
+        // we re-walk the DHT. Keep this small so we don't add meaningful
+        // latency to the genuinely-lost case (we already paid for one full
+        // close-group sweep before getting here).
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // If the retry's DHT lookup itself fails, treat that as "still
+        // couldn't find" rather than escalating the error — matches the
+        // semantics of the first attempt when peers are unreachable.
+        let retry = match self.chunk_get_try_close_group(address).await {
+            Ok(o) => o,
+            Err(e) => {
+                info!(
+                    "chunk_get retry close-group lookup failed for {addr_hex}: {e}; \
+                     first(queried={} not_found={} timeout={} network_err={} protocol_err={})",
+                    first.queried,
+                    first.not_found,
+                    first.timeout,
+                    first.network_err,
+                    first.protocol_err,
+                );
+                return Ok(None);
+            }
+        };
+        if let Some(chunk) = retry.chunk {
+            info!("chunk_get retry succeeded for {addr_hex}");
+            self.chunk_cache().put(chunk.address, chunk.content.clone());
+            return Ok(Some(chunk));
+        }
+
+        info!(
+            "chunk_get exhausted close group after retry for {addr_hex}: \
+             first(queried={} not_found={} timeout={} network_err={} protocol_err={}) \
+             retry(queried={} not_found={} timeout={} network_err={} protocol_err={})",
+            first.queried,
+            first.not_found,
+            first.timeout,
+            first.network_err,
+            first.protocol_err,
+            retry.queried,
+            retry.not_found,
+            retry.timeout,
+            retry.network_err,
+            retry.protocol_err,
+        );
+        Ok(None)
+    }
+
+    /// One sweep of the current close group: fetch the K closest peers
+    /// for `address` from the DHT and ask each for the chunk in turn,
+    /// returning on the first success.
+    async fn chunk_get_try_close_group(&self, address: &XorName) -> Result<CloseGroupOutcome> {
+        let peers = self.close_group_peers(address).await?;
+        let addr_hex = hex::encode(address);
         let queried = peers.len();
         let mut not_found = 0usize;
         let mut timeout = 0usize;
         let mut network_err = 0usize;
+        let mut protocol_err = 0usize;
 
         for (peer, addrs) in &peers {
             match self.chunk_get_from_peer(address, peer, addrs).await {
                 Ok(Some(chunk)) => {
-                    self.chunk_cache().put(chunk.address, chunk.content.clone());
-                    return Ok(Some(chunk));
+                    return Ok(CloseGroupOutcome {
+                        chunk: Some(chunk),
+                        queried,
+                        not_found,
+                        timeout,
+                        network_err,
+                        protocol_err,
+                    });
                 }
                 Ok(None) => {
                     not_found += 1;
@@ -284,18 +516,32 @@ impl Client {
                     network_err += 1;
                     debug!("Peer {peer} unreachable for chunk {addr_hex}, trying next");
                 }
+                // A `Protocol` error here is the storer responding with
+                // `ChunkGetResponse::Error(...)` — e.g. "Chunk verification
+                // failed" from a peer that has a corrupted local copy.
+                // That's a per-peer problem, not a per-chunk one: the
+                // remaining peers might still have a clean copy, so
+                // continue the sweep rather than aborting it. Counted
+                // separately from network_err so the summary log still
+                // distinguishes "peer corrupted" from "peer unreachable".
+                Err(Error::Protocol(ref e)) => {
+                    protocol_err += 1;
+                    debug!(
+                        "Peer {peer} returned protocol error for chunk {addr_hex} ({e}), trying next"
+                    );
+                }
                 Err(e) => return Err(e),
             }
         }
 
-        // None of the close group peers had the chunk. Emit a single summary
-        // so operators can distinguish data loss (all peers responded NotFound)
-        // from a reachability problem (most peers timed out / errored).
-        info!(
-            "chunk_get exhausted close group for {addr_hex}: \
-             queried={queried} not_found={not_found} timeout={timeout} network_err={network_err}"
-        );
-        Ok(None)
+        Ok(CloseGroupOutcome {
+            chunk: None,
+            queried,
+            not_found,
+            timeout,
+            network_err,
+            protocol_err,
+        })
     }
 
     /// Fetch a chunk from a specific peer.
@@ -433,6 +679,81 @@ mod tests {
     const TEST_MERKLE_TIMEOUT_SECS: u64 = 60;
     /// Sentinel byte used to represent an unknown/unrecognized proof tag.
     const UNKNOWN_PROOF_TAG: u8 = 0xff;
+
+    #[test]
+    fn authoritative_not_found_requires_unanimous_well_sampled_response() {
+        // Unanimous AND well-sampled: every queried peer of a full
+        // close group said NotFound. The only safe stop.
+        assert!(is_authoritative_not_found(7, 7));
+        // Unanimous with exactly a majority-sized sample is also
+        // authoritative.
+        assert!(is_authoritative_not_found(
+            CLOSE_GROUP_MAJORITY,
+            CLOSE_GROUP_MAJORITY
+        ));
+
+        // Unanimous but UNDER-sampled: a thin DHT walk returning 1 or 3
+        // peers, all NotFound, is NOT authoritative — the real replica
+        // majority may sit entirely outside that narrow view. Must
+        // retry (re-walk the DHT).
+        assert!(!is_authoritative_not_found(1, 1));
+        assert!(!is_authoritative_not_found(3, 3));
+        assert!(!is_authoritative_not_found(
+            CLOSE_GROUP_MAJORITY - 1,
+            CLOSE_GROUP_MAJORITY - 1
+        ));
+
+        // Not unanimous: 4-of-7 / 6-of-7 NotFound leaves storers in the
+        // timeout bucket. Must retry.
+        assert!(!is_authoritative_not_found(4, 7));
+        assert!(!is_authoritative_not_found(6, 7));
+
+        // Pure-reachability failure — must retry.
+        assert!(!is_authoritative_not_found(0, 7));
+
+        // Defensive: a zeroed outcome (e.g. the first attempt's
+        // close-group lookup errored) is never authoritative.
+        assert!(!is_authoritative_not_found(0, 0));
+    }
+
+    #[test]
+    fn chunk_get_outcome_classifies_each_result_kind() {
+        // Success: chunk_get returned a chunk, regardless of how many
+        // internal peer attempts it took.
+        let chunk = DataChunk::new([0u8; 32], Bytes::from_static(b"x"));
+        assert_eq!(
+            chunk_get_outcome(&Ok(Some(chunk))),
+            Outcome::Success,
+            "found-chunk must be Success",
+        );
+
+        // Ok(None): chunk_get exhausted the close group across first
+        // attempt + retry. This is the load-shedding signal — count it
+        // as Timeout so a sustained run of them on a saturated link
+        // shrinks the cap.
+        assert_eq!(
+            chunk_get_outcome(&Ok(None)),
+            Outcome::Timeout,
+            "Ok(None) must be Timeout — that's the controller's load-shedding signal",
+        );
+
+        // Capacity signals from explicit error variants.
+        assert_eq!(
+            chunk_get_outcome(&Err(Error::Timeout("t".into()))),
+            Outcome::Timeout,
+        );
+        assert_eq!(
+            chunk_get_outcome(&Err(Error::Network("n".into()))),
+            Outcome::NetworkError,
+        );
+
+        // Unexpected error variant (e.g. Protocol) — propagates out of
+        // chunk_get to the caller and is not a capacity signal.
+        assert_eq!(
+            chunk_get_outcome(&Err(Error::Protocol("p".into()))),
+            Outcome::ApplicationError,
+        );
+    }
 
     #[test]
     fn single_node_proof_uses_store_response_timeout() {
