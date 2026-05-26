@@ -87,6 +87,11 @@ const HILL_STABLE_PROBE_EPOCHS: usize = 3;
 /// Stress cuts fetch concurrency in half.
 const HILL_STRESS_DECREASE_DIVISOR: usize = 2;
 
+/// Fetch goodput epochs should cover complete concurrency waves. A
+/// fixed sample window can unfairly compare a full lower-cap wave with
+/// a partial higher-cap wave.
+const HILL_EPOCH_FULL_WAVES: usize = 2;
+
 /// Lock helper matching the project pattern (see `cache::ChunkCache`):
 /// poisoned mutexes still yield the inner state rather than panicking.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -512,6 +517,18 @@ impl Limiter {
     /// Record one observed operation with a payload byte count. Bytes
     /// are used by the fetch hill climber; AIMD channels ignore them.
     pub fn observe_with_bytes(&self, outcome: Outcome, latency: Duration, bytes: u64) {
+        let observed_at = Instant::now();
+        let operation_started = observed_at.checked_sub(latency).unwrap_or(observed_at);
+        self.observe_with_timing(outcome, latency, bytes, operation_started);
+    }
+
+    fn observe_with_timing(
+        &self,
+        outcome: Outcome,
+        latency: Duration,
+        bytes: u64,
+        operation_started: Instant,
+    ) {
         if !self.config.enabled {
             return;
         }
@@ -521,7 +538,14 @@ impl Limiter {
         }
         g.window.push_back(Sample { outcome, latency });
         if self.algorithm == LimiterAlgorithm::ThroughputHillClimb {
-            observe_hill_climb(&mut g, outcome, latency, bytes, &self.config);
+            observe_hill_climb(
+                &mut g,
+                outcome,
+                latency,
+                bytes,
+                operation_started,
+                &self.config,
+            );
             return;
         }
         g.samples_since_increase = g.samples_since_increase.saturating_add(1);
@@ -749,10 +773,12 @@ fn observe_hill_climb(
     outcome: Outcome,
     latency: Duration,
     bytes: u64,
+    operation_started: Instant,
     cfg: &LimiterConfig,
 ) {
-    if inner.hill.epoch_started.is_none() {
-        inner.hill.epoch_started = Some(Instant::now());
+    match inner.hill.epoch_started {
+        Some(epoch_started) if epoch_started <= operation_started => {}
+        _ => inner.hill.epoch_started = Some(operation_started),
     }
     inner.hill.epoch_samples = inner.hill.epoch_samples.saturating_add(1);
     match outcome {
@@ -775,7 +801,7 @@ fn observe_hill_climb(
         return;
     }
 
-    if inner.hill.epoch_samples < cfg.window_ops {
+    if inner.hill.epoch_samples < hill_epoch_target_samples(inner.current, cfg) {
         return;
     }
 
@@ -783,6 +809,12 @@ fn observe_hill_climb(
         apply_hill_epoch(inner, stats, cfg);
     }
     inner.hill.reset_epoch();
+}
+
+fn hill_epoch_target_samples(current: usize, cfg: &LimiterConfig) -> usize {
+    cfg.window_ops
+        .max(current.saturating_mul(HILL_EPOCH_FULL_WAVES))
+        .max(cfg.min_window_ops)
 }
 
 fn hill_epoch_stressed(hill: &HillClimbState, cfg: &LimiterConfig) -> bool {
@@ -1173,7 +1205,8 @@ impl<'a> ObserveGuard<'a> {
 impl Drop for ObserveGuard<'_> {
     fn drop(&mut self) {
         if let Some((outcome, latency, bytes)) = self.outcome.take() {
-            self.limiter.observe_with_bytes(outcome, latency, bytes);
+            self.limiter
+                .observe_with_timing(outcome, latency, bytes, self.started);
         }
     }
 }
@@ -1374,8 +1407,8 @@ where
 
 /// On-disk shape for the persisted adaptive state. Versioned so we
 /// can evolve the controller without crashing on stale files — an
-/// unknown schema version simply causes a silent fallback to cold
-/// defaults.
+/// unknown future schema version simply causes a silent fallback to
+/// cold defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     schema: u32,
@@ -1383,6 +1416,7 @@ struct PersistedState {
 }
 
 const PERSIST_SCHEMA: u32 = 2;
+const PERSIST_SCHEMA_AIMD_FETCH: u32 = 1;
 const PERSIST_FILENAME: &str = "client_adaptive.json";
 
 /// Default persistence path: `<data_dir>/client_adaptive.json`. Falls
@@ -1410,16 +1444,28 @@ pub fn load_snapshot(path: &Path) -> Option<ChannelStart> {
             return None;
         }
     };
-    if state.schema != PERSIST_SCHEMA {
-        debug!(
-            path = %path.display(),
-            schema = state.schema,
-            expected = PERSIST_SCHEMA,
-            "adaptive: snapshot schema mismatch, ignoring",
-        );
-        return None;
+    match state.schema {
+        PERSIST_SCHEMA => Some(state.channels),
+        PERSIST_SCHEMA_AIMD_FETCH => {
+            debug!(
+                path = %path.display(),
+                "adaptive: migrating schema-1 snapshot, preserving quote/store and resetting fetch",
+            );
+            Some(ChannelStart {
+                fetch: FETCH_COLD_START_CONCURRENCY,
+                ..state.channels
+            })
+        }
+        schema => {
+            debug!(
+                path = %path.display(),
+                schema,
+                expected = PERSIST_SCHEMA,
+                "adaptive: snapshot schema mismatch, ignoring",
+            );
+            None
+        }
     }
-    Some(state.channels)
 }
 
 /// Save a snapshot to disk atomically (write to `<path>.tmp`, then
@@ -1516,6 +1562,16 @@ pub fn save_snapshot_with_timeout(path: PathBuf, channels: ChannelStart, timeout
 mod tests {
     use super::*;
 
+    const HILL_TEST_START_CAP: usize = 16;
+    const HILL_TEST_UP_PROBE_CAP: usize = 20;
+    const HILL_TEST_NEXT_UP_PROBE_CAP: usize = 25;
+    const HILL_TEST_DOWN_PROBE_CAP: usize = 12;
+    const HILL_TEST_CHUNK_BYTES: u64 = 1_000;
+    const HILL_TEST_BASE_LATENCY_MS: u64 = 100;
+    const HILL_TEST_REJECT_LATENCY_MS: u64 = 130;
+    const HILL_TEST_RETAINED_DOWN_LATENCY_MS: u64 = 75;
+    const HILL_TEST_ASYNC_LATENCY_MS: u64 = 10;
+
     fn cfg_for_tests() -> LimiterConfig {
         LimiterConfig {
             enabled: true,
@@ -1547,10 +1603,25 @@ mod tests {
         Limiter::new_with_algorithm(start, cfg, LimiterAlgorithm::ThroughputHillClimb)
     }
 
-    fn observe_hill_success_epoch(limiter: &Limiter, cfg: &LimiterConfig, bytes: u64) {
-        for _ in 0..cfg.window_ops {
-            limiter.observe_with_bytes(Outcome::Success, Duration::from_millis(100), bytes);
+    fn observe_hill_success_epoch_with_latency(
+        limiter: &Limiter,
+        cfg: &LimiterConfig,
+        bytes: u64,
+        latency: Duration,
+    ) {
+        let samples = hill_epoch_target_samples(limiter.current(), cfg);
+        for _ in 0..samples {
+            limiter.observe_with_bytes(Outcome::Success, latency, bytes);
         }
+    }
+
+    fn observe_hill_success_epoch(limiter: &Limiter, cfg: &LimiterConfig, bytes: u64) {
+        observe_hill_success_epoch_with_latency(
+            limiter,
+            cfg,
+            bytes,
+            Duration::from_millis(HILL_TEST_BASE_LATENCY_MS),
+        );
     }
 
     /// Build an `AdaptiveConfig` for tests that need to construct a
@@ -1999,6 +2070,27 @@ mod tests {
         let payload = r#"{"schema":999,"channels":{"quote":1,"store":1,"fetch":1}}"#;
         std::fs::write(&path, payload).unwrap();
         assert!(load_snapshot(&path).is_none());
+    }
+
+    #[test]
+    fn load_schema_one_preserves_quote_store_and_resets_fetch() {
+        const LEGACY_QUOTE_CAP: usize = 48;
+        const LEGACY_STORE_CAP: usize = 24;
+        const LEGACY_FETCH_CAP: usize = 96;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.json");
+        let payload = format!(
+            r#"{{"schema":{},"channels":{{"quote":{},"store":{},"fetch":{}}}}}"#,
+            PERSIST_SCHEMA_AIMD_FETCH, LEGACY_QUOTE_CAP, LEGACY_STORE_CAP, LEGACY_FETCH_CAP,
+        );
+        std::fs::write(&path, payload).unwrap();
+
+        let loaded = load_snapshot(&path).unwrap();
+
+        assert_eq!(loaded.quote, LEGACY_QUOTE_CAP);
+        assert_eq!(loaded.store, LEGACY_STORE_CAP);
+        assert_eq!(loaded.fetch, FETCH_COLD_START_CONCURRENCY);
     }
 
     #[tokio::test]
@@ -2703,37 +2795,46 @@ mod tests {
     #[test]
     fn fetch_hill_rejects_upward_probe_without_goodput_gain() {
         let cfg = hill_cfg_for_tests();
-        let l = fetch_hill_for_tests(16, cfg.clone());
+        let l = fetch_hill_for_tests(HILL_TEST_START_CAP, cfg.clone());
 
-        observe_hill_success_epoch(&l, &cfg, 1_000);
-        assert_eq!(l.current(), 20, "first healthy epoch should probe upward");
-
-        observe_hill_success_epoch(&l, &cfg, 1_000);
+        observe_hill_success_epoch(&l, &cfg, HILL_TEST_CHUNK_BYTES);
         assert_eq!(
             l.current(),
-            16,
-            "unchanged goodput should reject the upward probe"
+            HILL_TEST_UP_PROBE_CAP,
+            "first healthy epoch should probe upward"
         );
-        assert_eq!(l.snapshot(), 16);
+
+        observe_hill_success_epoch_with_latency(
+            &l,
+            &cfg,
+            HILL_TEST_CHUNK_BYTES,
+            Duration::from_millis(HILL_TEST_REJECT_LATENCY_MS),
+        );
+        assert_eq!(
+            l.current(),
+            HILL_TEST_START_CAP,
+            "slower higher-cap wave should reject the upward probe"
+        );
+        assert_eq!(l.snapshot(), HILL_TEST_START_CAP);
     }
 
     #[test]
     fn fetch_hill_accepts_upward_probe_with_goodput_gain() {
         let cfg = hill_cfg_for_tests();
-        let l = fetch_hill_for_tests(16, cfg.clone());
+        let l = fetch_hill_for_tests(HILL_TEST_START_CAP, cfg.clone());
 
-        observe_hill_success_epoch(&l, &cfg, 1_000);
-        assert_eq!(l.current(), 20);
+        observe_hill_success_epoch(&l, &cfg, HILL_TEST_CHUNK_BYTES);
+        assert_eq!(l.current(), HILL_TEST_UP_PROBE_CAP);
 
-        observe_hill_success_epoch(&l, &cfg, 1_200);
+        observe_hill_success_epoch(&l, &cfg, HILL_TEST_CHUNK_BYTES);
         assert_eq!(
             l.snapshot(),
-            20,
-            "improved goodput should promote the probed cap to best"
+            HILL_TEST_UP_PROBE_CAP,
+            "same-size chunks at same latency should promote the higher cap"
         );
         assert_eq!(
             l.current(),
-            25,
+            HILL_TEST_NEXT_UP_PROBE_CAP,
             "after accepting an upward probe, hill climber should probe higher"
         );
     }
@@ -2741,26 +2842,76 @@ mod tests {
     #[test]
     fn fetch_hill_accepts_lower_probe_when_goodput_is_retained() {
         let cfg = hill_cfg_for_tests();
-        let l = fetch_hill_for_tests(16, cfg.clone());
+        let l = fetch_hill_for_tests(HILL_TEST_START_CAP, cfg.clone());
 
-        observe_hill_success_epoch(&l, &cfg, 1_000);
-        observe_hill_success_epoch(&l, &cfg, 1_000);
-        assert_eq!(l.current(), 16);
+        observe_hill_success_epoch(&l, &cfg, HILL_TEST_CHUNK_BYTES);
+        observe_hill_success_epoch_with_latency(
+            &l,
+            &cfg,
+            HILL_TEST_CHUNK_BYTES,
+            Duration::from_millis(HILL_TEST_REJECT_LATENCY_MS),
+        );
+        assert_eq!(l.current(), HILL_TEST_START_CAP);
 
         for _ in 0..(HILL_REJECT_COOLDOWN_EPOCHS + HILL_STABLE_PROBE_EPOCHS) {
-            observe_hill_success_epoch(&l, &cfg, 1_000);
+            observe_hill_success_epoch(&l, &cfg, HILL_TEST_CHUNK_BYTES);
         }
         assert_eq!(
             l.current(),
-            12,
+            HILL_TEST_DOWN_PROBE_CAP,
             "stable best should eventually probe a lower cap"
         );
 
-        observe_hill_success_epoch(&l, &cfg, 1_000);
+        observe_hill_success_epoch_with_latency(
+            &l,
+            &cfg,
+            HILL_TEST_CHUNK_BYTES,
+            Duration::from_millis(HILL_TEST_RETAINED_DOWN_LATENCY_MS),
+        );
         assert_eq!(
             l.snapshot(),
-            12,
+            HILL_TEST_DOWN_PROBE_CAP,
             "retained goodput at lower concurrency should become the new best"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_hill_accepts_constant_size_upward_probe_from_timed_ops() {
+        let cfg = hill_cfg_for_tests();
+        let l = fetch_hill_for_tests(HILL_TEST_START_CAP, cfg.clone());
+        let total_ops = hill_epoch_target_samples(HILL_TEST_START_CAP, &cfg)
+            + hill_epoch_target_samples(HILL_TEST_UP_PROBE_CAP, &cfg);
+        let limiter_for_ops = l.clone();
+
+        let result: std::result::Result<Vec<()>, ()> =
+            rebucketed_unordered(&l, 0..total_ops, move |_| {
+                let limiter = limiter_for_ops.clone();
+                async move {
+                    observe_op_with_success_bytes(
+                        &limiter,
+                        || async {
+                            tokio::time::sleep(Duration::from_millis(HILL_TEST_ASYNC_LATENCY_MS))
+                                .await;
+                            Ok::<(), ()>(())
+                        },
+                        |_| Outcome::NetworkError,
+                        |_| HILL_TEST_CHUNK_BYTES,
+                    )
+                    .await
+                }
+            })
+            .await;
+        result.unwrap();
+
+        assert_eq!(
+            l.snapshot(),
+            HILL_TEST_UP_PROBE_CAP,
+            "timed constant-size chunks should prove the higher cap improves goodput"
+        );
+        assert_eq!(
+            l.current(),
+            HILL_TEST_NEXT_UP_PROBE_CAP,
+            "accepted upward probe should immediately test the next cap"
         );
     }
 
