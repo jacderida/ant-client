@@ -1412,7 +1412,7 @@ impl Client {
                 chunk_addresses,
             } => {
                 let batch_result = finalize_merkle_batch(prepared_batch, winner_pool_hash)?;
-                let (chunks_stored, stats) = self
+                let outcome = self
                     .merkle_upload_chunks(
                         chunk_contents,
                         chunk_addresses,
@@ -1423,20 +1423,23 @@ impl Client {
                     )
                     .await?;
 
-                info!("External-signer merkle upload finalized: {chunks_stored} chunks stored");
+                info!(
+                    "External-signer merkle upload finalized: {} chunks stored, {} failed",
+                    outcome.stored, outcome.failed
+                );
 
                 Ok(FileUploadResult {
                     data_map: prepared.data_map,
-                    chunks_stored,
-                    chunks_failed: 0,
+                    chunks_stored: outcome.stored,
+                    chunks_failed: outcome.failed,
                     total_chunks,
                     payment_mode_used: PaymentMode::Merkle,
                     storage_cost_atto: "0".into(),
                     gas_cost_wei: 0,
                     data_map_address,
-                    chunk_attempts_total: stats.chunk_attempts_total,
-                    store_durations_ms: stats.store_durations_ms,
-                    retries_histogram: stats.retries_histogram,
+                    chunk_attempts_total: outcome.stats.chunk_attempts_total,
+                    store_durations_ms: outcome.stats.store_durations_ms,
+                    retries_histogram: outcome.stats.retries_histogram,
                 })
             }
             ExternalPaymentInfo::WaveBatch { .. } => Err(Error::Payment(
