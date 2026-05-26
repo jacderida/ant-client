@@ -81,10 +81,8 @@ fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
 /// Store-response timeout for non-merkle chunk PUTs.
 const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Base wave allowed for a diagnostic peer sweep.
-const DIAGNOSTIC_TIMEOUT_BASE_WAVES: u32 = 1;
 /// Extra waves allowed after the computed diagnostic peer-sweep deadline.
-const DIAGNOSTIC_TIMEOUT_PADDING_WAVES: u32 = 1;
+const DIAGNOSTIC_TIMEOUT_PADDING_WAVES: usize = 1;
 
 /// Result of fetching one chunk address from one close-group peer.
 pub struct ChunkPeerGetResult {
@@ -130,10 +128,17 @@ fn diagnostic_peer_get_concurrency(peer_count: usize, close_group_size: usize) -
     peer_count.min(close_group_size.max(1))
 }
 
-fn diagnostic_peer_get_overall_timeout(per_peer_timeout: Duration) -> Duration {
-    per_peer_timeout.saturating_mul(
-        DIAGNOSTIC_TIMEOUT_BASE_WAVES.saturating_add(DIAGNOSTIC_TIMEOUT_PADDING_WAVES),
-    )
+fn diagnostic_peer_get_overall_timeout(
+    per_peer_timeout: Duration,
+    target_count: usize,
+    concurrency_limit: usize,
+) -> Duration {
+    let concurrency_limit = concurrency_limit.max(1);
+    let peer_get_waves = target_count.div_ceil(concurrency_limit);
+    let timeout_waves = peer_get_waves.saturating_add(DIAGNOSTIC_TIMEOUT_PADDING_WAVES);
+    let timeout_waves = u32::try_from(timeout_waves).unwrap_or(u32::MAX);
+
+    per_peer_timeout.saturating_mul(timeout_waves)
 }
 
 fn timed_out_chunk_peer_get_result(
@@ -477,10 +482,7 @@ impl Client {
         // chunk would fail an entire multi-hundred-chunk download. A
         // zeroed outcome (queried=0) is never authoritative, so it flows
         // straight to the retry below.
-        let first = match self
-            .chunk_get_try_closest_peers(address, peer_count)
-            .await
-        {
+        let first = match self.chunk_get_try_closest_peers(address, peer_count).await {
             Ok(outcome) => outcome,
             Err(e) => {
                 info!("chunk_get first close-group lookup failed for {addr_hex}: {e}; will retry");
@@ -537,10 +539,7 @@ impl Client {
         // If the retry's DHT lookup itself fails, treat that as "still
         // couldn't find" rather than escalating the error — matches the
         // semantics of the first attempt when peers are unreachable.
-        let retry = match self
-            .chunk_get_try_closest_peers(address, peer_count)
-            .await
-        {
+        let retry = match self.chunk_get_try_closest_peers(address, peer_count).await {
             Ok(o) => o,
             Err(e) => {
                 info!(
@@ -684,7 +683,8 @@ impl Client {
         let concurrency_limit =
             diagnostic_peer_get_concurrency(peer_count, self.config().close_group_size);
         let per_peer_timeout = Duration::from_secs(self.config().chunk_get_timeout_secs);
-        let overall_timeout = diagnostic_peer_get_overall_timeout(per_peer_timeout);
+        let overall_timeout =
+            diagnostic_peer_get_overall_timeout(per_peer_timeout, targets.len(), concurrency_limit);
 
         let mut completed = vec![false; targets.len()];
         let mut results = Vec::with_capacity(targets.len());
@@ -1005,12 +1005,37 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_peer_get_overall_timeout_is_independent_of_peer_count() {
+    fn diagnostic_peer_get_overall_timeout_allows_one_wave_plus_padding() {
         const PER_PEER_TIMEOUT_SECS: u64 = 10;
         const EXPECTED_WAVES_WITH_PADDING: u64 = 2;
+        const TARGET_COUNT: usize = 7;
+        const CONCURRENCY_LIMIT: usize = 7;
 
-        let timeout =
-            diagnostic_peer_get_overall_timeout(Duration::from_secs(PER_PEER_TIMEOUT_SECS));
+        let timeout = diagnostic_peer_get_overall_timeout(
+            Duration::from_secs(PER_PEER_TIMEOUT_SECS),
+            TARGET_COUNT,
+            CONCURRENCY_LIMIT,
+        );
+
+        assert_eq!(
+            timeout,
+            Duration::from_secs(PER_PEER_TIMEOUT_SECS * EXPECTED_WAVES_WITH_PADDING)
+        );
+    }
+
+    #[test]
+    fn diagnostic_peer_get_overall_timeout_scales_with_peer_count() {
+        const PER_PEER_TIMEOUT_SECS: u64 = 10;
+        const TARGET_COUNT: usize = 20;
+        const CLOSE_GROUP_SIZE: usize = 7;
+        const EXPECTED_WAVES_WITH_PADDING: u64 = 4;
+
+        let concurrency_limit = diagnostic_peer_get_concurrency(TARGET_COUNT, CLOSE_GROUP_SIZE);
+        let timeout = diagnostic_peer_get_overall_timeout(
+            Duration::from_secs(PER_PEER_TIMEOUT_SECS),
+            TARGET_COUNT,
+            concurrency_limit,
+        );
 
         assert_eq!(
             timeout,
