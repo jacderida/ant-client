@@ -17,7 +17,7 @@ use ant_protocol::{
     ProofType, XorName, CLOSE_GROUP_MAJORITY,
 };
 use bytes::Bytes;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -81,6 +81,11 @@ fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
 /// Store-response timeout for non-merkle chunk PUTs.
 const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Base wave allowed for a diagnostic peer sweep.
+const DIAGNOSTIC_TIMEOUT_BASE_WAVES: u32 = 1;
+/// Extra waves allowed after the computed diagnostic peer-sweep deadline.
+const DIAGNOSTIC_TIMEOUT_PADDING_WAVES: u32 = 1;
+
 /// Result of fetching one chunk address from one close-group peer.
 pub struct ChunkPeerGetResult {
     /// Peer queried for the chunk.
@@ -91,6 +96,62 @@ pub struct ChunkPeerGetResult {
     pub xor_distance: [u8; 32],
     /// Per-peer fetch result.
     pub chunk_result: Result<Option<DataChunk>>,
+}
+
+#[derive(Clone)]
+struct ChunkPeerGetTarget {
+    index: usize,
+    peer_id: PeerId,
+    peer_addrs: Vec<MultiAddr>,
+    xor_distance: [u8; 32],
+}
+
+fn chunk_peer_get_targets(
+    peers: Vec<(PeerId, Vec<MultiAddr>)>,
+    address: &XorName,
+) -> Vec<ChunkPeerGetTarget> {
+    peers
+        .into_iter()
+        .enumerate()
+        .map(|(index, (peer_id, peer_addrs))| ChunkPeerGetTarget {
+            index,
+            peer_id,
+            peer_addrs,
+            xor_distance: peer_xor_distance(&peer_id, address),
+        })
+        .collect()
+}
+
+fn sort_chunk_peer_get_results(results: &mut [ChunkPeerGetResult]) {
+    results.sort_by_key(|result| result.xor_distance);
+}
+
+fn diagnostic_peer_get_concurrency(peer_count: usize, close_group_size: usize) -> usize {
+    peer_count.min(close_group_size.max(1))
+}
+
+fn diagnostic_peer_get_overall_timeout(per_peer_timeout: Duration) -> Duration {
+    per_peer_timeout.saturating_mul(
+        DIAGNOSTIC_TIMEOUT_BASE_WAVES.saturating_add(DIAGNOSTIC_TIMEOUT_PADDING_WAVES),
+    )
+}
+
+fn timed_out_chunk_peer_get_result(
+    target: &ChunkPeerGetTarget,
+    address: &XorName,
+    timeout: Duration,
+) -> ChunkPeerGetResult {
+    let addr_hex = hex::encode(address);
+    let timeout_secs = timeout.as_secs();
+    ChunkPeerGetResult {
+        peer_id: target.peer_id,
+        peer_addrs: target.peer_addrs.clone(),
+        xor_distance: target.xor_distance,
+        chunk_result: Err(Error::Timeout(format!(
+            "Diagnostic chunk GET sweep timed out before peer {} completed for chunk {addr_hex} after {timeout_secs}s",
+            target.peer_id
+        ))),
+    }
 }
 
 fn store_response_timeout_for_proof(proof: &[u8], merkle_timeout_secs: u64) -> Duration {
@@ -618,41 +679,60 @@ impl Client {
         address: &XorName,
         peer_count: usize,
     ) -> Result<Vec<ChunkPeerGetResult>> {
-        let mut peers = self.closest_peers(address, peer_count).await?;
-        peers.sort_by_key(|(peer, _)| peer_xor_distance(peer, address));
+        let peers = self.closest_peers(address, peer_count).await?;
+        let targets = chunk_peer_get_targets(peers, address);
+        let concurrency_limit =
+            diagnostic_peer_get_concurrency(peer_count, self.config().close_group_size);
+        let per_peer_timeout = Duration::from_secs(self.config().chunk_get_timeout_secs);
+        let overall_timeout = diagnostic_peer_get_overall_timeout(per_peer_timeout);
 
-        let mut get_futures = FuturesUnordered::new();
-        for (peer, addrs) in &peers {
-            let peer_id = *peer;
-            let peer_addrs = addrs.clone();
-            let xor_distance = peer_xor_distance(peer, address);
-
-            let get_future = async move {
+        let mut completed = vec![false; targets.len()];
+        let mut results = Vec::with_capacity(targets.len());
+        let mut get_results = stream::iter(targets.iter().cloned())
+            .map(|target| async move {
                 let chunk_result = self
-                    .chunk_get_from_peer(address, &peer_id, &peer_addrs)
+                    .chunk_get_from_peer(address, &target.peer_id, &target.peer_addrs)
                     .await;
 
                 if let Ok(Some(chunk)) = &chunk_result {
                     self.chunk_cache().put(chunk.address, chunk.content.clone());
                 }
 
-                ChunkPeerGetResult {
-                    peer_id,
-                    peer_addrs,
-                    xor_distance,
-                    chunk_result,
+                (
+                    target.index,
+                    ChunkPeerGetResult {
+                        peer_id: target.peer_id,
+                        peer_addrs: target.peer_addrs,
+                        xor_distance: target.xor_distance,
+                        chunk_result,
+                    },
+                )
+            })
+            .buffer_unordered(concurrency_limit);
+
+        let collect_results = async {
+            while let Some((index, result)) = get_results.next().await {
+                completed[index] = true;
+                results.push(result);
+            }
+        };
+
+        if tokio::time::timeout(overall_timeout, collect_results)
+            .await
+            .is_err()
+        {
+            for target in &targets {
+                if !completed[target.index] {
+                    results.push(timed_out_chunk_peer_get_result(
+                        target,
+                        address,
+                        overall_timeout,
+                    ));
                 }
-            };
-
-            get_futures.push(get_future);
+            }
         }
 
-        let mut results = Vec::with_capacity(peers.len());
-        while let Some(result) = get_futures.next().await {
-            results.push(result);
-        }
-
-        results.sort_by_key(|result| result.xor_distance);
+        sort_chunk_peer_get_results(&mut results);
         Ok(results)
     }
 
@@ -791,6 +871,22 @@ mod tests {
     const TEST_MERKLE_TIMEOUT_SECS: u64 = 60;
     /// Sentinel byte used to represent an unknown/unrecognized proof tag.
     const UNKNOWN_PROOF_TAG: u8 = 0xff;
+    /// XorName byte width used by test peer IDs and distances.
+    const TEST_XORNAME_BYTE_LEN: usize = 32;
+    /// Last byte position in the test XOR distance arrays.
+    const TEST_DISTANCE_TAIL_INDEX: usize = TEST_XORNAME_BYTE_LEN - 1;
+
+    fn chunk_peer_get_result(peer_seed: u8, distance_tail: u8) -> ChunkPeerGetResult {
+        let mut xor_distance = [0; TEST_XORNAME_BYTE_LEN];
+        xor_distance[TEST_DISTANCE_TAIL_INDEX] = distance_tail;
+
+        ChunkPeerGetResult {
+            peer_id: PeerId::from_bytes([peer_seed; TEST_XORNAME_BYTE_LEN]),
+            peer_addrs: Vec::new(),
+            xor_distance,
+            chunk_result: Ok(None),
+        }
+    }
 
     #[test]
     fn authoritative_not_found_requires_unanimous_well_sampled_response() {
@@ -889,6 +985,37 @@ mod tests {
             store_response_timeout_for_proof(&[PROOF_TAG_MERKLE], TEST_MERKLE_TIMEOUT_SECS);
 
         assert_eq!(timeout, Duration::from_secs(TEST_MERKLE_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn chunk_peer_get_results_sort_by_xor_distance() {
+        let mut results = vec![
+            chunk_peer_get_result(3, 3),
+            chunk_peer_get_result(1, 1),
+            chunk_peer_get_result(2, 2),
+        ];
+
+        sort_chunk_peer_get_results(&mut results);
+
+        let ordered_distances = results
+            .iter()
+            .map(|result| result.xor_distance[TEST_DISTANCE_TAIL_INDEX])
+            .collect::<Vec<_>>();
+        assert_eq!(ordered_distances, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn diagnostic_peer_get_overall_timeout_is_independent_of_peer_count() {
+        const PER_PEER_TIMEOUT_SECS: u64 = 10;
+        const EXPECTED_WAVES_WITH_PADDING: u64 = 2;
+
+        let timeout =
+            diagnostic_peer_get_overall_timeout(Duration::from_secs(PER_PEER_TIMEOUT_SECS));
+
+        assert_eq!(
+            timeout,
+            Duration::from_secs(PER_PEER_TIMEOUT_SECS * EXPECTED_WAVES_WITH_PADDING)
+        );
     }
 
     /// Regression: the default `merkle_store_timeout_secs` must be at

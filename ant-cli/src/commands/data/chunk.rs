@@ -7,7 +7,7 @@ use clap::Subcommand;
 use tracing::info;
 
 use ant_core::data::client::chunk::ChunkPeerGetResult;
-use ant_core::data::{Client, Error as DataError, MAX_CHUNK_SIZE};
+use ant_core::data::{Client, DataChunk, Error as DataError, MAX_CHUNK_SIZE};
 
 /// Chunk subcommands.
 #[derive(Subcommand, Debug)]
@@ -30,8 +30,8 @@ pub enum ChunkAction {
         /// -o/--output is supplied.
         #[arg(long, alias = "try-all-peers")]
         all_peers: bool,
-        /// Number of closest peers to try (defaults to the configured close-group size).
-        #[arg(long, alias = "peers")]
+        /// Diagnostic mode only. Number of closest peers to try with --all-peers.
+        #[arg(long, alias = "peers", requires = "all_peers")]
         peer_count: Option<NonZeroUsize>,
     },
 }
@@ -41,7 +41,8 @@ impl ChunkAction {
         match self {
             ChunkAction::Put { file } => {
                 let content = read_input(file.as_deref())?;
-                info!("Storing single chunk ({} bytes)", content.len());
+                let content_len = content.len();
+                info!("Storing single chunk ({content_len} bytes)");
 
                 let address = client
                     .chunk_put(Bytes::from(content))
@@ -67,18 +68,21 @@ impl ChunkAction {
                         .await;
                 }
 
-                let result = if let Some(peer_count) = peer_count {
-                    client.chunk_get_from_closest_peers(&addr, peer_count).await
-                } else {
-                    client.chunk_get(&addr).await
+                if peer_count.is_some() {
+                    anyhow::bail!("--peer-count requires --all-peers");
                 }
-                .map_err(|e| anyhow::anyhow!("Chunk get failed: {e}"))?;
+
+                let result = client
+                    .chunk_get(&addr)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Chunk get failed: {e}"))?;
 
                 match result {
                     Some(chunk) => {
                         if let Some(path) = output {
                             std::fs::write(&path, &chunk.content)?;
-                            info!("Chunk saved to {}", path.display());
+                            let path_display = path.display();
+                            info!("Chunk saved to {path_display}");
                         } else {
                             std::io::stdout().write_all(&chunk.content)?;
                         }
@@ -109,6 +113,37 @@ struct PeerGetSummary {
     timeout: usize,
     network_error: usize,
     error: usize,
+}
+
+impl PeerGetSummary {
+    fn record(
+        &mut self,
+        chunk_result: &std::result::Result<Option<DataChunk>, DataError>,
+    ) -> String {
+        match chunk_result {
+            Ok(Some(chunk)) => {
+                self.found += 1;
+                let byte_count = chunk.content.len();
+                format!("found bytes={byte_count}")
+            }
+            Ok(None) => {
+                self.not_found += 1;
+                "not_found".to_string()
+            }
+            Err(DataError::Timeout(e)) => {
+                self.timeout += 1;
+                format!("timeout message={e}")
+            }
+            Err(DataError::Network(e)) => {
+                self.network_error += 1;
+                format!("network_error message={e}")
+            }
+            Err(e) => {
+                self.error += 1;
+                format!("error message={e}")
+            }
+        }
+    }
 }
 
 fn read_input(file: Option<&std::path::Path>) -> anyhow::Result<Vec<u8>> {
@@ -162,11 +197,17 @@ async fn get_chunk_from_all_peers(
 
     if let Some(path) = output {
         std::fs::write(&path, &chunk.content)?;
-        info!("Chunk saved to {}", path.display());
-        println!("Saved closest successful chunk to {}", path.display());
-    } else {
+        let path_display = path.display();
+        let queried = results.len();
+        info!("Chunk saved to {path_display}");
         println!(
-            "Chunk found on {} peer(s); content not written in --all-peers mode",
+            "Saved chunk to {path_display} ({} / {queried} peers responded successfully)",
+            summary.found
+        );
+    } else {
+        let queried = results.len();
+        println!(
+            "Chunk found on {} / {queried} peer(s); content not written in --all-peers mode",
             summary.found
         );
     }
@@ -182,43 +223,24 @@ fn print_peer_get_results(address: &str, results: &[ChunkPeerGetResult]) -> Peer
         let rank = index + 1;
         let distance = xor_distance_decimal(&result.xor_distance);
         let status = peer_get_status(result, &mut summary);
-        println!(
-            "{rank}. peer={} distance={distance} addrs={} result={status}",
-            result.peer_id,
-            result.peer_addrs.len()
-        );
+        let peer_id = result.peer_id;
+        let addr_count = result.peer_addrs.len();
+        println!("{rank}. peer={peer_id} distance={distance} addrs={addr_count} result={status}");
     }
+    let found = summary.found;
+    let not_found = summary.not_found;
+    let timeout = summary.timeout;
+    let network_error = summary.network_error;
+    let error = summary.error;
     println!(
-        "Summary: found={} not_found={} timeout={} network_error={} error={}",
-        summary.found, summary.not_found, summary.timeout, summary.network_error, summary.error
+        "Summary: found={found} not_found={not_found} timeout={timeout} network_error={network_error} error={error}",
     );
 
     summary
 }
 
 fn peer_get_status(result: &ChunkPeerGetResult, summary: &mut PeerGetSummary) -> String {
-    match &result.chunk_result {
-        Ok(Some(chunk)) => {
-            summary.found += 1;
-            format!("found bytes={}", chunk.content.len())
-        }
-        Ok(None) => {
-            summary.not_found += 1;
-            "not_found".to_string()
-        }
-        Err(DataError::Timeout(e)) => {
-            summary.timeout += 1;
-            format!("timeout message={e}")
-        }
-        Err(DataError::Network(e)) => {
-            summary.network_error += 1;
-            format!("network_error message={e}")
-        }
-        Err(e) => {
-            summary.error += 1;
-            format!("error message={e}")
-        }
-    }
+    summary.record(&result.chunk_result)
 }
 
 fn xor_distance_decimal(distance: &[u8; XORNAME_BYTE_LEN]) -> String {
@@ -261,6 +283,17 @@ pub fn parse_address(address: &str) -> anyhow::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct TestChunkCli {
+        #[command(subcommand)]
+        action: ChunkAction,
+    }
+
+    fn test_address() -> String {
+        "00".repeat(XORNAME_BYTE_LEN)
+    }
 
     #[test]
     fn xor_distance_decimal_formats_zero() {
@@ -281,5 +314,68 @@ mod tests {
         distance[XORNAME_BYTE_LEN - 2] = 1;
 
         assert_eq!(xor_distance_decimal(&distance), "256");
+    }
+
+    #[test]
+    fn peer_count_requires_all_peers() {
+        let address = test_address();
+        let err =
+            TestChunkCli::try_parse_from(["test", "get", address.as_str(), "--peer-count", "2"])
+                .expect_err("--peer-count without --all-peers must fail");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn peer_count_is_accepted_with_all_peers() {
+        let address = test_address();
+        let cli = TestChunkCli::try_parse_from([
+            "test",
+            "get",
+            address.as_str(),
+            "--all-peers",
+            "--peer-count",
+            "2",
+        ])
+        .expect("--peer-count with --all-peers must parse");
+
+        match cli.action {
+            ChunkAction::Get {
+                all_peers,
+                peer_count,
+                ..
+            } => {
+                assert!(all_peers);
+                assert_eq!(peer_count.map(NonZeroUsize::get), Some(2));
+            }
+            ChunkAction::Put { .. } => panic!("expected chunk get action"),
+        }
+    }
+
+    #[test]
+    fn peer_get_summary_records_tallies() {
+        let mut summary = PeerGetSummary::default();
+        let chunk = DataChunk::new([0; XORNAME_BYTE_LEN], Bytes::from_static(b"abc"));
+
+        assert_eq!(summary.record(&Ok(Some(chunk))), "found bytes=3");
+        assert_eq!(summary.record(&Ok(None)), "not_found");
+        assert_eq!(
+            summary.record(&Err(DataError::Timeout("slow".to_string()))),
+            "timeout message=slow"
+        );
+        assert_eq!(
+            summary.record(&Err(DataError::Network("offline".to_string()))),
+            "network_error message=offline"
+        );
+        assert_eq!(
+            summary.record(&Err(DataError::InvalidData("bad hash".to_string()))),
+            "error message=invalid data: bad hash"
+        );
+
+        assert_eq!(summary.found, 1);
+        assert_eq!(summary.not_found, 1);
+        assert_eq!(summary.timeout, 1);
+        assert_eq!(summary.network_error, 1);
+        assert_eq!(summary.error, 1);
     }
 }
