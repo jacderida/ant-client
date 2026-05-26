@@ -88,10 +88,10 @@ fn store_response_timeout_for_proof(proof: &[u8], merkle_timeout_secs: u64) -> D
 }
 
 impl Client {
-    /// Run `chunk_get` and feed one observation per call to the
-    /// adaptive fetch limiter. Use this from any consumer that drives
-    /// chunk-fetch concurrency from `controller().fetch.current()` —
-    /// the controller's window relies on every call along the hot
+    /// Run `chunk_get` and feed one byte-aware observation per call to
+    /// the adaptive fetch limiter. Use this from any consumer that
+    /// drives chunk-fetch concurrency from `controller().fetch.current()`
+    /// — the controller's window relies on every call along the hot
     /// path producing an observation.
     ///
     /// Classifier semantics: see `chunk_get_outcome`. Most importantly,
@@ -102,9 +102,14 @@ impl Client {
         let started = Instant::now();
         let result = self.chunk_get(address).await;
         let latency = started.elapsed();
+        let bytes = result
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map_or(0, |chunk| chunk.content.len() as u64);
         self.controller()
             .fetch
-            .observe(chunk_get_outcome(&result), latency);
+            .observe_with_bytes(chunk_get_outcome(&result), latency, bytes);
         result
     }
 }

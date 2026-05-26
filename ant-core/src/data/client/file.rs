@@ -89,8 +89,8 @@ type QuoteEntry = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount);
 const UPLOAD_WAVE_SIZE: usize = 64;
 
 /// Stream decrypt batches should be larger than fetch fan-out so
-/// `buffer_unordered` can keep launching new chunk GETs as earlier ones
-/// complete, instead of stopping at each self-encryption batch boundary.
+/// the rolling fetch scheduler can keep launching new chunk GETs as earlier
+/// ones complete, instead of stopping at each self-encryption batch boundary.
 const DOWNLOAD_STREAM_BATCH_FETCH_MULTIPLIER: usize = 4;
 
 /// Use at most this fraction of currently usable RAM for one decrypt batch.
