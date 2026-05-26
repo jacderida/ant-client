@@ -998,6 +998,26 @@ async fn graceful_kill(pid: u32) {
     }
 }
 
+/// Decide whether the liveness monitor should flip a node it found dead to `Stopped`.
+///
+/// `snapshot_pid` is the PID the sweep captured and then observed to be dead. `current_pid`
+/// and `current_status` are the node's recorded state at the moment of the decision — which
+/// may differ from the snapshot (e.g. an upgrade respawn replaced the PID with a live one
+/// while leaving the status `Running`).
+///
+/// We only stop the node if it is still `Running` AND the recorded PID is still the one we
+/// observed dead. The PID check is essential: between the snapshot and now, an upgrade (or
+/// crash) respawn can have replaced the dead `snapshot_pid` with a live `current_pid` while
+/// keeping the status `Running`. Stopping in that case would clobber a healthy, freshly
+/// respawned process (the "running node reported as stopped after an upgrade" bug).
+fn liveness_should_stop(
+    snapshot_pid: u32,
+    current_pid: Option<u32>,
+    current_status: Option<NodeStatus>,
+) -> bool {
+    current_status == Some(NodeStatus::Running) && current_pid == Some(snapshot_pid)
+}
+
 /// Poll each Running node's PID for OS liveness every `LIVENESS_POLL_INTERVAL`,
 /// flipping dead ones to `Stopped` and emitting `NodeStopped`.
 ///
@@ -1105,7 +1125,8 @@ pub fn spawn_liveness_monitor(
                 let mut sup = supervisor.write().await;
                 // Re-check under the write lock to avoid racing with a concurrent
                 // start/stop that flipped the state between the snapshot and now.
-                if !matches!(sup.node_status(node_id), Ok(NodeStatus::Running)) {
+                if !liveness_should_stop(pid, sup.node_pid(node_id), sup.node_status(node_id).ok())
+                {
                     continue;
                 }
                 sup.update_state(node_id, NodeStatus::Stopped, None);
@@ -1237,6 +1258,27 @@ mod tests {
         // clears so the liveness monitor stops treating its exit as needing a respawn.
         sup.mark_owned(1);
         assert!(!sup.is_adopted(1));
+    }
+
+    // Regression test for the "running node reported as stopped after an upgrade" bug.
+    //
+    // A daemon-spawned node was respawned by monitor_node after an upgrade, so the recorded
+    // state is now Running with a live PID_new. A liveness sweep that snapshotted the old,
+    // now-dead PID then acts: it must NOT mark the node Stopped, because the running process
+    // is the new one. `liveness_should_stop` guards against this by also requiring the recorded
+    // PID to still match the one the sweep observed dead.
+    #[test]
+    fn liveness_does_not_stop_node_respawned_under_it() {
+        let dead_snapshot_pid = 1000; // PID the sweep captured and found dead
+        let live_respawned_pid = Some(2000); // PID_new from the upgrade respawn (alive)
+        assert!(
+            !liveness_should_stop(
+                dead_snapshot_pid,
+                live_respawned_pid,
+                Some(NodeStatus::Running)
+            ),
+            "liveness must not stop a node whose PID changed under it (respawned with a live PID)"
+        );
     }
 
     #[test]
