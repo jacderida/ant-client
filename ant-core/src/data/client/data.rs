@@ -172,7 +172,7 @@ impl Client {
                 Err(e) => return Err(e),
             };
 
-            let (chunks_stored, _stats) = self
+            let outcome = self
                 .merkle_upload_chunks(
                     chunk_contents,
                     merkle_plan.to_upload,
@@ -182,11 +182,25 @@ impl Client {
                     chunk_count,
                 )
                 .await?;
+            // Unlike `FileUploadResult`, `DataUploadResult` cannot express a
+            // partial store, and the returned `data_map` is unusable unless
+            // every chunk landed (download fails on any missing chunk). So a
+            // residual shortfall after retries is a hard failure here, not a
+            // success with a quietly broken data map.
+            if outcome.failed > 0 {
+                return Err(Error::InsufficientPeers(format!(
+                    "Data merkle upload incomplete: {} of {} chunk(s) short of quorum after retries",
+                    outcome.failed, chunk_count
+                )));
+            }
 
-            info!("Data uploaded via merkle: {chunks_stored} chunks stored ({content_len} bytes)");
+            info!(
+                "Data uploaded via merkle: {} chunks stored ({content_len} bytes)",
+                outcome.stored
+            );
             Ok(DataUploadResult {
                 data_map,
-                chunks_stored,
+                chunks_stored: outcome.stored,
                 payment_mode_used: PaymentMode::Merkle,
             })
         } else {

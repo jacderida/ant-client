@@ -21,6 +21,7 @@ use ant_protocol::{
 };
 use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
+use rand::Rng;
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -760,13 +761,24 @@ impl Client {
 
     /// Upload chunks using pre-computed merkle proofs from a batch payment.
     ///
-    /// Each chunk is matched to its proof from `batch_result.proofs`,
-    /// then stored to its close group concurrently. Returns the number
-    /// of chunks successfully stored.
+    /// Each chunk is matched to its proof from `batch_result.proofs`, then
+    /// stored to its close group concurrently. A per-chunk quorum shortfall
+    /// (`InsufficientPeers`) does **not** abort the file: such chunks are
+    /// collected and retried — with the same reusable proof and a freshly
+    /// re-collected close group — for up to [`MERKLE_STORE_MAX_ATTEMPTS`]
+    /// attempts. `stored_offset` carries chunks already confirmed by an earlier
+    /// preflight (used for progress numbering and the returned `stored` count),
+    /// and `total_chunks` is the whole-file total for progress events.
+    ///
+    /// Returns how many chunks are stored (including `stored_offset`), how many
+    /// remained short of quorum after all retries, and the aggregate store
+    /// stats.
     ///
     /// # Errors
     ///
-    /// Returns an error if any chunk is missing its proof or storage fails.
+    /// Returns an error only for non-quorum failures (e.g. a missing proof, or a
+    /// chunk-count/address mismatch); quorum shortfalls are reported via
+    /// [`MerkleStoreOutcome::failed`].
     pub(crate) async fn merkle_upload_chunks(
         &self,
         chunk_contents: Vec<Bytes>,
@@ -775,9 +787,7 @@ impl Client {
         progress: Option<&mpsc::Sender<UploadEvent>>,
         stored_offset: usize,
         total_chunks: usize,
-    ) -> Result<(usize, crate::data::client::batch::WaveAggregateStats)> {
-        let mut stored = stored_offset;
-        let mut stats = crate::data::client::batch::WaveAggregateStats::default();
+    ) -> Result<MerkleStoreOutcome> {
         let store_limiter = self.controller().store.clone();
         // Clamp fan-out to batch size — partial batches should not
         // pay for unused slots (see PERF-RESULTS.md).
@@ -789,50 +799,183 @@ impl Client {
             )));
         }
         let store_concurrency = store_limiter.current().min(batch_size.max(1));
-        let mut upload_stream = stream::iter(chunk_contents.into_iter().zip(addresses).map(
-            |(content, addr)| {
-                let proof_bytes = batch_result.proofs.get(&addr).cloned();
-                let limiter = store_limiter.clone();
-                async move {
-                    let started = std::time::Instant::now();
-                    let proof = proof_bytes.ok_or_else(|| {
-                        Error::Payment(format!(
-                            "Missing merkle proof for chunk {}",
-                            hex::encode(addr)
-                        ))
-                    })?;
-                    let peers = self.close_group_peers(&addr).await?;
-                    observe_op(
-                        &limiter,
-                        || async move {
-                            self.chunk_put_to_close_group(content, proof, &peers).await
-                        },
-                        classify_error,
-                    )
-                    .await
-                    .map(|_| started)
-                }
-            },
-        ))
-        .buffer_unordered(store_concurrency);
 
-        while let Some(result) = upload_stream.next().await {
-            let started = result?;
-            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            stats.store_durations_ms.push(duration_ms);
-            stats.chunk_attempts_total = stats.chunk_attempts_total.saturating_add(1);
-            stats.retries_histogram[0] = stats.retries_histogram[0].saturating_add(1);
-            stored += 1;
-            if let Some(tx) = progress {
-                let _ = tx.try_send(UploadEvent::ChunkStored {
-                    stored,
-                    total: total_chunks,
-                });
+        let chunks: Vec<([u8; 32], Bytes)> = addresses.into_iter().zip(chunk_contents).collect();
+
+        // Store one chunk to its (freshly re-collected) close group. Called
+        // once per chunk per attempt, so a retry round naturally lands on a
+        // converged routing table. Only `InsufficientPeers` is recoverable;
+        // a missing proof stays fatal.
+        let store_one = |addr: [u8; 32], content: Bytes| {
+            let limiter = store_limiter.clone();
+            let proof_bytes = batch_result.proofs.get(&addr).cloned();
+            async move {
+                let started = std::time::Instant::now();
+                let proof = proof_bytes.ok_or_else(|| {
+                    Error::Payment(format!(
+                        "Missing merkle proof for chunk {}",
+                        hex::encode(addr)
+                    ))
+                })?;
+                let peers = self.close_group_peers(&addr).await?;
+                observe_op(
+                    &limiter,
+                    || async move { self.chunk_put_to_close_group(content, proof, &peers).await },
+                    classify_error,
+                )
+                .await
+                .map(|_| started)
+            }
+        };
+
+        merkle_store_with_retry(
+            chunks,
+            store_concurrency,
+            MERKLE_STORE_MAX_ATTEMPTS,
+            MERKLE_RETRY_BACKOFF,
+            progress,
+            stored_offset,
+            total_chunks,
+            store_one,
+        )
+        .await
+    }
+}
+
+/// Total store-attempt budget for a merkle batch: the initial attempt plus up
+/// to three retries. Chosen to match the wave path's contract
+/// (`batch.rs` iterates `0..=MAX_RETRIES` with `MAX_RETRIES = 3`) and the
+/// four-slot [`WaveAggregateStats::retries_histogram`], so a chunk that lands
+/// on the final retry is recorded in `retries_histogram[3]`.
+///
+/// A chunk's close group can transiently reject its `winner_pool` midpoint
+/// while a few nodes' routing tables disagree about that midpoint; the network
+/// converges within minutes. Per-chunk proofs are reusable, so retrying the
+/// same proof after a short backoff recovers these shortfalls for free — no
+/// re-payment and no new pool.
+const MERKLE_STORE_MAX_ATTEMPTS: usize = 4;
+
+/// Base backoff between merkle store attempts. The routing-table divergence
+/// that causes `InsufficientPeers` resolves on the order of minutes, so a short
+/// sleep between rounds is enough to land on a converged close group. The
+/// actual wait is jittered by [`MERKLE_RETRY_JITTER`] so a large failed set
+/// does not re-fire against the same divergent nodes in lockstep.
+const MERKLE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Fractional jitter applied to [`MERKLE_RETRY_BACKOFF`] (±10%), spreading the
+/// retry wave so convergent nodes are not all probed at the same instant.
+const MERKLE_RETRY_JITTER: f64 = 0.1;
+
+/// Outcome of storing a merkle batch: how many chunks landed, how many
+/// remained short of quorum after all retries, and the aggregate store stats.
+#[derive(Debug, Default)]
+pub(crate) struct MerkleStoreOutcome {
+    /// Chunks that reached quorum, including any `stored_offset` carried in
+    /// from a preflight (counted once, even if they needed retries).
+    pub stored: usize,
+    /// Chunks still short of quorum after [`MERKLE_STORE_MAX_ATTEMPTS`].
+    pub failed: usize,
+    /// Aggregate store stats (durations, attempts, per-round retry histogram).
+    pub stats: crate::data::client::batch::WaveAggregateStats,
+}
+
+/// Drive a set of merkle chunk stores with bounded retry of quorum shortfalls.
+///
+/// Runs `store_one` over all `chunks` concurrently (up to `store_concurrency`),
+/// collecting any `InsufficientPeers` failures rather than aborting. Failed
+/// chunks are retried — `store_one` re-collects their close group on each call,
+/// so a converged routing table can yield a fresh group — for up to
+/// `max_attempts` rounds, sleeping a jittered `backoff` between rounds. A
+/// chunk's success is counted once and recorded in the retry round it landed on
+/// (`retries_histogram[round]`). `stored_offset` seeds the returned `stored`
+/// count and the progress numbering; `total` is the whole-file total reported
+/// in progress events. Non-quorum errors abort immediately.
+#[allow(clippy::too_many_arguments)]
+async fn merkle_store_with_retry<F, Fut>(
+    chunks: Vec<([u8; 32], Bytes)>,
+    store_concurrency: usize,
+    max_attempts: usize,
+    backoff: Duration,
+    progress: Option<&mpsc::Sender<UploadEvent>>,
+    stored_offset: usize,
+    total: usize,
+    store_one: F,
+) -> Result<MerkleStoreOutcome>
+where
+    F: Fn([u8; 32], Bytes) -> Fut,
+    Fut: std::future::Future<Output = Result<std::time::Instant>>,
+{
+    let attempts = max_attempts.max(1);
+    let mut outcome = MerkleStoreOutcome {
+        stored: stored_offset,
+        ..MerkleStoreOutcome::default()
+    };
+    let mut pending = chunks;
+
+    for attempt in 0..attempts {
+        let concurrency = store_concurrency.min(pending.len().max(1)).max(1);
+        let mut next_failed: Vec<([u8; 32], Bytes)> = Vec::new();
+
+        let mut upload_stream = stream::iter(pending.into_iter().map(|(addr, content)| {
+            let fut = store_one(addr, content.clone());
+            async move { (addr, content, fut.await) }
+        }))
+        .buffer_unordered(concurrency);
+
+        while let Some((addr, content, result)) = upload_stream.next().await {
+            outcome.stats.chunk_attempts_total =
+                outcome.stats.chunk_attempts_total.saturating_add(1);
+            match result {
+                Ok(started) => {
+                    let duration_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    outcome.stats.store_durations_ms.push(duration_ms);
+                    let idx = attempt.min(outcome.stats.retries_histogram.len().saturating_sub(1));
+                    outcome.stats.retries_histogram[idx] =
+                        outcome.stats.retries_histogram[idx].saturating_add(1);
+                    outcome.stored += 1;
+                    if let Some(tx) = progress {
+                        let _ = tx.try_send(UploadEvent::ChunkStored {
+                            stored: outcome.stored,
+                            total,
+                        });
+                    }
+                }
+                Err(Error::InsufficientPeers(_)) => next_failed.push((addr, content)),
+                Err(e) => return Err(e),
             }
         }
 
-        Ok((stored, stats))
+        if next_failed.is_empty() {
+            break;
+        }
+
+        if attempt + 1 < attempts {
+            warn!(
+                failed = next_failed.len(),
+                attempt = attempt + 1,
+                "merkle chunks short of quorum, retrying after backoff"
+            );
+            pending = next_failed;
+            if backoff > Duration::ZERO {
+                // Jitter the wait (±MERKLE_RETRY_JITTER) so a large failed set
+                // does not re-probe the same divergent nodes in lockstep.
+                // `thread_rng` is !Send, so the value is computed and the rng
+                // dropped before the await to keep this future Send.
+                let wait = {
+                    let mut rng = rand::thread_rng();
+                    let factor = 1.0 + rng.gen_range(-MERKLE_RETRY_JITTER..=MERKLE_RETRY_JITTER);
+                    backoff.mul_f64(factor)
+                };
+                tokio::time::sleep(wait).await;
+            }
+        } else {
+            outcome.failed = next_failed.len();
+            break;
+        }
     }
+
+    Ok(outcome)
 }
 
 /// Phase 2 of external-signer merkle payment: generate proofs from winner.
@@ -1283,5 +1426,190 @@ mod tests {
         // 3 * MAX_LEAVES should split into 3
         let addrs = make_test_addresses(3 * MAX_LEAVES);
         assert_eq!(addrs.chunks(MAX_LEAVES).count(), 3);
+    }
+
+    // =========================================================================
+    // merkle_store_with_retry: collect-not-abort + bounded retry (C2.1 / C2.2)
+    // =========================================================================
+
+    use std::sync::{Arc, Mutex};
+
+    /// Build `count` (addr, content) pairs for the retry helper.
+    fn make_chunks(count: usize) -> Vec<([u8; 32], Bytes)> {
+        make_test_addresses(count)
+            .into_iter()
+            .map(|addr| (addr, Bytes::from_static(b"chunk")))
+            .collect()
+    }
+
+    /// C2.1: a per-chunk `InsufficientPeers` is collected, not propagated —
+    /// the whole batch must NOT abort. With a single attempt, the failing
+    /// subset is reported via `failed` and the rest are `stored`.
+    #[tokio::test]
+    async fn store_with_retry_collects_failures_instead_of_aborting() {
+        let chunks = make_chunks(6);
+        let failing: std::collections::HashSet<[u8; 32]> =
+            chunks.iter().take(2).map(|(a, _)| *a).collect();
+        let failing_for_closure = failing.clone();
+
+        let store_one = move |addr: [u8; 32], _content: Bytes| {
+            let fail = failing_for_closure.contains(&addr);
+            async move {
+                if fail {
+                    Err(Error::InsufficientPeers("test shortfall".into()))
+                } else {
+                    Ok(std::time::Instant::now())
+                }
+            }
+        };
+
+        let outcome = merkle_store_with_retry(chunks, 8, 1, Duration::ZERO, None, 0, 6, store_one)
+            .await
+            .expect("quorum shortfalls must not abort the batch");
+
+        assert_eq!(outcome.stored, 4);
+        assert_eq!(outcome.failed, 2);
+        // Single attempt → all successes recorded in round 0.
+        assert_eq!(outcome.stats.retries_histogram[0], 4);
+        assert_eq!(outcome.stats.chunk_attempts_total, 6);
+    }
+
+    /// A non-quorum error (e.g. a missing proof) stays fatal and aborts.
+    #[tokio::test]
+    async fn store_with_retry_propagates_non_quorum_errors() {
+        let chunks = make_chunks(3);
+        let store_one = |_addr: [u8; 32], _content: Bytes| async move {
+            Err::<std::time::Instant, _>(Error::Payment("missing proof".into()))
+        };
+
+        let result =
+            merkle_store_with_retry(chunks, 8, 3, Duration::ZERO, None, 0, 3, store_one).await;
+        assert!(matches!(result, Err(Error::Payment(_))));
+    }
+
+    /// C2.2: only the chunks that failed the previous round are retried.
+    #[tokio::test]
+    async fn store_with_retry_retries_only_the_failed_set() {
+        let chunks = make_chunks(5);
+        let total = chunks.len();
+        let failing: std::collections::HashSet<[u8; 32]> =
+            chunks.iter().take(2).map(|(a, _)| *a).collect();
+        let failing_for_closure = failing.clone();
+
+        // Record every (addr) the store op was invoked with, in call order.
+        let calls = Arc::new(Mutex::new(Vec::<[u8; 32]>::new()));
+        let calls_for_closure = calls.clone();
+
+        let store_one = move |addr: [u8; 32], _content: Bytes| {
+            let calls = calls_for_closure.clone();
+            // Fails the first round only; succeeds thereafter.
+            let already_seen = calls.lock().unwrap().iter().filter(|&&a| a == addr).count();
+            let fail = failing_for_closure.contains(&addr) && already_seen == 0;
+            calls.lock().unwrap().push(addr);
+            async move {
+                if fail {
+                    Err(Error::InsufficientPeers("round-1 shortfall".into()))
+                } else {
+                    Ok(std::time::Instant::now())
+                }
+            }
+        };
+
+        let outcome =
+            merkle_store_with_retry(chunks, 8, 3, Duration::ZERO, None, 0, total, store_one)
+                .await
+                .expect("should converge after retry");
+
+        assert_eq!(outcome.stored, total);
+        assert_eq!(outcome.failed, 0);
+
+        // Round 1 drains fully before round 2 starts, so the call log is
+        // segmented: first `total` calls = round 1 (all chunks), the rest =
+        // the retry round, which must contain ONLY the failing set.
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), total + failing.len());
+        let round_two: std::collections::HashSet<[u8; 32]> =
+            calls[total..].iter().copied().collect();
+        assert_eq!(round_two, failing);
+    }
+
+    /// C2.2: a chunk that fails attempt 1 and succeeds attempt 2 is counted
+    /// once as stored and recorded as one retry in `retries_histogram[1]`.
+    #[tokio::test]
+    async fn store_with_retry_counts_retry_success_once_in_histogram() {
+        let chunks = make_chunks(4);
+        let total = chunks.len();
+        let flaky_addr = chunks[0].0;
+
+        let attempts = Arc::new(Mutex::new(HashMap::<[u8; 32], usize>::new()));
+        let attempts_for_closure = attempts.clone();
+
+        let store_one = move |addr: [u8; 32], _content: Bytes| {
+            let attempts = attempts_for_closure.clone();
+            let n = {
+                let mut m = attempts.lock().unwrap();
+                let entry = m.entry(addr).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            let fail = addr == flaky_addr && n == 1;
+            async move {
+                if fail {
+                    Err(Error::InsufficientPeers("transient".into()))
+                } else {
+                    Ok(std::time::Instant::now())
+                }
+            }
+        };
+
+        let outcome =
+            merkle_store_with_retry(chunks, 8, 3, Duration::ZERO, None, 0, total, store_one)
+                .await
+                .expect("flaky chunk should recover on retry");
+
+        assert_eq!(outcome.stored, total);
+        assert_eq!(outcome.failed, 0);
+        // 3 chunks landed on the first attempt, 1 on the first retry.
+        assert_eq!(outcome.stats.retries_histogram[0], total - 1);
+        assert_eq!(outcome.stats.retries_histogram[1], 1);
+        // One extra store attempt for the flaky chunk.
+        assert_eq!(outcome.stats.chunk_attempts_total, total + 1);
+    }
+
+    /// C2.2: when every chunk stays short of quorum through the whole attempt
+    /// budget, the helper still returns `Ok` (collect-not-abort) with the full
+    /// batch reported as `failed`, having tried each chunk exactly
+    /// `MERKLE_STORE_MAX_ATTEMPTS` times.
+    #[tokio::test]
+    async fn store_with_retry_reports_all_failed_when_retries_exhausted() {
+        let chunks = make_chunks(3);
+        let total = chunks.len();
+
+        let store_one = |_addr: [u8; 32], _content: Bytes| async move {
+            Err::<std::time::Instant, _>(Error::InsufficientPeers("never converges".into()))
+        };
+
+        let outcome = merkle_store_with_retry(
+            chunks,
+            8,
+            MERKLE_STORE_MAX_ATTEMPTS,
+            Duration::ZERO,
+            None,
+            0,
+            total,
+            store_one,
+        )
+        .await
+        .expect("an exhausted retry budget is reported, not propagated as Err");
+
+        assert_eq!(outcome.stored, 0);
+        assert_eq!(outcome.failed, total);
+        // Every chunk was attempted once per round across the full budget.
+        assert_eq!(
+            outcome.stats.chunk_attempts_total,
+            total * MERKLE_STORE_MAX_ATTEMPTS
+        );
+        // No successes, so the histogram stays empty.
+        assert_eq!(outcome.stats.retries_histogram, [0; 4]);
     }
 }
