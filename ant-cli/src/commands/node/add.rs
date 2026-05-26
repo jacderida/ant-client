@@ -6,7 +6,7 @@ use colored::Colorize;
 use ant_core::node::binary::ProgressReporter;
 use ant_core::node::daemon::client;
 use ant_core::node::types::DaemonConfig;
-use ant_core::node::types::{AddNodeOpts, AddNodeResult, BinarySource, PortRange};
+use ant_core::node::types::{AddNodeOpts, AddNodeResult, BinarySource, PortRange, UpgradeChannel};
 
 #[derive(Args)]
 pub struct AddArgs {
@@ -54,9 +54,29 @@ pub struct AddArgs {
     #[arg(long, value_delimiter = ',')]
     pub bootstrap: Vec<String>,
 
+    /// Release channel the node tracks for automatic upgrades
+    #[arg(long, value_enum)]
+    pub upgrade_channel: Option<UpgradeChannelArg>,
+
     /// Environment variables for the node (KEY=VALUE format)
     #[arg(long, value_delimiter = ',')]
     pub env: Vec<String>,
+}
+
+/// CLI value for the node's upgrade channel. Mirrors `ant-node`'s accepted values.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum UpgradeChannelArg {
+    Stable,
+    Beta,
+}
+
+impl From<UpgradeChannelArg> for UpgradeChannel {
+    fn from(arg: UpgradeChannelArg) -> Self {
+        match arg {
+            UpgradeChannelArg::Stable => Self::Stable,
+            UpgradeChannelArg::Beta => Self::Beta,
+        }
+    }
 }
 
 impl AddArgs {
@@ -153,6 +173,7 @@ impl AddArgs {
             binary_source,
             bootstrap_peers: self.bootstrap.clone(),
             env_variables,
+            upgrade_channel: self.upgrade_channel.map(Into::into),
         })
     }
 

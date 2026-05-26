@@ -94,6 +94,9 @@ pub struct NodeConfig {
     pub version: String,
     pub env_variables: HashMap<String, String>,
     pub bootstrap_peers: Vec<String>,
+    /// Release channel to track for automatic upgrades. `None` lets the node use its own default.
+    #[serde(default)]
+    pub upgrade_channel: Option<UpgradeChannel>,
 }
 
 /// Runtime information for a running node (held in daemon memory only).
@@ -152,6 +155,27 @@ impl fmt::Display for BinarySource {
             Self::Version(v) => write!(f, "v{v}"),
             Self::Url(u) => write!(f, "{u}"),
             Self::LocalPath(p) => write!(f, "{}", p.display()),
+        }
+    }
+}
+
+/// Release channel the node tracks for automatic upgrades.
+///
+/// Maps directly onto `ant-node`'s `--upgrade-channel` argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeChannel {
+    /// Stable releases only.
+    Stable,
+    /// Beta releases.
+    Beta,
+}
+
+impl fmt::Display for UpgradeChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stable => write!(f, "stable"),
+            Self::Beta => write!(f, "beta"),
         }
     }
 }
@@ -220,6 +244,8 @@ pub struct AddNodeOpts {
     pub bootstrap_peers: Vec<String>,
     /// Environment variables for the node.
     pub env_variables: Vec<(String, String)>,
+    /// Release channel to track for automatic upgrades. `None` lets the node use its own default.
+    pub upgrade_channel: Option<UpgradeChannel>,
 }
 
 impl Default for AddNodeOpts {
@@ -235,6 +261,7 @@ impl Default for AddNodeOpts {
             binary_source: BinarySource::default(),
             bootstrap_peers: Vec::new(),
             env_variables: Vec::new(),
+            upgrade_channel: None,
         }
     }
 }

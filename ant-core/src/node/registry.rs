@@ -149,6 +149,7 @@ mod tests {
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
+            upgrade_channel: None,
         }
     }
 

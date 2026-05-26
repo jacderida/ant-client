@@ -878,6 +878,7 @@ mod tests {
             version: version.into(),
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
+            upgrade_channel: None,
         }
     }
 
