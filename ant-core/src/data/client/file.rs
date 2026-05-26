@@ -1979,11 +1979,20 @@ impl Client {
                                         // this chunk for a later retry rather
                                         // than aborting the whole batch.
                                         Ok(None) => Ok((idx, Err(hash))),
-                                        Err(e) => Err(self_encryption::Error::Generic(
-                                            format!(
-                                                "Network fetch failed for {addr_hex}: {e}"
-                                            ),
-                                        )),
+                                        // A transient error for one chunk
+                                        // (e.g. its close-group DHT walk
+                                        // erroring on this pass) must not
+                                        // abort a multi-hundred-chunk
+                                        // download. Defer it to the retry
+                                        // rounds, same as Ok(None); only a
+                                        // chunk that survives all deferred
+                                        // rounds is fatal.
+                                        Err(e) => {
+                                            info!(
+                                                "First-pass fetch error for {addr_hex}: {e}; deferring"
+                                            );
+                                            Ok((idx, Err(hash)))
+                                        }
                                     }
                                 }
                             },

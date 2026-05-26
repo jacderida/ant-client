@@ -682,23 +682,28 @@ impl AdaptiveController {
         // Download-specific growth/decision tuning (see the field docs
         // on `LimiterConfig`):
         //
-        // - Keep slow-start armed all the way to the channel ceiling.
-        //   Classic AIMD additive growth (+1 per healthy window) cannot
-        //   reach a useful cap from a low base before a multi-GB file
-        //   finishes — a fast-but-lossy connection (e.g. a VPS with a
-        //   steady ~4% close-group-exhaustion trickle) was observed
-        //   stuck at cap ~13-24 across 36 files because every transient
-        //   Decrease permanently dropped it to additive growth. With
-        //   the threshold at the ceiling, a Decrease still halves the
-        //   cap but the next healthy window doubles it back, so the cap
-        //   tracks the connection's real capacity instead of crawling.
+        // - Never exit slow-start. Classic AIMD additive growth (+1 per
+        //   healthy window) cannot reach a useful cap from a low base
+        //   before a multi-GB file finishes — a fast-but-lossy
+        //   connection (e.g. a VPS with a steady ~4% close-group-
+        //   exhaustion trickle) was observed stuck at cap ~13-24 across
+        //   36 files because every transient Decrease permanently
+        //   dropped it to additive growth. `usize::MAX` keeps slow-start
+        //   armed at every cap including the ceiling, so a Decrease
+        //   (e.g. 256 -> 128) still halves but the next healthy window
+        //   doubles it back. The cap therefore tracks the connection's
+        //   real capacity instead of crawling, and a single transient
+        //   Decrease near the ceiling can't re-pin the link to additive
+        //   recovery. (A threshold == max_concurrency would NOT achieve
+        //   this: `current >= threshold` is true at the ceiling, so a
+        //   Decrease there would exit slow-start.)
         // - Disable the p95-latency Decrease. chunk_get's observed
         //   latency includes the internal retry sleep + slow retry
         //   sweep for chunks that needed one, so a window with a couple
         //   of retry-path chunks shows a hugely inflated p95 that is
         //   retry variance, not congestion. Genuine fetch congestion
         //   still drives Decrease via the Ok(None) -> Timeout rate.
-        fetch_cfg.slow_start_ramp_threshold = fetch_cfg.max_concurrency;
+        fetch_cfg.slow_start_ramp_threshold = usize::MAX;
         fetch_cfg.latency_decrease_enabled = false;
         Self {
             quote: Limiter::new(start.quote, quote_cfg),
@@ -1198,6 +1203,51 @@ mod tests {
     }
 
     #[test]
+    fn slow_start_stays_armed_at_ceiling_with_max_threshold() {
+        // Regression for the "lost protection at the ceiling" bug.
+        // threshold == usize::MAX (the fetch setting) keeps slow-start
+        // armed even when a Decrease fires at the ceiling, so the cap
+        // doubles back. threshold == max_concurrency (the buggy
+        // setting) would exit slow-start there — `current >= threshold`
+        // is true at the ceiling — and recover only additively. After
+        // identical stress-at-ceiling + recovery, the MAX-threshold
+        // limiter must end strictly higher.
+        let base = LimiterConfig {
+            max_concurrency: 256,
+            latency_decrease_enabled: false,
+            ..cfg_for_tests()
+        };
+        let fixed = Limiter::new(
+            256,
+            LimiterConfig {
+                slow_start_ramp_threshold: usize::MAX,
+                ..base.clone()
+            },
+        );
+        let buggy = Limiter::new(
+            256,
+            LimiterConfig {
+                slow_start_ramp_threshold: 256,
+                ..base.clone()
+            },
+        );
+        for l in [&fixed, &buggy] {
+            for _ in 0..base.window_ops {
+                l.observe(Outcome::Timeout, Duration::from_millis(10));
+            }
+            for _ in 0..(base.window_ops * 10) {
+                l.observe(Outcome::Success, Duration::from_millis(10));
+            }
+        }
+        assert!(
+            fixed.current() > buggy.current(),
+            "MAX-threshold limiter ({}) must out-recover the ceiling-threshold one ({})",
+            fixed.current(),
+            buggy.current(),
+        );
+    }
+
+    #[test]
     fn protected_slow_start_recovers_faster_than_additive() {
         // After identical stress + recovery, a limiter with slow-start
         // protected to the ceiling (fetch behaviour) must end at a
@@ -1288,8 +1338,9 @@ mod tests {
             "fetch latency-decrease must be disabled",
         );
         assert_eq!(
-            c.fetch.config.slow_start_ramp_threshold, c.fetch.config.max_concurrency,
-            "fetch slow-start must be protected to the ceiling",
+            c.fetch.config.slow_start_ramp_threshold,
+            usize::MAX,
+            "fetch slow-start must never exit (armed at every cap incl. ceiling)",
         );
         assert!(
             c.quote.config.latency_decrease_enabled,
