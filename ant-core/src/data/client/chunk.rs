@@ -6,6 +6,7 @@
 use crate::data::client::adaptive::Outcome;
 use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
 use crate::data::client::peer_cache::record_peer_outcome;
+use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{QuoteHash, TxHash};
@@ -16,7 +17,7 @@ use ant_protocol::{
     ProofType, XorName, CLOSE_GROUP_MAJORITY,
 };
 use bytes::Bytes;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -79,6 +80,84 @@ fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
 
 /// Store-response timeout for non-merkle chunk PUTs.
 const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Extra waves allowed after the computed diagnostic peer-sweep deadline.
+const DIAGNOSTIC_TIMEOUT_PADDING_WAVES: usize = 1;
+
+/// Result of fetching one chunk address from one close-group peer.
+pub struct ChunkPeerGetResult {
+    /// Peer queried for the chunk.
+    pub peer_id: PeerId,
+    /// Known network addresses used for the peer.
+    pub peer_addrs: Vec<MultiAddr>,
+    /// XOR distance from `peer_id` to the chunk address.
+    pub xor_distance: [u8; 32],
+    /// Per-peer fetch result.
+    pub chunk_result: Result<Option<DataChunk>>,
+}
+
+#[derive(Clone)]
+struct ChunkPeerGetTarget {
+    index: usize,
+    peer_id: PeerId,
+    peer_addrs: Vec<MultiAddr>,
+    xor_distance: [u8; 32],
+}
+
+fn chunk_peer_get_targets(
+    peers: Vec<(PeerId, Vec<MultiAddr>)>,
+    address: &XorName,
+) -> Vec<ChunkPeerGetTarget> {
+    peers
+        .into_iter()
+        .enumerate()
+        .map(|(index, (peer_id, peer_addrs))| ChunkPeerGetTarget {
+            index,
+            peer_id,
+            peer_addrs,
+            xor_distance: peer_xor_distance(&peer_id, address),
+        })
+        .collect()
+}
+
+fn sort_chunk_peer_get_results(results: &mut [ChunkPeerGetResult]) {
+    results.sort_by_key(|result| result.xor_distance);
+}
+
+fn diagnostic_peer_get_concurrency(peer_count: usize, close_group_size: usize) -> usize {
+    peer_count.min(close_group_size.max(1))
+}
+
+fn diagnostic_peer_get_overall_timeout(
+    per_peer_timeout: Duration,
+    target_count: usize,
+    concurrency_limit: usize,
+) -> Duration {
+    let concurrency_limit = concurrency_limit.max(1);
+    let peer_get_waves = target_count.div_ceil(concurrency_limit);
+    let timeout_waves = peer_get_waves.saturating_add(DIAGNOSTIC_TIMEOUT_PADDING_WAVES);
+    let timeout_waves = u32::try_from(timeout_waves).unwrap_or(u32::MAX);
+
+    per_peer_timeout.saturating_mul(timeout_waves)
+}
+
+fn timed_out_chunk_peer_get_result(
+    target: &ChunkPeerGetTarget,
+    address: &XorName,
+    timeout: Duration,
+) -> ChunkPeerGetResult {
+    let addr_hex = hex::encode(address);
+    let timeout_secs = timeout.as_secs();
+    ChunkPeerGetResult {
+        peer_id: target.peer_id,
+        peer_addrs: target.peer_addrs.clone(),
+        xor_distance: target.xor_distance,
+        chunk_result: Err(Error::Timeout(format!(
+            "Diagnostic chunk GET sweep timed out before peer {} completed for chunk {addr_hex} after {timeout_secs}s",
+            target.peer_id
+        ))),
+    }
+}
 
 fn store_response_timeout_for_proof(proof: &[u8], merkle_timeout_secs: u64) -> Duration {
     match detect_proof_type(proof) {
@@ -358,6 +437,25 @@ impl Client {
     ///
     /// Returns an error if the network operation fails.
     pub async fn chunk_get(&self, address: &XorName) -> Result<Option<DataChunk>> {
+        self.chunk_get_from_closest_peers(address, self.config().close_group_size)
+            .await
+    }
+
+    /// Retrieve a chunk from the requested number of closest peers.
+    ///
+    /// Queries peers in XOR-distance order for the chunk address,
+    /// returning the first successful response. This handles the case
+    /// where the storing peer differs from the first peer returned by
+    /// DHT routing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the network operation fails.
+    pub async fn chunk_get_from_closest_peers(
+        &self,
+        address: &XorName,
+        peer_count: usize,
+    ) -> Result<Option<DataChunk>> {
         // Check cache first, with integrity verification.
         if let Some(cached) = self.chunk_cache().get(address) {
             let computed = compute_address(&cached);
@@ -384,7 +482,7 @@ impl Client {
         // chunk would fail an entire multi-hundred-chunk download. A
         // zeroed outcome (queried=0) is never authoritative, so it flows
         // straight to the retry below.
-        let first = match self.chunk_get_try_close_group(address).await {
+        let first = match self.chunk_get_try_closest_peers(address, peer_count).await {
             Ok(outcome) => outcome,
             Err(e) => {
                 info!("chunk_get first close-group lookup failed for {addr_hex}: {e}; will retry");
@@ -441,7 +539,7 @@ impl Client {
         // If the retry's DHT lookup itself fails, treat that as "still
         // couldn't find" rather than escalating the error — matches the
         // semantics of the first attempt when peers are unreachable.
-        let retry = match self.chunk_get_try_close_group(address).await {
+        let retry = match self.chunk_get_try_closest_peers(address, peer_count).await {
             Ok(o) => o,
             Err(e) => {
                 info!(
@@ -480,11 +578,15 @@ impl Client {
         Ok(None)
     }
 
-    /// One sweep of the current close group: fetch the K closest peers
+    /// One sweep of the requested closest peers: fetch the closest peers
     /// for `address` from the DHT and ask each for the chunk in turn,
     /// returning on the first success.
-    async fn chunk_get_try_close_group(&self, address: &XorName) -> Result<CloseGroupOutcome> {
-        let peers = self.close_group_peers(address).await?;
+    async fn chunk_get_try_closest_peers(
+        &self,
+        address: &XorName,
+        peer_count: usize,
+    ) -> Result<CloseGroupOutcome> {
+        let peers = self.closest_peers(address, peer_count).await?;
         let addr_hex = hex::encode(address);
         let queried = peers.len();
         let mut not_found = 0usize;
@@ -542,6 +644,96 @@ impl Client {
             network_err,
             protocol_err,
         })
+    }
+
+    /// Retrieve a chunk from every peer in the close group.
+    ///
+    /// Unlike [`Client::chunk_get`], this method does not return early
+    /// after the first successful response. It returns one result per
+    /// close-group peer, sorted from closest XOR distance to furthest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the close-group lookup fails.
+    pub async fn chunk_get_from_close_group(
+        &self,
+        address: &XorName,
+    ) -> Result<Vec<ChunkPeerGetResult>> {
+        self.chunk_get_from_closest_peer_group(address, self.config().close_group_size)
+            .await
+    }
+
+    /// Retrieve a chunk from the requested number of closest peers.
+    ///
+    /// Unlike [`Client::chunk_get_from_closest_peers`], this method does
+    /// not return early after the first successful response. It returns
+    /// one result per queried peer, sorted from closest XOR distance to
+    /// furthest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DHT lookup fails.
+    pub async fn chunk_get_from_closest_peer_group(
+        &self,
+        address: &XorName,
+        peer_count: usize,
+    ) -> Result<Vec<ChunkPeerGetResult>> {
+        let peers = self.closest_peers(address, peer_count).await?;
+        let targets = chunk_peer_get_targets(peers, address);
+        let concurrency_limit =
+            diagnostic_peer_get_concurrency(peer_count, self.config().close_group_size);
+        let per_peer_timeout = Duration::from_secs(self.config().chunk_get_timeout_secs);
+        let overall_timeout =
+            diagnostic_peer_get_overall_timeout(per_peer_timeout, targets.len(), concurrency_limit);
+
+        let mut completed = vec![false; targets.len()];
+        let mut results = Vec::with_capacity(targets.len());
+        let mut get_results = stream::iter(targets.iter().cloned())
+            .map(|target| async move {
+                let chunk_result = self
+                    .chunk_get_from_peer(address, &target.peer_id, &target.peer_addrs)
+                    .await;
+
+                if let Ok(Some(chunk)) = &chunk_result {
+                    self.chunk_cache().put(chunk.address, chunk.content.clone());
+                }
+
+                (
+                    target.index,
+                    ChunkPeerGetResult {
+                        peer_id: target.peer_id,
+                        peer_addrs: target.peer_addrs,
+                        xor_distance: target.xor_distance,
+                        chunk_result,
+                    },
+                )
+            })
+            .buffer_unordered(concurrency_limit);
+
+        let collect_results = async {
+            while let Some((index, result)) = get_results.next().await {
+                completed[index] = true;
+                results.push(result);
+            }
+        };
+
+        if tokio::time::timeout(overall_timeout, collect_results)
+            .await
+            .is_err()
+        {
+            for target in &targets {
+                if !completed[target.index] {
+                    results.push(timed_out_chunk_peer_get_result(
+                        target,
+                        address,
+                        overall_timeout,
+                    ));
+                }
+            }
+        }
+
+        sort_chunk_peer_get_results(&mut results);
+        Ok(results)
     }
 
     /// Fetch a chunk from a specific peer.
@@ -679,6 +871,22 @@ mod tests {
     const TEST_MERKLE_TIMEOUT_SECS: u64 = 60;
     /// Sentinel byte used to represent an unknown/unrecognized proof tag.
     const UNKNOWN_PROOF_TAG: u8 = 0xff;
+    /// XorName byte width used by test peer IDs and distances.
+    const TEST_XORNAME_BYTE_LEN: usize = 32;
+    /// Last byte position in the test XOR distance arrays.
+    const TEST_DISTANCE_TAIL_INDEX: usize = TEST_XORNAME_BYTE_LEN - 1;
+
+    fn chunk_peer_get_result(peer_seed: u8, distance_tail: u8) -> ChunkPeerGetResult {
+        let mut xor_distance = [0; TEST_XORNAME_BYTE_LEN];
+        xor_distance[TEST_DISTANCE_TAIL_INDEX] = distance_tail;
+
+        ChunkPeerGetResult {
+            peer_id: PeerId::from_bytes([peer_seed; TEST_XORNAME_BYTE_LEN]),
+            peer_addrs: Vec::new(),
+            xor_distance,
+            chunk_result: Ok(None),
+        }
+    }
 
     #[test]
     fn authoritative_not_found_requires_unanimous_well_sampled_response() {
@@ -777,6 +985,62 @@ mod tests {
             store_response_timeout_for_proof(&[PROOF_TAG_MERKLE], TEST_MERKLE_TIMEOUT_SECS);
 
         assert_eq!(timeout, Duration::from_secs(TEST_MERKLE_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn chunk_peer_get_results_sort_by_xor_distance() {
+        let mut results = vec![
+            chunk_peer_get_result(3, 3),
+            chunk_peer_get_result(1, 1),
+            chunk_peer_get_result(2, 2),
+        ];
+
+        sort_chunk_peer_get_results(&mut results);
+
+        let ordered_distances = results
+            .iter()
+            .map(|result| result.xor_distance[TEST_DISTANCE_TAIL_INDEX])
+            .collect::<Vec<_>>();
+        assert_eq!(ordered_distances, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn diagnostic_peer_get_overall_timeout_allows_one_wave_plus_padding() {
+        const PER_PEER_TIMEOUT_SECS: u64 = 10;
+        const EXPECTED_WAVES_WITH_PADDING: u64 = 2;
+        const TARGET_COUNT: usize = 7;
+        const CONCURRENCY_LIMIT: usize = 7;
+
+        let timeout = diagnostic_peer_get_overall_timeout(
+            Duration::from_secs(PER_PEER_TIMEOUT_SECS),
+            TARGET_COUNT,
+            CONCURRENCY_LIMIT,
+        );
+
+        assert_eq!(
+            timeout,
+            Duration::from_secs(PER_PEER_TIMEOUT_SECS * EXPECTED_WAVES_WITH_PADDING)
+        );
+    }
+
+    #[test]
+    fn diagnostic_peer_get_overall_timeout_scales_with_peer_count() {
+        const PER_PEER_TIMEOUT_SECS: u64 = 10;
+        const TARGET_COUNT: usize = 20;
+        const CLOSE_GROUP_SIZE: usize = 7;
+        const EXPECTED_WAVES_WITH_PADDING: u64 = 4;
+
+        let concurrency_limit = diagnostic_peer_get_concurrency(TARGET_COUNT, CLOSE_GROUP_SIZE);
+        let timeout = diagnostic_peer_get_overall_timeout(
+            Duration::from_secs(PER_PEER_TIMEOUT_SECS),
+            TARGET_COUNT,
+            concurrency_limit,
+        );
+
+        assert_eq!(
+            timeout,
+            Duration::from_secs(PER_PEER_TIMEOUT_SECS * EXPECTED_WAVES_WITH_PADDING)
+        );
     }
 
     /// Regression: the default `merkle_store_timeout_secs` must be at

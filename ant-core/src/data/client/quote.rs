@@ -4,6 +4,7 @@
 //! managing payment for data storage.
 
 use crate::data::client::peer_cache::record_peer_outcome;
+use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{Amount, PaymentQuote};
@@ -15,20 +16,6 @@ use ant_protocol::{
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
-
-/// Compute XOR distance between a peer's ID bytes and a target address.
-///
-/// Uses the first 32 bytes of the peer ID (or fewer if shorter) XORed with
-/// the target address. Returns a byte array suitable for lexicographic comparison.
-fn xor_distance(peer_id: &PeerId, target: &[u8; 32]) -> [u8; 32] {
-    let peer_bytes = peer_id.as_bytes();
-    let mut distance = [0u8; 32];
-    for (i, d) in distance.iter_mut().enumerate() {
-        let pb = peer_bytes.get(i).copied().unwrap_or(0);
-        *d = pb ^ target[i];
-    }
-    distance
-}
 
 /// ML-DSA-65 public key length in bytes. Mirrors the same value defined as
 /// `pub const ML_DSA_65_PUBLIC_KEY_SIZE` in `saorsa-pqc::pqc::types`, which
@@ -303,7 +290,7 @@ impl Client {
                         }
                         Err(Error::AlreadyStored) => {
                             info!("Peer {peer_id} reports chunk already stored");
-                            let dist = xor_distance(&peer_id, address);
+                            let dist = peer_xor_distance(&peer_id, address);
                             already_stored_peers.push((peer_id, dist));
                         }
                         Err(e) => {
@@ -356,7 +343,7 @@ impl Client {
         if !already_stored_peers.is_empty() {
             let mut all_peers_by_distance: Vec<(bool, [u8; 32])> = Vec::new();
             for (peer_id, _, _, _) in &quotes {
-                all_peers_by_distance.push((false, xor_distance(peer_id, address)));
+                all_peers_by_distance.push((false, peer_xor_distance(peer_id, address)));
             }
             for (_, dist) in &already_stored_peers {
                 all_peers_by_distance.push((true, *dist));
@@ -386,8 +373,8 @@ impl Client {
         if quotes.len() >= CLOSE_GROUP_SIZE {
             // Sort by XOR distance to target, keep the closest CLOSE_GROUP_SIZE.
             quotes.sort_by(|a, b| {
-                let dist_a = xor_distance(&a.0, address);
-                let dist_b = xor_distance(&b.0, address);
+                let dist_a = peer_xor_distance(&a.0, address);
+                let dist_b = peer_xor_distance(&b.0, address);
                 dist_a.cmp(&dist_b)
             });
             quotes.truncate(CLOSE_GROUP_SIZE);

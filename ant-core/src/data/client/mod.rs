@@ -72,6 +72,21 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
     }
 }
 
+/// Compute XOR distance between a peer's ID bytes and a target address.
+///
+/// Uses the first 32 bytes of the peer ID (or fewer if shorter) XORed
+/// with the target address. The returned byte array sorts
+/// lexicographically from closest to furthest.
+pub(crate) fn peer_xor_distance(peer_id: &PeerId, target: &[u8; 32]) -> [u8; 32] {
+    let peer_bytes = peer_id.as_bytes();
+    let mut distance = [0u8; 32];
+    for (i, d) in distance.iter_mut().enumerate() {
+        let peer_byte = peer_bytes.get(i).copied().unwrap_or(0);
+        *d = peer_byte ^ target[i];
+    }
+    distance
+}
+
 /// Default timeout for lightweight network operations (quotes, DHT lookups) in seconds.
 const DEFAULT_QUOTE_TIMEOUT_SECS: u64 = 10;
 
@@ -464,10 +479,20 @@ impl Client {
         &self,
         target: &XorName,
     ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
-        let peers = self
-            .network()
-            .find_closest_peers(target, self.config().close_group_size)
-            .await?;
+        self.closest_peers(target, self.config().close_group_size)
+            .await
+    }
+
+    /// Return the requested number of closest peers for a target address.
+    ///
+    /// Queries the DHT for peers by XOR distance. Returns each peer
+    /// paired with its known network addresses.
+    pub(crate) async fn closest_peers(
+        &self,
+        target: &XorName,
+        count: usize,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
+        let peers = self.network().find_closest_peers(target, count).await?;
 
         if peers.is_empty() {
             return Err(Error::InsufficientPeers(
