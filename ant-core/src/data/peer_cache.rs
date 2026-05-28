@@ -2,7 +2,8 @@
 //!
 //! Client peer IDs are ephemeral, so this cache is not keyed by distance from
 //! the local client. It remembers authenticated node peers that we have already
-//! connected to, and stores only their DHT `Direct`-tagged dial addresses.
+//! connected to, stores only their DHT `Direct`-tagged dial addresses, and
+//! prefers retaining peers that are spread across the peer-id keyspace.
 
 use crate::config;
 use ant_protocol::transport::{IPDiversityConfig, MultiAddr, P2PNode, PeerId};
@@ -35,6 +36,7 @@ const IPV6_SUBNET_PREFIX_SEGMENTS: usize = 3;
 const BITS_PER_BYTE: u8 = 8;
 const PEER_ID_SECTOR_BITS: u8 = 4;
 const PEER_ID_SECTOR_COUNT: usize = 1 << PEER_ID_SECTOR_BITS;
+const PEER_ID_XOR_DISTANCE_BYTES: usize = 32;
 
 // saorsa-core's AddressType enum is visible through the P2P node API but is not
 // re-exported by ant-protocol. `AddressType::Direct.priority()` is 1 there.
@@ -358,20 +360,26 @@ impl ClientPeerCacheFile {
                 .then_with(|| left.peer_id.to_hex().cmp(&right.peer_id.to_hex()))
         });
 
-        let mut tracker = DiversityTracker::new(diversity_config, k_value);
+        let mut candidates = Vec::with_capacity(self.peers.len());
         let mut seen_peers = HashSet::new();
+        for peer in self.peers.drain(..) {
+            if seen_peers.insert(peer.peer_id) {
+                candidates.push(peer);
+            }
+        }
+
+        let mut tracker = DiversityTracker::new(diversity_config, k_value);
         let mut normalized = Vec::with_capacity(CLIENT_PEER_CACHE_MAX_PEERS);
 
-        for peer in self.peers.drain(..) {
-            if normalized.len() >= CLIENT_PEER_CACHE_MAX_PEERS {
+        while normalized.len() < CLIENT_PEER_CACHE_MAX_PEERS {
+            let Some(best_index) =
+                select_peer_id_diverse_candidate(&candidates, &normalized, &tracker)
+            else {
                 break;
-            }
-            if !seen_peers.insert(peer.peer_id) {
-                continue;
-            }
-            if tracker.admit_peer(&peer) {
-                normalized.push(peer);
-            }
+            };
+            let peer = candidates.swap_remove(best_index);
+            tracker.record_peer(&peer);
+            normalized.push(peer);
         }
 
         self.peers = normalized;
@@ -421,6 +429,71 @@ impl ClientPeerCacheFile {
     }
 }
 
+fn select_peer_id_diverse_candidate(
+    candidates: &[CachedPeer],
+    selected: &[CachedPeer],
+    tracker: &DiversityTracker,
+) -> Option<usize> {
+    let mut best_index = None;
+
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        if !tracker.can_admit_peer(candidate) {
+            continue;
+        }
+        let Some(current_best_index) = best_index else {
+            best_index = Some(candidate_index);
+            continue;
+        };
+        let current_best = &candidates[current_best_index];
+        if prefer_peer_id_candidate(candidate, current_best, selected) {
+            best_index = Some(candidate_index);
+        }
+    }
+
+    best_index
+}
+
+fn prefer_peer_id_candidate(
+    candidate: &CachedPeer,
+    current_best: &CachedPeer,
+    selected: &[CachedPeer],
+) -> bool {
+    peer_id_spread_score(candidate, selected)
+        .cmp(&peer_id_spread_score(current_best, selected))
+        .then_with(|| {
+            candidate
+                .last_connected_epoch_secs
+                .cmp(&current_best.last_connected_epoch_secs)
+        })
+        .then_with(|| {
+            current_best
+                .peer_id
+                .to_hex()
+                .cmp(&candidate.peer_id.to_hex())
+        })
+        .is_gt()
+}
+
+fn peer_id_spread_score(
+    candidate: &CachedPeer,
+    selected: &[CachedPeer],
+) -> Option<[u8; PEER_ID_XOR_DISTANCE_BYTES]> {
+    selected
+        .iter()
+        .map(|peer| peer_id_xor_distance(candidate.peer_id, peer.peer_id))
+        .min()
+}
+
+fn peer_id_xor_distance(left: PeerId, right: PeerId) -> [u8; PEER_ID_XOR_DISTANCE_BYTES] {
+    let left_bytes = left.as_bytes();
+    let right_bytes = right.as_bytes();
+    let mut distance = [0u8; PEER_ID_XOR_DISTANCE_BYTES];
+    for (index, byte) in distance.iter_mut().enumerate() {
+        *byte = left_bytes[index] ^ right_bytes[index];
+    }
+    distance
+}
+
 impl DiversityTracker {
     fn new(config: &IPDiversityConfig, k_value: usize) -> Self {
         Self {
@@ -433,24 +506,10 @@ impl DiversityTracker {
         }
     }
 
-    fn admit_peer(&mut self, peer: &CachedPeer) -> bool {
-        let ip_set = peer
-            .direct_addresses
-            .iter()
-            .filter_map(|addr| {
-                addr.dialable_socket_addr()
-                    .map(|socket| canonical_ip(socket.ip()))
-            })
-            .collect::<HashSet<_>>();
-
-        if ip_set.is_empty() {
+    fn can_admit_peer(&self, peer: &CachedPeer) -> bool {
+        let Some((ip_set, subnet_set)) = peer_diversity_sets(peer) else {
             return false;
-        }
-
-        let subnet_set = ip_set
-            .iter()
-            .map(|ip| subnet_key(*ip))
-            .collect::<HashSet<_>>();
+        };
 
         for ip in &ip_set {
             if self.exact_ip_counts.get(ip).copied().unwrap_or_default() >= self.max_per_ip {
@@ -464,15 +523,43 @@ impl DiversityTracker {
             }
         }
 
+        true
+    }
+
+    fn record_peer(&mut self, peer: &CachedPeer) {
+        let Some((ip_set, subnet_set)) = peer_diversity_sets(peer) else {
+            return;
+        };
+
         for ip in ip_set {
             *self.exact_ip_counts.entry(ip).or_default() += 1;
         }
         for subnet in subnet_set {
             *self.subnet_counts.entry(subnet).or_default() += 1;
         }
-
-        true
     }
+}
+
+fn peer_diversity_sets(peer: &CachedPeer) -> Option<(HashSet<IpAddr>, HashSet<SubnetKey>)> {
+    let ip_set = peer
+        .direct_addresses
+        .iter()
+        .filter_map(|addr| {
+            addr.dialable_socket_addr()
+                .map(|socket| canonical_ip(socket.ip()))
+        })
+        .collect::<HashSet<_>>();
+
+    if ip_set.is_empty() {
+        return None;
+    }
+
+    let subnet_set = ip_set
+        .iter()
+        .map(|ip| subnet_key(*ip))
+        .collect::<HashSet<_>>();
+
+    Some((ip_set, subnet_set))
 }
 
 fn sanitize_direct_addresses(peer_id: PeerId, direct_addresses: Vec<MultiAddr>) -> Vec<MultiAddr> {
@@ -565,12 +652,16 @@ mod tests {
     const TEST_NOW: u64 = 1_000_000;
     const EXACT_IP_ATTEMPTS: u8 = 3;
     const SUBNET_ATTEMPTS: u8 = 6;
-    const PEER_COUNT_OVER_CACHE_LIMIT: usize = CLIENT_PEER_CACHE_MAX_PEERS + 10;
     const BOOTSTRAP_ROUND_ROBIN_TEST_LIMIT: usize = 6;
 
     fn peer_id(byte: u8) -> PeerId {
+        peer_id_with_prefix(byte, 0)
+    }
+
+    fn peer_id_with_prefix(first_byte: u8, second_byte: u8) -> PeerId {
         let mut bytes = [0u8; TEST_PEER_ID_LEN];
-        bytes[0] = byte;
+        bytes[0] = first_byte;
+        bytes[1] = second_byte;
         PeerId::from_bytes(bytes)
     }
 
@@ -587,28 +678,51 @@ mod tests {
     }
 
     #[test]
-    fn cache_keeps_most_recent_peers_when_full() {
+    fn cache_prefers_peer_id_spread_over_recency_when_full() {
         let mut cache = ClientPeerCacheFile::empty();
         let diversity = IPDiversityConfig::permissive();
 
-        for idx in 0..PEER_COUNT_OVER_CACHE_LIMIT {
-            let peer = peer_id(idx as u8);
+        let old_distant_peer = peer_id_with_prefix(u8::MAX, 0);
+        cache.peers.push(CachedPeer {
+            peer_id: old_distant_peer,
+            direct_addresses: vec![direct_addr(v4(203, 0, 113, 1), FIRST_PORT)],
+            first_connected_epoch_secs: TEST_NOW,
+            last_connected_epoch_secs: TEST_NOW,
+        });
+
+        for idx in 0..CLIENT_PEER_CACHE_MAX_PEERS {
+            let peer = peer_id_with_prefix(0, idx as u8);
             let addr = direct_addr(
                 v4(1, 0, idx as u8, 1),
                 FIRST_PORT + u16::try_from(idx).unwrap(),
             );
-            cache.upsert_connected_peer(
-                peer,
-                vec![addr],
-                TEST_NOW + u64::try_from(idx).unwrap(),
-                &diversity,
-                TEST_K_VALUE,
-            );
+            let connected_epoch_secs = TEST_NOW + u64::try_from(idx).unwrap() + 1;
+            cache.peers.push(CachedPeer {
+                peer_id: peer,
+                direct_addresses: vec![addr.with_peer_id(peer)],
+                first_connected_epoch_secs: connected_epoch_secs,
+                last_connected_epoch_secs: connected_epoch_secs,
+            });
         }
 
+        cache.normalize(&diversity, TEST_K_VALUE);
+
         assert_eq!(cache.peers.len(), CLIENT_PEER_CACHE_MAX_PEERS);
-        assert!(cache.peers.iter().any(|peer| peer.peer_id == peer_id(59)));
-        assert!(!cache.peers.iter().any(|peer| peer.peer_id == peer_id(0)));
+        assert!(
+            cache
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == old_distant_peer),
+            "old distant peer must be retained ahead of one newer clustered peer"
+        );
+        assert_eq!(
+            cache
+                .peers
+                .iter()
+                .filter(|peer| peer.peer_id.as_bytes()[0] == 0)
+                .count(),
+            CLIENT_PEER_CACHE_MAX_PEERS - 1
+        );
     }
 
     #[test]
