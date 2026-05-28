@@ -19,6 +19,7 @@ pub const CLIENT_PEER_CACHE_MAX_PEERS: usize = 50;
 const CLIENT_PEER_CACHE_SCHEMA_VERSION: u32 = 1;
 const CLIENT_PEER_CACHE_FILE_NAME: &str = "client_peer_cache.json";
 const CLIENT_PEER_CACHE_TEMP_SUFFIX: &str = "tmp";
+const CLIENT_BOOTSTRAP_CACHED_CANDIDATE_LIMIT: usize = 6;
 const DEFAULT_MAX_PER_EXACT_IP: usize = 2;
 const SUBNET_LIMIT_K_DIVISOR: usize = 4;
 const IPV4_SUBNET_PREFIX_OCTETS: usize = 3;
@@ -72,11 +73,12 @@ pub fn cache_path() -> Option<PathBuf> {
     }
 }
 
-/// Load cache addresses to prepend to configured bootstrap peers.
+/// Load cache addresses to try before configured bootstrap peers.
 ///
-/// Returns at most one direct address per cached peer, selected in peer-ID
-/// sector round-robin order so the bootstrap list is not dominated by one part
-/// of the network keyspace.
+/// Returns at most one direct address per cached peer, capped at the client
+/// bootstrap target. The cap lets configured bootstrap peers act as fallback if
+/// the cache cannot provide enough successful connections, while still avoiding
+/// those configured peers on a healthy warm start.
 #[must_use]
 pub fn cached_bootstrap_peers(cache_path: &Path, k_value: usize) -> Vec<MultiAddr> {
     let mut cache = ClientPeerCacheFile::load(cache_path);
@@ -85,25 +87,21 @@ pub fn cached_bootstrap_peers(cache_path: &Path, k_value: usize) -> Vec<MultiAdd
     if normalized {
         cache.save(cache_path);
     }
-    cache.bootstrap_addresses()
+    cache.bootstrap_addresses(CLIENT_BOOTSTRAP_CACHED_CANDIDATE_LIMIT)
 }
 
 /// Select startup bootstrap peers.
 ///
-/// Cached peers are used exclusively when available, so a warm client does not
-/// put load on configured/hardcoded bootstrap peers. Configured bootstrap peers
-/// are used only for first start or when the persisted cache has no usable
-/// Direct addresses.
+/// Cached peers are ordered first and configured bootstrap peers are appended
+/// behind them. saorsa-core stops client bootstrap after the client bootstrap
+/// target is reached, so configured peers are only reached when the cached
+/// candidates do not produce enough successful connections.
 #[must_use]
 pub fn select_bootstrap_peers(
     cached: impl IntoIterator<Item = MultiAddr>,
     configured: impl IntoIterator<Item = MultiAddr>,
 ) -> Vec<MultiAddr> {
-    let cached = dedupe_bootstrap_peers(cached);
-    if !cached.is_empty() {
-        return cached;
-    }
-    dedupe_bootstrap_peers(configured)
+    dedupe_bootstrap_peers(cached.into_iter().chain(configured))
 }
 
 fn dedupe_bootstrap_peers(addrs: impl IntoIterator<Item = MultiAddr>) -> Vec<MultiAddr> {
@@ -325,7 +323,7 @@ impl ClientPeerCacheFile {
         self.peers != before
     }
 
-    fn bootstrap_addresses(&self) -> Vec<MultiAddr> {
+    fn bootstrap_addresses(&self, limit: usize) -> Vec<MultiAddr> {
         let mut sectors = (0..PEER_ID_SECTOR_COUNT)
             .map(|_| Vec::new())
             .collect::<Vec<Vec<&CachedPeer>>>();
@@ -335,7 +333,7 @@ impl ClientPeerCacheFile {
         }
 
         let mut positions = [0usize; PEER_ID_SECTOR_COUNT];
-        let mut addresses = Vec::with_capacity(self.peers.len().min(CLIENT_PEER_CACHE_MAX_PEERS));
+        let mut addresses = Vec::with_capacity(self.peers.len().min(limit));
 
         loop {
             let mut added_this_round = false;
@@ -349,7 +347,7 @@ impl ClientPeerCacheFile {
                     added_this_round = true;
                     positions[sector] += 1;
                 }
-                if addresses.len() >= CLIENT_PEER_CACHE_MAX_PEERS {
+                if addresses.len() >= limit {
                     return addresses;
                 }
             }
@@ -632,7 +630,7 @@ mod tests {
             TEST_K_VALUE,
         );
 
-        let addresses = cache.bootstrap_addresses();
+        let addresses = cache.bootstrap_addresses(CLIENT_BOOTSTRAP_CACHED_CANDIDATE_LIMIT);
 
         assert_eq!(addresses.len(), 3);
         assert_eq!(
@@ -667,15 +665,15 @@ mod tests {
     }
 
     #[test]
-    fn select_bootstrap_peers_skips_configured_when_cache_has_entries() {
+    fn select_bootstrap_peers_orders_configured_after_cached_fallback() {
         let peer = peer_id(1);
         let cached =
             MultiAddr::quic(SocketAddr::new(v4(203, 0, 113, 20), FIRST_PORT)).with_peer_id(peer);
         let configured = MultiAddr::quic(SocketAddr::new(v4(203, 0, 113, 21), FIRST_PORT));
 
-        let selected = select_bootstrap_peers(vec![cached.clone()], vec![configured]);
+        let selected = select_bootstrap_peers(vec![cached.clone()], vec![configured.clone()]);
 
-        assert_eq!(selected, vec![cached]);
+        assert_eq!(selected, vec![cached, configured]);
     }
 
     #[test]
@@ -685,5 +683,28 @@ mod tests {
         let selected = select_bootstrap_peers(Vec::new(), vec![configured.clone()]);
 
         assert_eq!(selected, vec![configured]);
+    }
+
+    #[test]
+    fn cached_bootstrap_peers_are_limited_to_client_bootstrap_target() {
+        let mut cache = ClientPeerCacheFile::empty();
+        let diversity = IPDiversityConfig::permissive();
+
+        for idx in 0..CLIENT_BOOTSTRAP_CACHED_CANDIDATE_LIMIT + 1 {
+            cache.upsert_connected_peer(
+                peer_id(idx as u8),
+                vec![direct_addr(
+                    v4(1, 0, idx as u8, 1),
+                    FIRST_PORT + u16::try_from(idx).unwrap(),
+                )],
+                TEST_NOW + u64::try_from(idx).unwrap(),
+                &diversity,
+                TEST_K_VALUE,
+            );
+        }
+
+        let addresses = cache.bootstrap_addresses(CLIENT_BOOTSTRAP_CACHED_CANDIDATE_LIMIT);
+
+        assert_eq!(addresses.len(), CLIENT_BOOTSTRAP_CACHED_CANDIDATE_LIMIT);
     }
 }

@@ -206,7 +206,11 @@ async fn build_data_client(
 
     let manifest = load_manifest(ctx)?;
     let bootstrap = resolve_bootstrap_from(ctx, manifest.as_ref())?;
-    let use_peer_cache = ctx.devnet_manifest.is_none();
+    // Explicit network selectors should be isolated from the general client
+    // peer cache. `--bootstrap` and `--devnet-manifest` both mean "use exactly
+    // this network entrypoint", so cached public-network peers must not be
+    // mixed in or saved back from that run.
+    let use_peer_cache = ctx.devnet_manifest.is_none() && ctx.bootstrap.is_empty();
 
     // Connection phase with animated spinner showing peer discovery in real-time.
     // The spinner is the user-facing UI; tracing::info! provides log-level visibility
