@@ -389,7 +389,6 @@ impl Client {
         );
         let network = Network::new(bootstrap_peers, config.allow_loopback, config.ipv6).await?;
         let (controller, persist_path) = build_controller(&config);
-        let peer_cache_path = peer_cache::cache_path();
         Ok(Self {
             config,
             network,
@@ -399,7 +398,7 @@ impl Client {
             next_request_id: AtomicU64::new(1),
             controller,
             persist_path,
-            peer_cache_path,
+            peer_cache_path: None,
         })
     }
 

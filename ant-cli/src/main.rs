@@ -12,8 +12,9 @@ use tracing::info;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use ant_core::data::{
-    peer_cache, Client, ClientConfig, CoreNodeConfig, CustomNetwork, DevnetManifest, EvmAddress,
-    EvmNetwork, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, Wallet, MAX_WIRE_MESSAGE_SIZE,
+    peer_cache::{self, BootstrapAddressFilter},
+    Client, ClientConfig, CoreNodeConfig, CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork,
+    IPDiversityConfig, MultiAddr, NodeMode, P2PNode, Wallet, MAX_WIRE_MESSAGE_SIZE,
 };
 use cli::{Cli, Commands};
 
@@ -523,9 +524,16 @@ async fn create_client_node_raw(
 
     let dht_k_value = core_config.dht_config.k_value;
     let cache_path = use_peer_cache.then(peer_cache::cache_path).flatten();
+    let cache_address_filter = if ipv4_only {
+        BootstrapAddressFilter::Ipv4Only
+    } else {
+        BootstrapAddressFilter::All
+    };
     let cached_bootstrap_peers = cache_path
         .as_deref()
-        .map(|path| peer_cache::cached_bootstrap_peers(path, dht_k_value))
+        .map(|path| {
+            peer_cache::cached_bootstrap_peers_with_filter(path, dht_k_value, cache_address_filter)
+        })
         .unwrap_or_default();
 
     core_config.bootstrap_peers = peer_cache::select_bootstrap_peers(

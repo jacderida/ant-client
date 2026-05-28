@@ -16,6 +16,15 @@ use tracing::{debug, info, warn};
 
 pub const CLIENT_PEER_CACHE_MAX_PEERS: usize = 50;
 
+/// Address families allowed when materializing cached startup candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapAddressFilter {
+    /// Allow every dialable cached address.
+    All,
+    /// Allow only IPv4 cached addresses.
+    Ipv4Only,
+}
+
 const CLIENT_PEER_CACHE_SCHEMA_VERSION: u32 = 1;
 const CLIENT_PEER_CACHE_FILE_NAME: &str = "client_peer_cache.json";
 const CLIENT_PEER_CACHE_TEMP_SUFFIX: &str = "tmp";
@@ -80,6 +89,17 @@ pub fn cache_path() -> Option<PathBuf> {
 /// all cached peers to be dialed on a healthy warm start.
 #[must_use]
 pub fn cached_bootstrap_peers(cache_path: &Path, k_value: usize) -> Vec<MultiAddr> {
+    cached_bootstrap_peers_with_filter(cache_path, k_value, BootstrapAddressFilter::All)
+}
+
+/// Load cache addresses to try before configured bootstrap peers, applying an
+/// address-family filter before choosing the first address for each peer.
+#[must_use]
+pub fn cached_bootstrap_peers_with_filter(
+    cache_path: &Path,
+    k_value: usize,
+    address_filter: BootstrapAddressFilter,
+) -> Vec<MultiAddr> {
     let Some(mut cache) = ClientPeerCacheFile::load_existing(cache_path) else {
         return Vec::new();
     };
@@ -90,7 +110,8 @@ pub fn cached_bootstrap_peers(cache_path: &Path, k_value: usize) -> Vec<MultiAdd
     if normalized {
         cache.save(cache_path);
     }
-    let bootstrap_addresses = cache.bootstrap_addresses(CLIENT_PEER_CACHE_MAX_PEERS);
+    let bootstrap_addresses =
+        cache.bootstrap_addresses(CLIENT_PEER_CACHE_MAX_PEERS, address_filter);
     info!(
         path = %cache_path.display(),
         cached_peers = loaded_peer_count,
@@ -190,6 +211,17 @@ pub async fn promote_connected_direct_peers(node: &P2PNode, cache_path: &Path, k
 #[must_use]
 fn cache_diversity_config() -> IPDiversityConfig {
     IPDiversityConfig::default()
+}
+
+impl BootstrapAddressFilter {
+    fn allows(self, addr: &MultiAddr) -> bool {
+        match self {
+            Self::All => addr.dialable_socket_addr().is_some(),
+            Self::Ipv4Only => addr
+                .dialable_socket_addr()
+                .is_some_and(|socket| socket.is_ipv4()),
+        }
+    }
 }
 
 impl ClientPeerCacheFile {
@@ -346,7 +378,11 @@ impl ClientPeerCacheFile {
         self.peers != before
     }
 
-    fn bootstrap_addresses(&self, limit: usize) -> Vec<MultiAddr> {
+    fn bootstrap_addresses(
+        &self,
+        limit: usize,
+        address_filter: BootstrapAddressFilter,
+    ) -> Vec<MultiAddr> {
         let mut sectors = (0..PEER_ID_SECTOR_COUNT)
             .map(|_| Vec::new())
             .collect::<Vec<Vec<&CachedPeer>>>();
@@ -359,22 +395,26 @@ impl ClientPeerCacheFile {
         let mut addresses = Vec::with_capacity(self.peers.len().min(limit));
 
         loop {
-            let mut added_this_round = false;
+            let mut advanced_this_round = false;
             for sector in 0..PEER_ID_SECTOR_COUNT {
                 let position = positions[sector];
                 let Some(peer) = sectors[sector].get(position) else {
                     continue;
                 };
-                if let Some(addr) = peer.direct_addresses.first() {
+                positions[sector] += 1;
+                advanced_this_round = true;
+                if let Some(addr) = peer
+                    .direct_addresses
+                    .iter()
+                    .find(|addr| address_filter.allows(addr))
+                {
                     addresses.push(addr.clone());
-                    added_this_round = true;
-                    positions[sector] += 1;
                 }
                 if addresses.len() >= limit {
                     return addresses;
                 }
             }
-            if !added_this_round {
+            if !advanced_this_round {
                 return addresses;
             }
         }
@@ -654,7 +694,10 @@ mod tests {
             TEST_K_VALUE,
         );
 
-        let addresses = cache.bootstrap_addresses(BOOTSTRAP_ROUND_ROBIN_TEST_LIMIT);
+        let addresses = cache.bootstrap_addresses(
+            BOOTSTRAP_ROUND_ROBIN_TEST_LIMIT,
+            BootstrapAddressFilter::All,
+        );
 
         assert_eq!(addresses.len(), 3);
         assert_eq!(
@@ -686,6 +729,33 @@ mod tests {
 
         let addr = cache.peers[0].direct_addresses[0].clone();
         assert_eq!(addr.peer_id(), Some(&peer_id(1)));
+    }
+
+    #[test]
+    fn cached_bootstrap_addresses_respect_ipv4_only_filter() {
+        let mut cache = ClientPeerCacheFile::empty();
+        let diversity = IPDiversityConfig::permissive();
+
+        let peer = peer_id(1);
+        let ipv6_addr = direct_addr(v6(0x2001, 1), FIRST_PORT);
+        let ipv4_addr = direct_addr(v4(203, 0, 113, 10), FIRST_PORT + 1);
+        cache.upsert_connected_peer(
+            peer,
+            vec![ipv6_addr.clone(), ipv4_addr.clone()],
+            TEST_NOW,
+            &diversity,
+            TEST_K_VALUE,
+        );
+
+        let all_addresses =
+            cache.bootstrap_addresses(CLIENT_PEER_CACHE_MAX_PEERS, BootstrapAddressFilter::All);
+        assert_eq!(all_addresses, vec![ipv6_addr.with_peer_id(peer)]);
+
+        let ipv4_addresses = cache.bootstrap_addresses(
+            CLIENT_PEER_CACHE_MAX_PEERS,
+            BootstrapAddressFilter::Ipv4Only,
+        );
+        assert_eq!(ipv4_addresses, vec![ipv4_addr.with_peer_id(peer)]);
     }
 
     #[test]
@@ -731,7 +801,8 @@ mod tests {
             );
         }
 
-        let addresses = cache.bootstrap_addresses(CLIENT_PEER_CACHE_MAX_PEERS);
+        let addresses =
+            cache.bootstrap_addresses(CLIENT_PEER_CACHE_MAX_PEERS, BootstrapAddressFilter::All);
 
         assert_eq!(addresses.len(), BOOTSTRAP_ROUND_ROBIN_TEST_LIMIT + 1);
     }
