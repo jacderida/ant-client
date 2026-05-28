@@ -68,7 +68,7 @@ impl Network {
             .map(|path| peer_cache::cached_bootstrap_peers(path, dht_k_value))
             .unwrap_or_default();
 
-        core_config.bootstrap_peers = peer_cache::merge_bootstrap_peers(
+        core_config.bootstrap_peers = peer_cache::select_bootstrap_peers(
             cached_bootstrap_peers,
             bootstrap_peers.iter().map(|addr| MultiAddr::quic(*addr)),
         );

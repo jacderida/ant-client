@@ -88,24 +88,35 @@ pub fn cached_bootstrap_peers(cache_path: &Path, k_value: usize) -> Vec<MultiAdd
     cache.bootstrap_addresses()
 }
 
-/// Merge cached peers before the configured bootstrap peers, deduplicating by
-/// dialable socket so a cached `/p2p` address does not make us dial the same
-/// hardcoded bootstrap socket twice.
+/// Select startup bootstrap peers.
+///
+/// Cached peers are used exclusively when available, so a warm client does not
+/// put load on configured/hardcoded bootstrap peers. Configured bootstrap peers
+/// are used only for first start or when the persisted cache has no usable
+/// Direct addresses.
 #[must_use]
-pub fn merge_bootstrap_peers(
+pub fn select_bootstrap_peers(
     cached: impl IntoIterator<Item = MultiAddr>,
     configured: impl IntoIterator<Item = MultiAddr>,
 ) -> Vec<MultiAddr> {
-    let mut seen = HashSet::new();
-    let mut merged = Vec::new();
+    let cached = dedupe_bootstrap_peers(cached);
+    if !cached.is_empty() {
+        return cached;
+    }
+    dedupe_bootstrap_peers(configured)
+}
 
-    for addr in cached.into_iter().chain(configured) {
+fn dedupe_bootstrap_peers(addrs: impl IntoIterator<Item = MultiAddr>) -> Vec<MultiAddr> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+
+    for addr in addrs {
         if seen.insert(bootstrap_address_key(&addr)) {
-            merged.push(addr);
+            deduped.push(addr);
         }
     }
 
-    merged
+    deduped
 }
 
 /// Persist connected routing-table peers that also have Direct-tagged DHT
@@ -656,14 +667,23 @@ mod tests {
     }
 
     #[test]
-    fn merge_bootstrap_peers_prefers_cached_peer_id_address() {
+    fn select_bootstrap_peers_skips_configured_when_cache_has_entries() {
         let peer = peer_id(1);
-        let socket = SocketAddr::new(v4(203, 0, 113, 20), FIRST_PORT);
-        let cached = MultiAddr::quic(socket).with_peer_id(peer);
-        let configured = MultiAddr::quic(socket);
+        let cached =
+            MultiAddr::quic(SocketAddr::new(v4(203, 0, 113, 20), FIRST_PORT)).with_peer_id(peer);
+        let configured = MultiAddr::quic(SocketAddr::new(v4(203, 0, 113, 21), FIRST_PORT));
 
-        let merged = merge_bootstrap_peers(vec![cached.clone()], vec![configured]);
+        let selected = select_bootstrap_peers(vec![cached.clone()], vec![configured]);
 
-        assert_eq!(merged, vec![cached]);
+        assert_eq!(selected, vec![cached]);
+    }
+
+    #[test]
+    fn select_bootstrap_peers_uses_configured_when_cache_empty() {
+        let configured = MultiAddr::quic(SocketAddr::new(v4(203, 0, 113, 21), FIRST_PORT));
+
+        let selected = select_bootstrap_peers(Vec::new(), vec![configured.clone()]);
+
+        assert_eq!(selected, vec![configured]);
     }
 }
