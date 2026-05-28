@@ -4,6 +4,7 @@
 //! for the client library.
 
 use crate::data::error::{Error, Result};
+use crate::data::peer_cache;
 use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, PeerId,
 };
@@ -60,10 +61,17 @@ impl Network {
         // silently drop legitimate testnet peers that share an IP or /24.
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
-        core_config.bootstrap_peers = bootstrap_peers
-            .iter()
-            .map(|addr| MultiAddr::quic(*addr))
-            .collect();
+        let dht_k_value = core_config.dht_config.k_value;
+        let cache_path = peer_cache::cache_path();
+        let cached_bootstrap_peers = cache_path
+            .as_deref()
+            .map(|path| peer_cache::cached_bootstrap_peers(path, dht_k_value))
+            .unwrap_or_default();
+
+        core_config.bootstrap_peers = peer_cache::merge_bootstrap_peers(
+            cached_bootstrap_peers,
+            bootstrap_peers.iter().map(|addr| MultiAddr::quic(*addr)),
+        );
 
         let node = P2PNode::new(core_config)
             .await
@@ -72,6 +80,10 @@ impl Network {
         node.start()
             .await
             .map_err(|e| Error::Network(format!("Failed to start P2P node: {e}")))?;
+
+        if let Some(ref cache_path) = cache_path {
+            peer_cache::promote_connected_direct_peers(&node, cache_path, dht_k_value).await;
+        }
 
         Ok(Self {
             node: Arc::new(node),

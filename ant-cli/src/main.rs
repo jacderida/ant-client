@@ -12,8 +12,8 @@ use tracing::info;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use ant_core::data::{
-    Client, ClientConfig, CoreNodeConfig, CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork,
-    IPDiversityConfig, MultiAddr, NodeMode, P2PNode, Wallet, MAX_WIRE_MESSAGE_SIZE,
+    peer_cache, Client, ClientConfig, CoreNodeConfig, CustomNetwork, DevnetManifest, EvmAddress,
+    EvmNetwork, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, Wallet, MAX_WIRE_MESSAGE_SIZE,
 };
 use cli::{Cli, Commands};
 
@@ -147,6 +147,7 @@ async fn run() -> anyhow::Result<()> {
             // Persist whatever the controller learned this run, even
             // on error — partial signal is still better than cold next
             // time. Drop will also fire as a backstop.
+            client.save_peer_cache().await;
             client.save_adaptive_snapshot();
             result?;
         }
@@ -154,6 +155,7 @@ async fn run() -> anyhow::Result<()> {
             let needs_wallet = matches!(action, commands::data::ChunkAction::Put { .. });
             let client = build_data_client(&data_ctx, needs_wallet, json, None, None).await?;
             let result = action.execute(&client).await;
+            client.save_peer_cache().await;
             client.save_adaptive_snapshot();
             result?;
         }
@@ -204,17 +206,30 @@ async fn build_data_client(
 
     let manifest = load_manifest(ctx)?;
     let bootstrap = resolve_bootstrap_from(ctx, manifest.as_ref())?;
+    let use_peer_cache = ctx.devnet_manifest.is_none();
 
     // Connection phase with animated spinner showing peer discovery in real-time.
     // The spinner is the user-facing UI; tracing::info! provides log-level visibility
     // when `-v` is set.
     info!("Connecting to autonomi network");
     let node = if quiet {
-        create_client_node(bootstrap, ctx.allow_loopback, ctx.ipv4_only).await?
+        create_client_node(
+            &bootstrap,
+            ctx.allow_loopback,
+            ctx.ipv4_only,
+            use_peer_cache,
+        )
+        .await?
     } else {
         let spinner = progress::new_spinner("Connecting to autonomi network...");
 
-        let node = match create_client_node_raw(bootstrap, ctx.allow_loopback, ctx.ipv4_only).await
+        let node = match create_client_node_raw(
+            &bootstrap,
+            ctx.allow_loopback,
+            ctx.ipv4_only,
+            use_peer_cache,
+        )
+        .await
         {
             Ok(n) => n,
             Err(e) => {
@@ -252,6 +267,9 @@ async fn build_data_client(
         start_result.map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
 
         let peers = node.connected_peers().await.len();
+        if use_peer_cache {
+            promote_client_peer_cache(&node).await;
+        }
         info!("Connected to autonomi network ({peers} peers)");
         eprintln!("Connected to autonomi network (found {peers} peers)");
         node
@@ -324,7 +342,8 @@ async fn build_data_client(
         config.store_concurrency = c;
     }
 
-    let mut client = Client::from_node(node, config);
+    let peer_cache_path = use_peer_cache.then(peer_cache::cache_path).flatten();
+    let mut client = Client::from_node_with_peer_cache(node, config, peer_cache_path);
 
     if needs_wallet {
         let key = private_key
@@ -461,22 +480,27 @@ fn resolve_bootstrap_from(
 }
 
 async fn create_client_node(
-    bootstrap: Vec<SocketAddr>,
+    bootstrap: &[SocketAddr],
     allow_loopback: bool,
     ipv4_only: bool,
+    use_peer_cache: bool,
 ) -> anyhow::Result<Arc<P2PNode>> {
-    let node = create_client_node_raw(bootstrap, allow_loopback, ipv4_only).await?;
+    let node = create_client_node_raw(bootstrap, allow_loopback, ipv4_only, use_peer_cache).await?;
     node.start()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
+    if use_peer_cache {
+        promote_client_peer_cache(&node).await;
+    }
     Ok(node)
 }
 
 /// Create a P2P node without starting it (for spinner polling during start).
 async fn create_client_node_raw(
-    bootstrap: Vec<SocketAddr>,
+    bootstrap: &[SocketAddr],
     allow_loopback: bool,
     ipv4_only: bool,
+    use_peer_cache: bool,
 ) -> anyhow::Result<Arc<P2PNode>> {
     let mut core_config = CoreNodeConfig::builder()
         .port(0)
@@ -493,14 +517,28 @@ async fn create_client_node_raw(
     // silently drop legitimate testnet peers that share an IP or /24.
     core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
-    core_config.bootstrap_peers = bootstrap
-        .iter()
-        .map(|addr| MultiAddr::quic(*addr))
-        .collect();
+    let dht_k_value = core_config.dht_config.k_value;
+    let cache_path = use_peer_cache.then(peer_cache::cache_path).flatten();
+    let cached_bootstrap_peers = cache_path
+        .as_deref()
+        .map(|path| peer_cache::cached_bootstrap_peers(path, dht_k_value))
+        .unwrap_or_default();
+
+    core_config.bootstrap_peers = peer_cache::merge_bootstrap_peers(
+        cached_bootstrap_peers,
+        bootstrap.iter().map(|addr| MultiAddr::quic(*addr)),
+    );
 
     let node = P2PNode::new(core_config)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create P2P node: {e}"))?;
 
     Ok(Arc::new(node))
+}
+
+async fn promote_client_peer_cache(node: &P2PNode) {
+    let Some(cache_path) = peer_cache::cache_path() else {
+        return;
+    };
+    peer_cache::promote_connected_direct_peers(node, &cache_path, node.dht().k_value()).await;
 }
