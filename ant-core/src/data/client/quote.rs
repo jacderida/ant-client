@@ -3,7 +3,6 @@
 //! Handles requesting storage quotes from network nodes and
 //! managing payment for data storage.
 
-use crate::data::client::peer_cache::record_peer_outcome;
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -14,7 +13,7 @@ use ant_protocol::{
     ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// ML-DSA-65 public key length in bytes. Mirrors the same value defined as
@@ -72,9 +71,8 @@ fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
 /// - `Err(Error::AlreadyStored)` — the peer claims the chunk is already
 ///   present AND the quote it provided binds to its peer ID. Vote counts.
 /// - `Err(Error::BadQuoteBinding { .. })` — bad binding (mirrors the
-///   storer-side rejection); the peer is treated as a failure so the
-///   AIMD cache learns to deprioritize it. Outer collector counts these
-///   via the typed variant (no string matching).
+///   storer-side rejection). Outer collector counts these via the typed
+///   variant (no string matching).
 /// - `Err(Error::Serialization(...))` — the quote bytes did not deserialize.
 fn classify_quote_response(
     peer_id: &PeerId,
@@ -113,20 +111,6 @@ fn classify_quote_response(
     let price = payment_quote.price;
     debug!("Received quote from {peer_id}: price = {price}");
     Ok((payment_quote, price))
-}
-
-/// Map a per-peer quote-collection outcome to the AIMD-cache success flag.
-///
-/// `Ok(_)` and `AlreadyStored` are both *benign* outcomes — the peer is
-/// reachable and well-behaved — so we record them as successes (recording
-/// a smooth RTT). Every other variant (network/timeout/protocol/
-/// serialization, plus `BadQuoteBinding`) records as a failure so the
-/// local AIMD bootstrap cache learns to deprioritize peers that don't
-/// help us upload.
-///
-/// Pulled out of the per-peer closure for unit-testing.
-fn quote_outcome_is_success(result: &std::result::Result<(PaymentQuote, Amount), Error>) -> bool {
-    matches!(result, Ok(_) | Err(Error::AlreadyStored))
 }
 
 /// Drop quotes whose `pub_key` does not BLAKE3-hash to the peer that supplied
@@ -225,7 +209,6 @@ impl Client {
             let node_clone = node.clone();
 
             let quote_future = async move {
-                let start = Instant::now();
                 let result = send_and_await_chunk_response(
                     &node_clone,
                     &peer_id_clone,
@@ -255,13 +238,6 @@ impl Client {
                     || Error::Timeout(format!("Timeout waiting for quote from {peer_id_clone}")),
                 )
                 .await;
-
-                // Record the per-peer outcome for the AIMD bootstrap cache.
-                // See `quote_outcome_is_success` for the full classification.
-                let success = quote_outcome_is_success(&result);
-                let rtt_ms = success.then(|| start.elapsed().as_millis() as u64);
-                record_peer_outcome(&node_clone, peer_id_clone, &addrs_clone, success, rtt_ms)
-                    .await;
 
                 (peer_id_clone, addrs_clone, result)
             };
@@ -823,61 +799,6 @@ mod tests {
             matches!(result, Err(Error::Serialization(_))),
             "garbage bytes must produce a Serialization error; got {result:?}"
         );
-    }
-
-    // ============================================================
-    // AIMD attribution: every error variant is classified correctly
-    // for `record_peer_outcome` so misbehaving peers are deprioritized
-    // and reachable-but-already-storing peers stay reputable.
-    // ============================================================
-
-    #[test]
-    fn aimd_success_for_ok_result() {
-        let (_, _, quote, _) = good_quote_real();
-        let result: std::result::Result<(PaymentQuote, Amount), Error> =
-            Ok((quote.clone(), quote.price));
-        assert!(quote_outcome_is_success(&result));
-    }
-
-    #[test]
-    fn aimd_success_for_already_stored() {
-        let result: std::result::Result<(PaymentQuote, Amount), Error> = Err(Error::AlreadyStored);
-        assert!(
-            quote_outcome_is_success(&result),
-            "an honest peer reporting already_stored is a benign outcome — \
-             the peer is reachable and well-behaved, so the AIMD cache must \
-             keep them at high reputation"
-        );
-    }
-
-    #[test]
-    fn aimd_failure_for_bad_quote_binding() {
-        let result: std::result::Result<(PaymentQuote, Amount), Error> =
-            Err(Error::BadQuoteBinding {
-                peer_id: "abc123".to_string(),
-                detail: "test".to_string(),
-            });
-        assert!(
-            !quote_outcome_is_success(&result),
-            "BadQuoteBinding peers must be marked as failures so the AIMD \
-             bootstrap cache learns to stop asking them on every upload"
-        );
-    }
-
-    #[test]
-    fn aimd_failure_for_network_and_timeout_and_protocol_and_serialization() {
-        for err in [
-            Error::Network("net".to_string()),
-            Error::Timeout("to".to_string()),
-            Error::Protocol("proto".to_string()),
-            Error::Serialization("ser".to_string()),
-        ] {
-            let result: std::result::Result<(PaymentQuote, Amount), Error> = Err(err);
-            assert!(
-                !quote_outcome_is_success(&result),
-                "network-class errors must be classified as failures: {result:?}"
-            );
-        }
     }
 
     /// Cross-validate the classifier's binding verdict against the
