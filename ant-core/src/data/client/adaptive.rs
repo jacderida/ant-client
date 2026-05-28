@@ -16,9 +16,9 @@
 //! - `store`  — multi-MB chunk PUTs to a close group, expensive per op
 //! - `fetch`  — multi-MB chunk GETs from peers, asymmetric to `store`
 //!
-//! ## Algorithm
+//! ## Algorithms
 //!
-//! TCP-style AIMD with slow-start:
+//! Quote and store use TCP-style AIMD with slow-start:
 //!
 //! - **Slow-start**: starting concurrency doubles after each healthy
 //!   window until first stress signal or until the configured ceiling.
@@ -33,6 +33,12 @@
 //! observed outcomes per channel. Below `min_window_ops` outcomes the
 //! controller holds steady — too few samples to act on.
 //!
+//! Fetch uses a throughput-seeking hill climber instead. It measures
+//! bytes/sec over epochs, probes nearby concurrency values, accepts
+//! higher caps only when goodput improves materially, and accepts lower
+//! caps when goodput is effectively unchanged. Stress signals still cut
+//! concurrency immediately.
+//!
 //! ## What this is not
 //!
 //! - Not a payment-batching controller. Wave / batch sizes are
@@ -40,6 +46,7 @@
 //! - Not a peer-quality scorer. That lives in `peer_cache` and feeds
 //!   `BootstrapManager`. Outcomes flow into both, separately.
 
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -52,6 +59,38 @@ use tracing::{debug, warn};
 /// Combined with PID + nanosecond timestamp, makes collision
 /// effectively impossible across concurrent save_snapshot calls.
 static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Fetch starts at the residential-saturation floor validated in
+/// production. The hill climber will find higher caps on
+/// machines/networks that can actually use them.
+const FETCH_COLD_START_CONCURRENCY: usize = 4;
+
+/// Hill-climb probes grow/shrink by roughly 25% of the current best cap.
+const HILL_PROBE_STEP_DIVISOR: usize = 4;
+
+/// Minimum probe movement so low caps can still explore.
+const HILL_MIN_PROBE_STEP: usize = 1;
+
+/// Upward probes must improve measured goodput by at least 5%.
+const HILL_UP_PROBE_ACCEPT_RATIO: f64 = 1.05;
+
+/// Downward probes are accepted if goodput stays within 2% of the best.
+const HILL_DOWN_PROBE_ACCEPT_RATIO: f64 = 0.98;
+
+/// After rejecting a probe, wait a couple of epochs before trying again.
+const HILL_REJECT_COOLDOWN_EPOCHS: usize = 2;
+
+/// At a stable best cap, periodically probe the neighbor again so the
+/// controller can adapt when machine/network conditions change.
+const HILL_STABLE_PROBE_EPOCHS: usize = 3;
+
+/// Stress cuts fetch concurrency in half.
+const HILL_STRESS_DECREASE_DIVISOR: usize = 2;
+
+/// Fetch goodput epochs should cover complete concurrency waves. A
+/// fixed sample window can unfairly compare a full lower-cap wave with
+/// a partial higher-cap wave.
+const HILL_EPOCH_FULL_WAVES: usize = 2;
 
 /// Lock helper matching the project pattern (see `cache::ChunkCache`):
 /// poisoned mutexes still yield the inner state rather than panicking.
@@ -73,6 +112,17 @@ pub enum Outcome {
     /// controller down — it is not a capacity signal.
     ApplicationError,
 }
+
+/// Lower bound on the `fetch` channel's adaptive cap.
+///
+/// AIMD will not shrink fetch concurrency below this even under
+/// sustained timeout pressure. Specific to fetch because residential
+/// downloads exhibit a noise floor of peer-side timeouts (NAT path
+/// issues, peers in the close group not storing the chunk) that look
+/// like client saturation to the controller, causing it to fully
+/// serialize and collapse throughput. Quote and store channels keep
+/// the global `min_concurrency` floor of 1.
+const FETCH_MIN_FLOOR: usize = 4;
 
 /// Per-channel concurrency ceilings. Each channel has its own cap so
 /// that constraining one (e.g. user pinned a low store concurrency for
@@ -152,7 +202,7 @@ impl AdaptiveConfig {
         }
         self.timeout_ceiling = self.timeout_ceiling.clamp(0.0, 1.0);
         if !self.latency_inflation_factor.is_finite() || self.latency_inflation_factor <= 0.0 {
-            self.latency_inflation_factor = 2.0;
+            self.latency_inflation_factor = 4.0;
         }
         self.min_concurrency = self.min_concurrency.max(1);
         self.window_ops = self.window_ops.max(1);
@@ -173,23 +223,28 @@ impl Default for AdaptiveConfig {
             min_window_ops: 8,
             success_target: 0.95,
             timeout_ceiling: 0.10,
-            latency_inflation_factor: 2.0,
+            // p95 doubling is the normal signal on a per-chunk fetch with
+            // close-group fallback (one slow peer in a chunk's close group
+            // adds ~10s on top of a sub-second median); 2.0 mis-classified
+            // that as stress and halved the fetch cap mid-download. 4.0
+            // means p95 has to quadruple before we treat the network as
+            // degraded.
+            latency_inflation_factor: 4.0,
             latency_ewma_alpha: 0.2,
         }
     }
 }
 
 /// Suggested starting concurrency per channel for a brand-new client
-/// with no persisted state. Intentionally matches or exceeds the prior
-/// static defaults so the cold path is not slower:
+/// with no persisted state:
 ///
 /// - quote was statically 32 — start at 32.
 /// - store was statically 8 — start at 8.
-/// - fetch was previously unbounded (the entire self_encryption batch
-///   was fired at once via `FuturesUnordered`). Typical batches are
-///   small (handful of chunks); occasional larger ones are capped at
-///   `max_concurrency`. Start at 64 to keep small/medium downloads
-///   indistinguishable from the prior unbounded behavior.
+/// - fetch starts at 4, the residential-saturation floor validated
+///   after the old 64-wide cold burst saturated home links before
+///   any adaptive observations could land. The throughput hill
+///   climber then lets measured goodput justify growth on faster
+///   links.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ChannelStart {
     pub quote: usize,
@@ -202,7 +257,7 @@ impl Default for ChannelStart {
         Self {
             quote: 32,
             store: 8,
-            fetch: 64,
+            fetch: FETCH_COLD_START_CONCURRENCY,
         }
     }
 }
@@ -212,6 +267,75 @@ impl Default for ChannelStart {
 struct Sample {
     outcome: Outcome,
     latency: Duration,
+}
+
+/// Limiter adaptation strategy. Kept out of `LimiterConfig` so external
+/// config literals and persisted JSON do not grow a migration surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimiterAlgorithm {
+    Aimd,
+    ThroughputHillClimb,
+}
+
+/// Direction of an active hill-climb probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeDirection {
+    Up,
+    Down,
+}
+
+/// Epoch-local stats for the throughput hill climber.
+#[derive(Debug)]
+struct HillClimbState {
+    epoch_started: Option<Instant>,
+    epoch_samples: usize,
+    epoch_successes: usize,
+    epoch_timeouts: usize,
+    epoch_net_errors: usize,
+    epoch_bytes: u64,
+    epoch_latencies: Vec<Duration>,
+    best_goodput_per_sec: Option<f64>,
+    best_latency_p95: Option<Duration>,
+    best_concurrency: usize,
+    stable_epochs: usize,
+    cooldown_epochs: usize,
+    next_probe: ProbeDirection,
+    active_probe: Option<ProbeDirection>,
+}
+
+impl HillClimbState {
+    fn new(start: usize, epoch_capacity: usize) -> Self {
+        Self {
+            epoch_started: None,
+            epoch_samples: 0,
+            epoch_successes: 0,
+            epoch_timeouts: 0,
+            epoch_net_errors: 0,
+            epoch_bytes: 0,
+            epoch_latencies: Vec::with_capacity(epoch_capacity),
+            best_goodput_per_sec: None,
+            best_latency_p95: None,
+            best_concurrency: start,
+            stable_epochs: 0,
+            cooldown_epochs: 0,
+            next_probe: ProbeDirection::Up,
+            active_probe: None,
+        }
+    }
+
+    fn reset_epoch(&mut self) {
+        self.epoch_started = None;
+        self.epoch_samples = 0;
+        self.epoch_successes = 0;
+        self.epoch_timeouts = 0;
+        self.epoch_net_errors = 0;
+        self.epoch_bytes = 0;
+        self.epoch_latencies.clear();
+    }
+
+    fn capacity_total(&self) -> usize {
+        self.epoch_successes + self.epoch_timeouts + self.epoch_net_errors
+    }
 }
 
 /// Per-limiter configuration. Carries the shared adaptive parameters
@@ -230,6 +354,30 @@ pub struct LimiterConfig {
     pub timeout_ceiling: f64,
     pub latency_inflation_factor: f64,
     pub latency_ewma_alpha: f64,
+    /// While `current < slow_start_ramp_threshold`, a Decrease halves
+    /// the cap but does NOT permanently exit slow-start — the next
+    /// healthy window can double the cap back up. Above the threshold,
+    /// a Decrease exits slow-start and the controller transitions to
+    /// classic AIMD (+1 per healthy window).
+    ///
+    /// 0 (the default) reproduces the original behaviour: any Decrease
+    /// at any cap permanently exits slow-start. The fetch channel sets
+    /// this to its `max_concurrency` so download concurrency keeps
+    /// doubling toward the ceiling instead of crawling +1 per window —
+    /// additive growth simply cannot reach a useful cap on a
+    /// fast-but-lossy link before the file finishes. See
+    /// `AdaptiveController::new`.
+    pub slow_start_ramp_threshold: usize,
+    /// When `false`, the p95-latency-vs-baseline comparison never
+    /// triggers a Decrease (it still updates the baseline). The fetch
+    /// channel disables it because `chunk_get`'s observed latency
+    /// includes the internal retry sleep and slow retry-sweep for the
+    /// chunks that needed one, so a window with a couple of retry-path
+    /// chunks has a wildly inflated p95 that is retry variance, not
+    /// congestion. Genuine fetch congestion still surfaces as a rising
+    /// `Ok(None)` (Timeout) rate, which the timeout_ceiling check
+    /// catches.
+    pub latency_decrease_enabled: bool,
 }
 
 impl LimiterConfig {
@@ -244,6 +392,10 @@ impl LimiterConfig {
             timeout_ceiling: cfg.timeout_ceiling,
             latency_inflation_factor: cfg.latency_inflation_factor,
             latency_ewma_alpha: cfg.latency_ewma_alpha,
+            // Defaults preserve the original AIMD behaviour; the fetch
+            // channel overrides both in `AdaptiveController::new`.
+            slow_start_ramp_threshold: 0,
+            latency_decrease_enabled: true,
         }
     }
 
@@ -266,7 +418,7 @@ impl LimiterConfig {
         }
         self.timeout_ceiling = self.timeout_ceiling.clamp(0.0, 1.0);
         if !self.latency_inflation_factor.is_finite() || self.latency_inflation_factor <= 0.0 {
-            self.latency_inflation_factor = 2.0;
+            self.latency_inflation_factor = 4.0;
         }
         self.min_concurrency = self.min_concurrency.max(1);
         self.window_ops = self.window_ops.max(1);
@@ -284,6 +436,7 @@ impl LimiterConfig {
 pub struct Limiter {
     inner: Arc<Mutex<LimiterInner>>,
     config: Arc<LimiterConfig>,
+    algorithm: LimiterAlgorithm,
 }
 
 #[derive(Debug)]
@@ -307,6 +460,10 @@ struct LimiterInner {
     /// `true` once we have observed a stress signal at least once.
     /// Slow-start mode ends permanently after first stress.
     left_slow_start: bool,
+    /// Fetch-only throughput optimizer state. Present for every limiter
+    /// to keep `Limiter` cheap to clone and avoid an enum around the
+    /// whole inner struct.
+    hill: HillClimbState,
 }
 
 impl Limiter {
@@ -316,6 +473,14 @@ impl Limiter {
     /// with hostile float values (`NaN`, etc).
     #[must_use]
     pub fn new(start: usize, config: LimiterConfig) -> Self {
+        Self::new_with_algorithm(start, config, LimiterAlgorithm::Aimd)
+    }
+
+    fn new_with_algorithm(
+        start: usize,
+        config: LimiterConfig,
+        algorithm: LimiterAlgorithm,
+    ) -> Self {
         let mut config = config;
         config.sanitize();
         let clamped = start.clamp(config.min_concurrency, config.max_concurrency.max(1));
@@ -328,8 +493,10 @@ impl Limiter {
                 samples_since_decrease: 0,
                 latency_baseline: None,
                 left_slow_start: false,
+                hill: HillClimbState::new(clamped, window_cap),
             })),
             config: Arc::new(config),
+            algorithm,
         }
     }
 
@@ -344,6 +511,24 @@ impl Limiter {
     /// Record one observed operation. Updates the sliding window and
     /// re-evaluates the cap if the window is full enough.
     pub fn observe(&self, outcome: Outcome, latency: Duration) {
+        self.observe_with_bytes(outcome, latency, 0);
+    }
+
+    /// Record one observed operation with a payload byte count. Bytes
+    /// are used by the fetch hill climber; AIMD channels ignore them.
+    pub fn observe_with_bytes(&self, outcome: Outcome, latency: Duration, bytes: u64) {
+        let observed_at = Instant::now();
+        let operation_started = observed_at.checked_sub(latency).unwrap_or(observed_at);
+        self.observe_with_timing(outcome, latency, bytes, operation_started);
+    }
+
+    fn observe_with_timing(
+        &self,
+        outcome: Outcome,
+        latency: Duration,
+        bytes: u64,
+        operation_started: Instant,
+    ) {
         if !self.config.enabled {
             return;
         }
@@ -352,6 +537,17 @@ impl Limiter {
             g.window.pop_front();
         }
         g.window.push_back(Sample { outcome, latency });
+        if self.algorithm == LimiterAlgorithm::ThroughputHillClimb {
+            observe_hill_climb(
+                &mut g,
+                outcome,
+                latency,
+                bytes,
+                operation_started,
+                &self.config,
+            );
+            return;
+        }
         g.samples_since_increase = g.samples_since_increase.saturating_add(1);
         g.samples_since_decrease = g.samples_since_decrease.saturating_add(1);
         if g.window.len() < self.config.min_window_ops {
@@ -362,12 +558,27 @@ impl Limiter {
     }
 
     /// Replace the current cap with `start`, clamped. Used for warm
-    /// loads from persisted state. Marks the limiter as having
-    /// already-left-slow-start so a single healthy window doesn't
-    /// double the cap (an over-aggressive cold-start from a warm
-    /// value). Subsequent increases are +1 per healthy window.
-    /// Does not clear the sliding window — fresh observations remain
-    /// authoritative for adaptation decisions.
+    /// loads from persisted state. Does not clear the sliding window —
+    /// fresh observations remain authoritative for adaptation
+    /// decisions.
+    ///
+    /// Slow-start state after a warm load depends on the channel's
+    /// `slow_start_ramp_threshold`:
+    ///
+    /// - Default (threshold 0, i.e. quote/store): mark slow-start as
+    ///   already-left so a single healthy window doesn't *double* a
+    ///   learned warm value — an over-aggressive jump. Subsequent
+    ///   increases are +1 per healthy window.
+    /// - Protected (threshold > clamped, i.e. fetch below the ceiling):
+    ///   keep slow-start armed. This is critical for the CLI usage
+    ///   pattern where every `ant file download` is a fresh process
+    ///   that warm-starts from the snapshot: if warm_start always
+    ///   exited slow-start, the fetch cap could only ever grow
+    ///   additively from the persisted value, which cannot climb back
+    ///   to the ceiling against an intermittent Decrease trickle (the
+    ///   exact pin-at-~20 behaviour observed on a fast-but-lossy VPS).
+    ///   Keeping slow-start armed lets the cap double back toward the
+    ///   capacity the connection can actually sustain.
     pub fn warm_start(&self, start: usize) {
         let clamped = start.clamp(
             self.config.min_concurrency,
@@ -375,14 +586,26 @@ impl Limiter {
         );
         let mut g = lock(&self.inner);
         g.current = clamped;
-        g.left_slow_start = true;
+        g.left_slow_start = clamped >= self.config.slow_start_ramp_threshold;
+        g.hill = HillClimbState::new(clamped, self.config.window_ops);
     }
 
     /// Snapshot of the current cap for persistence. Cheap, lock-only.
     #[must_use]
     pub fn snapshot(&self) -> usize {
-        lock(&self.inner).current
+        let g = lock(&self.inner);
+        if self.algorithm == LimiterAlgorithm::ThroughputHillClimb {
+            g.hill.best_concurrency
+        } else {
+            g.current
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HillEpochStats {
+    goodput_per_sec: f64,
+    latency_p95: Option<Duration>,
 }
 
 /// Outcome of evaluating one window.
@@ -434,10 +657,12 @@ fn evaluate(
     }
 
     if let Some(p95) = p95_of(&mut latencies) {
-        if let Some(base) = baseline {
-            let limit = base.mul_f64(cfg.latency_inflation_factor);
-            if p95 > limit {
-                return Decision::Decrease;
+        if cfg.latency_decrease_enabled {
+            if let Some(base) = baseline {
+                let limit = base.mul_f64(cfg.latency_inflation_factor);
+                if p95 > limit {
+                    return Decision::Decrease;
+                }
             }
         }
         Decision::Increase
@@ -485,7 +710,15 @@ fn apply_decision(inner: &mut LimiterInner, decision: Decision, cfg: &LimiterCon
             if inner.samples_since_decrease < cfg.min_window_ops {
                 return;
             }
-            inner.left_slow_start = true;
+            // Below the ramp threshold we still halve (responsiveness is
+            // preserved) but keep slow-start armed, so the next healthy
+            // window can double the cap back up rather than crawling +1.
+            // Above the threshold a Decrease is the signal to settle into
+            // classic AIMD. With threshold=0 (quote/store) this is the
+            // original behaviour: any Decrease exits slow-start.
+            if inner.current >= cfg.slow_start_ramp_threshold {
+                inner.left_slow_start = true;
+            }
             let next = (inner.current / 2).max(cfg.min_concurrency);
             if next != inner.current {
                 debug!(from = inner.current, to = next, "adaptive: decrease");
@@ -535,6 +768,266 @@ fn ewma(prev: Duration, sample: Duration, alpha: f64) -> Duration {
     Duration::from_secs_f64(new_ms / 1000.0)
 }
 
+fn observe_hill_climb(
+    inner: &mut LimiterInner,
+    outcome: Outcome,
+    latency: Duration,
+    bytes: u64,
+    operation_started: Instant,
+    cfg: &LimiterConfig,
+) {
+    match inner.hill.epoch_started {
+        Some(epoch_started) if epoch_started <= operation_started => {}
+        _ => inner.hill.epoch_started = Some(operation_started),
+    }
+    inner.hill.epoch_samples = inner.hill.epoch_samples.saturating_add(1);
+    match outcome {
+        Outcome::Success => {
+            inner.hill.epoch_successes = inner.hill.epoch_successes.saturating_add(1);
+            inner.hill.epoch_bytes = inner.hill.epoch_bytes.saturating_add(bytes);
+            inner.hill.epoch_latencies.push(latency);
+        }
+        Outcome::Timeout => {
+            inner.hill.epoch_timeouts = inner.hill.epoch_timeouts.saturating_add(1);
+        }
+        Outcome::NetworkError => {
+            inner.hill.epoch_net_errors = inner.hill.epoch_net_errors.saturating_add(1);
+        }
+        Outcome::ApplicationError => {}
+    }
+
+    if hill_epoch_stressed(&inner.hill, cfg) {
+        apply_hill_stress(inner, cfg);
+        return;
+    }
+
+    if inner.hill.epoch_samples < hill_epoch_target_samples(inner.current, cfg) {
+        return;
+    }
+
+    if let Some(stats) = hill_epoch_stats(&inner.hill, cfg) {
+        apply_hill_epoch(inner, stats, cfg);
+    }
+    inner.hill.reset_epoch();
+}
+
+fn hill_epoch_target_samples(current: usize, cfg: &LimiterConfig) -> usize {
+    cfg.window_ops
+        .max(current.saturating_mul(HILL_EPOCH_FULL_WAVES))
+        .max(cfg.min_window_ops)
+}
+
+fn hill_epoch_stressed(hill: &HillClimbState, cfg: &LimiterConfig) -> bool {
+    let capacity_total = hill.capacity_total();
+    if capacity_total < cfg.min_window_ops {
+        return false;
+    }
+    let total_f = capacity_total as f64;
+    let success_rate = hill.epoch_successes as f64 / total_f;
+    let timeout_rate = hill.epoch_timeouts as f64 / total_f;
+    success_rate < cfg.success_target || timeout_rate > cfg.timeout_ceiling
+}
+
+fn hill_epoch_stats(hill: &HillClimbState, cfg: &LimiterConfig) -> Option<HillEpochStats> {
+    let capacity_total = hill.capacity_total();
+    if capacity_total < cfg.min_window_ops || hill.epoch_successes == 0 {
+        return None;
+    }
+    let mut latencies = hill.epoch_latencies.clone();
+    let latency_p95 = p95_of(&mut latencies);
+    let max_latency = latencies.iter().copied().max().unwrap_or(Duration::ZERO);
+    let wall_elapsed = hill.epoch_started.map_or(Duration::ZERO, |s| s.elapsed());
+    let elapsed = wall_elapsed.max(max_latency);
+    let elapsed_secs = elapsed.as_secs_f64();
+    if !elapsed_secs.is_finite() || elapsed_secs <= 0.0 {
+        return None;
+    }
+
+    // Unit fallback keeps direct unit tests that call `observe(Success, ..)`
+    // meaningful; real download paths report bytes.
+    let units = if hill.epoch_bytes > 0 {
+        hill.epoch_bytes as f64
+    } else {
+        hill.epoch_successes as f64
+    };
+    Some(HillEpochStats {
+        goodput_per_sec: units / elapsed_secs,
+        latency_p95,
+    })
+}
+
+fn apply_hill_stress(inner: &mut LimiterInner, cfg: &LimiterConfig) {
+    let next = (inner.current / HILL_STRESS_DECREASE_DIVISOR)
+        .max(cfg.min_concurrency)
+        .min(cfg.max_concurrency);
+    if next != inner.current {
+        debug!(
+            from = inner.current,
+            to = next,
+            "adaptive: fetch hill stress decrease"
+        );
+    }
+    inner.current = next;
+    inner.hill.best_concurrency = next;
+    inner.hill.best_goodput_per_sec = None;
+    inner.hill.best_latency_p95 = None;
+    inner.hill.stable_epochs = 0;
+    inner.hill.cooldown_epochs = HILL_REJECT_COOLDOWN_EPOCHS;
+    inner.hill.active_probe = None;
+    inner.hill.next_probe = ProbeDirection::Up;
+    inner.hill.reset_epoch();
+}
+
+fn apply_hill_epoch(inner: &mut LimiterInner, stats: HillEpochStats, cfg: &LimiterConfig) {
+    let Some(best_goodput) = inner.hill.best_goodput_per_sec else {
+        inner.hill.best_goodput_per_sec = Some(stats.goodput_per_sec);
+        inner.hill.best_latency_p95 = stats.latency_p95;
+        inner.hill.best_concurrency = inner.current;
+        probe_hill_neighbor(inner, ProbeDirection::Up, cfg);
+        return;
+    };
+
+    match inner.hill.active_probe {
+        Some(ProbeDirection::Up) => {
+            let improved = stats.goodput_per_sec >= best_goodput * HILL_UP_PROBE_ACCEPT_RATIO;
+            if improved
+                && hill_latency_acceptable(stats.latency_p95, inner.hill.best_latency_p95, cfg)
+            {
+                accept_hill_probe(inner, stats, cfg);
+                probe_hill_neighbor(inner, ProbeDirection::Up, cfg);
+            } else {
+                reject_hill_probe(inner);
+            }
+        }
+        Some(ProbeDirection::Down) => {
+            let retained = stats.goodput_per_sec >= best_goodput * HILL_DOWN_PROBE_ACCEPT_RATIO;
+            if retained
+                && hill_latency_acceptable(stats.latency_p95, inner.hill.best_latency_p95, cfg)
+            {
+                accept_hill_probe(inner, stats, cfg);
+                inner.hill.next_probe = ProbeDirection::Up;
+            } else {
+                reject_hill_probe(inner);
+            }
+        }
+        None => {
+            refresh_hill_best(inner, stats, cfg);
+            if inner.hill.cooldown_epochs > 0 {
+                inner.hill.cooldown_epochs -= 1;
+                return;
+            }
+            inner.hill.stable_epochs = inner.hill.stable_epochs.saturating_add(1);
+            if inner.hill.stable_epochs >= HILL_STABLE_PROBE_EPOCHS {
+                let direction = inner.hill.next_probe;
+                inner.hill.next_probe = match direction {
+                    ProbeDirection::Up => ProbeDirection::Down,
+                    ProbeDirection::Down => ProbeDirection::Up,
+                };
+                probe_hill_neighbor(inner, direction, cfg);
+            }
+        }
+    }
+}
+
+fn refresh_hill_best(inner: &mut LimiterInner, stats: HillEpochStats, cfg: &LimiterConfig) {
+    inner.hill.best_goodput_per_sec = Some(match inner.hill.best_goodput_per_sec {
+        Some(prev) => ewma_f64(prev, stats.goodput_per_sec, cfg.latency_ewma_alpha),
+        None => stats.goodput_per_sec,
+    });
+    if let Some(latency_p95) = stats.latency_p95 {
+        inner.hill.best_latency_p95 = Some(match inner.hill.best_latency_p95 {
+            Some(prev) => ewma(prev, latency_p95, cfg.latency_ewma_alpha),
+            None => latency_p95,
+        });
+    }
+}
+
+fn hill_latency_acceptable(
+    candidate: Option<Duration>,
+    best: Option<Duration>,
+    cfg: &LimiterConfig,
+) -> bool {
+    match (candidate, best) {
+        (Some(candidate), Some(best)) => candidate <= best.mul_f64(cfg.latency_inflation_factor),
+        _ => true,
+    }
+}
+
+fn ewma_f64(prev: f64, sample: f64, alpha: f64) -> f64 {
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        return prev;
+    };
+    let next = (1.0 - alpha) * prev + alpha * sample;
+    if next.is_finite() && next >= 0.0 {
+        next
+    } else {
+        prev
+    }
+}
+
+fn accept_hill_probe(inner: &mut LimiterInner, stats: HillEpochStats, cfg: &LimiterConfig) {
+    debug!(
+        concurrency = inner.current,
+        goodput_per_sec = stats.goodput_per_sec,
+        "adaptive: fetch hill accepted probe"
+    );
+    inner.hill.best_concurrency = inner.current;
+    inner.hill.best_goodput_per_sec = Some(stats.goodput_per_sec);
+    inner.hill.best_latency_p95 = stats.latency_p95;
+    inner.hill.active_probe = None;
+    inner.hill.cooldown_epochs = 0;
+    inner.hill.stable_epochs = 0;
+    inner.current = inner
+        .hill
+        .best_concurrency
+        .clamp(cfg.min_concurrency, cfg.max_concurrency);
+}
+
+fn reject_hill_probe(inner: &mut LimiterInner) {
+    let from = inner.current;
+    let to = inner.hill.best_concurrency;
+    let rejected_direction = inner.hill.active_probe;
+    if from != to {
+        debug!(from, to, "adaptive: fetch hill rejected probe");
+    }
+    inner.current = to;
+    inner.hill.active_probe = None;
+    if let Some(direction) = rejected_direction {
+        inner.hill.next_probe = match direction {
+            ProbeDirection::Up => ProbeDirection::Down,
+            ProbeDirection::Down => ProbeDirection::Up,
+        };
+    }
+    inner.hill.cooldown_epochs = HILL_REJECT_COOLDOWN_EPOCHS;
+    inner.hill.stable_epochs = 0;
+}
+
+fn probe_hill_neighbor(inner: &mut LimiterInner, direction: ProbeDirection, cfg: &LimiterConfig) {
+    let best = inner.hill.best_concurrency;
+    let step = (best / HILL_PROBE_STEP_DIVISOR).max(HILL_MIN_PROBE_STEP);
+    let candidate = match direction {
+        ProbeDirection::Up => best.saturating_add(step).min(cfg.max_concurrency),
+        ProbeDirection::Down => best.saturating_sub(step).max(cfg.min_concurrency),
+    };
+    if candidate == best {
+        inner.current = best;
+        inner.hill.active_probe = None;
+        inner.hill.stable_epochs = 0;
+        return;
+    }
+    debug!(
+        from = best,
+        to = candidate,
+        ?direction,
+        "adaptive: fetch hill probing"
+    );
+    inner.current = candidate;
+    inner.hill.active_probe = Some(direction);
+    inner.hill.stable_epochs = 0;
+}
+
 /// Bundle of per-channel limiters owned by the `Client`.
 #[derive(Debug, Clone)]
 pub struct AdaptiveController {
@@ -567,11 +1060,61 @@ impl AdaptiveController {
         config.sanitize();
         let quote_cfg = LimiterConfig::from_adaptive(&config, config.max.quote);
         let store_cfg = LimiterConfig::from_adaptive(&config, config.max.store);
-        let fetch_cfg = LimiterConfig::from_adaptive(&config, config.max.fetch);
+        let mut fetch_cfg = LimiterConfig::from_adaptive(&config, config.max.fetch);
+        // Lift the fetch channel's floor above the global
+        // `min_concurrency`. Reasoning is specific to download: on
+        // residential links, residual peer-side timeouts (NAT path
+        // issues, peers in the close group that don't store the chunk,
+        // peers under temporary load) continuously push the
+        // controller's timeout_rate above ceiling. A global floor of 1
+        // means the controller fully serializes chunk fetches on that
+        // noise floor and gets stuck — observed on PROD-LOCAL-DL-03
+        // where the download stayed stable but throughput collapsed to
+        // ~330 KB/s on a multi-MB/s link.
+        //
+        // 4 is the smallest floor that keeps the download from fully
+        // serializing; it also matches the validated cold-start floor.
+        // Floor `quote` and `store` separately if a corresponding
+        // pathology is identified for them; today's evidence is
+        // download-only.
+        fetch_cfg.min_concurrency = fetch_cfg.min_concurrency.max(FETCH_MIN_FLOOR);
+        // Re-establish max >= min after the bump in case the channel
+        // ceiling was somehow lower than the new floor.
+        fetch_cfg.max_concurrency = fetch_cfg.max_concurrency.max(fetch_cfg.min_concurrency);
+        // Download-specific growth/decision tuning (see the field docs
+        // on `LimiterConfig`):
+        //
+        // - Never exit slow-start. Classic AIMD additive growth (+1 per
+        //   healthy window) cannot reach a useful cap from a low base
+        //   before a multi-GB file finishes — a fast-but-lossy
+        //   connection (e.g. a VPS with a steady ~4% close-group-
+        //   exhaustion trickle) was observed stuck at cap ~13-24 across
+        //   36 files because every transient Decrease permanently
+        //   dropped it to additive growth. `usize::MAX` keeps slow-start
+        //   armed at every cap including the ceiling, so a Decrease
+        //   (e.g. 256 -> 128) still halves but the next healthy window
+        //   doubles it back. The cap therefore tracks the connection's
+        //   real capacity instead of crawling, and a single transient
+        //   Decrease near the ceiling can't re-pin the link to additive
+        //   recovery. (A threshold == max_concurrency would NOT achieve
+        //   this: `current >= threshold` is true at the ceiling, so a
+        //   Decrease there would exit slow-start.)
+        // - Disable the p95-latency Decrease. chunk_get's observed
+        //   latency includes the internal retry sleep + slow retry
+        //   sweep for chunks that needed one, so a window with a couple
+        //   of retry-path chunks shows a hugely inflated p95 that is
+        //   retry variance, not congestion. Genuine fetch congestion
+        //   still drives Decrease via the Ok(None) -> Timeout rate.
+        fetch_cfg.slow_start_ramp_threshold = usize::MAX;
+        fetch_cfg.latency_decrease_enabled = false;
         Self {
             quote: Limiter::new(start.quote, quote_cfg),
             store: Limiter::new(start.store, store_cfg),
-            fetch: Limiter::new(start.fetch, fetch_cfg),
+            fetch: Limiter::new_with_algorithm(
+                start.fetch,
+                fetch_cfg,
+                LimiterAlgorithm::ThroughputHillClimb,
+            ),
             config,
             cold_start: start,
         }
@@ -639,7 +1182,7 @@ impl Default for AdaptiveController {
 struct ObserveGuard<'a> {
     limiter: &'a Limiter,
     started: Instant,
-    outcome: Option<(Outcome, Duration)>,
+    outcome: Option<(Outcome, Duration, u64)>,
 }
 
 impl<'a> ObserveGuard<'a> {
@@ -651,14 +1194,19 @@ impl<'a> ObserveGuard<'a> {
         }
     }
     fn finish(&mut self, outcome: Outcome) {
-        self.outcome = Some((outcome, self.started.elapsed()));
+        self.finish_with_bytes(outcome, 0);
+    }
+
+    fn finish_with_bytes(&mut self, outcome: Outcome, bytes: u64) {
+        self.outcome = Some((outcome, self.started.elapsed(), bytes));
     }
 }
 
 impl Drop for ObserveGuard<'_> {
     fn drop(&mut self) {
-        if let Some((outcome, latency)) = self.outcome.take() {
-            self.limiter.observe(outcome, latency);
+        if let Some((outcome, latency, bytes)) = self.outcome.take() {
+            self.limiter
+                .observe_with_timing(outcome, latency, bytes, self.started);
         }
     }
 }
@@ -694,6 +1242,31 @@ where
     result
 }
 
+/// Byte-aware variant of [`observe_op`] for fetch paths. The success
+/// byte extractor is called only for `Ok` results; errors still carry
+/// zero bytes and are classified by the provided function.
+pub async fn observe_op_with_success_bytes<T, E, F, Fut, C, B>(
+    limiter: &Limiter,
+    op: F,
+    classify: C,
+    success_bytes: B,
+) -> Result<T, E>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    C: FnOnce(&E) -> Outcome,
+    B: FnOnce(&T) -> u64,
+{
+    let mut guard = ObserveGuard::new(limiter);
+    let result = op().await;
+    match &result {
+        Ok(value) => guard.finish_with_bytes(Outcome::Success, success_bytes(value)),
+        Err(e) => guard.finish_with_bytes(classify(e), 0),
+    }
+    drop(guard);
+    result
+}
+
 /// Process an iterator of items with a rolling scheduler whose cap
 /// is re-read from the limiter as each slot frees. Replaces the
 /// "snapshot the cap once at pipeline build" behavior of plain
@@ -718,7 +1291,6 @@ where
     F: FnMut(I::Item) -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
-    use futures::stream::{FuturesUnordered, StreamExt};
     let mut iter = items.into_iter().peekable();
     let mut in_flight: FuturesUnordered<Fut> = FuturesUnordered::new();
     let mut results = Vec::new();
@@ -800,7 +1372,6 @@ where
     if !ordered {
         return rebucketed_unordered(limiter, items, op).await;
     }
-    use futures::stream::{self, StreamExt};
     let mut iter = items.into_iter();
     let mut results = Vec::new();
     let mut pending_err: Option<E> = None;
@@ -836,15 +1407,16 @@ where
 
 /// On-disk shape for the persisted adaptive state. Versioned so we
 /// can evolve the controller without crashing on stale files — an
-/// unknown schema version simply causes a silent fallback to cold
-/// defaults.
+/// unknown future schema version simply causes a silent fallback to
+/// cold defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     schema: u32,
     channels: ChannelStart,
 }
 
-const PERSIST_SCHEMA: u32 = 1;
+const PERSIST_SCHEMA: u32 = 2;
+const PERSIST_SCHEMA_AIMD_FETCH: u32 = 1;
 const PERSIST_FILENAME: &str = "client_adaptive.json";
 
 /// Default persistence path: `<data_dir>/client_adaptive.json`. Falls
@@ -872,16 +1444,28 @@ pub fn load_snapshot(path: &Path) -> Option<ChannelStart> {
             return None;
         }
     };
-    if state.schema != PERSIST_SCHEMA {
-        debug!(
-            path = %path.display(),
-            schema = state.schema,
-            expected = PERSIST_SCHEMA,
-            "adaptive: snapshot schema mismatch, ignoring",
-        );
-        return None;
+    match state.schema {
+        PERSIST_SCHEMA => Some(state.channels),
+        PERSIST_SCHEMA_AIMD_FETCH => {
+            debug!(
+                path = %path.display(),
+                "adaptive: migrating schema-1 snapshot, preserving quote/store and resetting fetch",
+            );
+            Some(ChannelStart {
+                fetch: FETCH_COLD_START_CONCURRENCY,
+                ..state.channels
+            })
+        }
+        schema => {
+            debug!(
+                path = %path.display(),
+                schema,
+                expected = PERSIST_SCHEMA,
+                "adaptive: snapshot schema mismatch, ignoring",
+            );
+            None
+        }
     }
-    Some(state.channels)
 }
 
 /// Save a snapshot to disk atomically (write to `<path>.tmp`, then
@@ -978,6 +1562,16 @@ pub fn save_snapshot_with_timeout(path: PathBuf, channels: ChannelStart, timeout
 mod tests {
     use super::*;
 
+    const HILL_TEST_START_CAP: usize = 16;
+    const HILL_TEST_UP_PROBE_CAP: usize = 20;
+    const HILL_TEST_NEXT_UP_PROBE_CAP: usize = 25;
+    const HILL_TEST_DOWN_PROBE_CAP: usize = 12;
+    const HILL_TEST_CHUNK_BYTES: u64 = 1_000;
+    const HILL_TEST_BASE_LATENCY_MS: u64 = 100;
+    const HILL_TEST_REJECT_LATENCY_MS: u64 = 130;
+    const HILL_TEST_RETAINED_DOWN_LATENCY_MS: u64 = 75;
+    const HILL_TEST_ASYNC_LATENCY_MS: u64 = 10;
+
     fn cfg_for_tests() -> LimiterConfig {
         LimiterConfig {
             enabled: true,
@@ -989,7 +1583,45 @@ mod tests {
             timeout_ceiling: 0.2,
             latency_inflation_factor: 2.0,
             latency_ewma_alpha: 0.5,
+            slow_start_ramp_threshold: 0,
+            latency_decrease_enabled: true,
         }
+    }
+
+    fn hill_cfg_for_tests() -> LimiterConfig {
+        LimiterConfig {
+            window_ops: 4,
+            min_window_ops: 2,
+            max_concurrency: 64,
+            success_target: 0.9,
+            timeout_ceiling: 0.2,
+            ..cfg_for_tests()
+        }
+    }
+
+    fn fetch_hill_for_tests(start: usize, cfg: LimiterConfig) -> Limiter {
+        Limiter::new_with_algorithm(start, cfg, LimiterAlgorithm::ThroughputHillClimb)
+    }
+
+    fn observe_hill_success_epoch_with_latency(
+        limiter: &Limiter,
+        cfg: &LimiterConfig,
+        bytes: u64,
+        latency: Duration,
+    ) {
+        let samples = hill_epoch_target_samples(limiter.current(), cfg);
+        for _ in 0..samples {
+            limiter.observe_with_bytes(Outcome::Success, latency, bytes);
+        }
+    }
+
+    fn observe_hill_success_epoch(limiter: &Limiter, cfg: &LimiterConfig, bytes: u64) {
+        observe_hill_success_epoch_with_latency(
+            limiter,
+            cfg,
+            bytes,
+            Duration::from_millis(HILL_TEST_BASE_LATENCY_MS),
+        );
     }
 
     /// Build an `AdaptiveConfig` for tests that need to construct a
@@ -1013,6 +1645,206 @@ mod tests {
             latency_inflation_factor: l.latency_inflation_factor,
             latency_ewma_alpha: l.latency_ewma_alpha,
         }
+    }
+
+    #[test]
+    fn warm_start_keeps_slow_start_armed_below_protected_threshold() {
+        // Regression guard for the CLI multi-file pattern: each
+        // `ant file download` is a fresh process that warm-starts from
+        // the persisted snapshot. If warm_start exited slow-start, the
+        // fetch cap could only grow additively from the warm value and
+        // could never climb back to the ceiling against an intermittent
+        // Decrease trickle. A protected limiter (threshold == max) that
+        // warm-starts BELOW the ceiling must keep slow-start armed so it
+        // doubles back up.
+        let cfg = LimiterConfig {
+            max_concurrency: 256,
+            slow_start_ramp_threshold: 256,
+            latency_decrease_enabled: false,
+            ..cfg_for_tests()
+        };
+        let l = Limiter::new(64, cfg.clone());
+        l.warm_start(20);
+        assert_eq!(l.current(), 20);
+        // A single healthy window should DOUBLE (slow-start armed),
+        // proving warm_start did not exit slow-start.
+        for _ in 0..cfg.window_ops {
+            l.observe(Outcome::Success, Duration::from_millis(10));
+        }
+        assert_eq!(
+            l.current(),
+            40,
+            "protected channel must double after warm_start, not crawl +1",
+        );
+
+        // Default channel (threshold 0): warm_start exits slow-start,
+        // so the same window only adds 1.
+        let default_cfg = LimiterConfig {
+            max_concurrency: 256,
+            ..cfg_for_tests()
+        };
+        let d = Limiter::new(64, default_cfg.clone());
+        d.warm_start(20);
+        for _ in 0..default_cfg.window_ops {
+            d.observe(Outcome::Success, Duration::from_millis(10));
+        }
+        assert_eq!(
+            d.current(),
+            21,
+            "default channel must stay additive after warm_start",
+        );
+    }
+
+    #[test]
+    fn slow_start_stays_armed_at_ceiling_with_max_threshold() {
+        // Regression for the "lost protection at the ceiling" bug.
+        // threshold == usize::MAX (the fetch setting) keeps slow-start
+        // armed even when a Decrease fires at the ceiling, so the cap
+        // doubles back. threshold == max_concurrency (the buggy
+        // setting) would exit slow-start there — `current >= threshold`
+        // is true at the ceiling — and recover only additively. After
+        // identical stress-at-ceiling + recovery, the MAX-threshold
+        // limiter must end strictly higher.
+        let base = LimiterConfig {
+            max_concurrency: 256,
+            latency_decrease_enabled: false,
+            ..cfg_for_tests()
+        };
+        let fixed = Limiter::new(
+            256,
+            LimiterConfig {
+                slow_start_ramp_threshold: usize::MAX,
+                ..base.clone()
+            },
+        );
+        let buggy = Limiter::new(
+            256,
+            LimiterConfig {
+                slow_start_ramp_threshold: 256,
+                ..base.clone()
+            },
+        );
+        for l in [&fixed, &buggy] {
+            for _ in 0..base.window_ops {
+                l.observe(Outcome::Timeout, Duration::from_millis(10));
+            }
+            for _ in 0..(base.window_ops * 10) {
+                l.observe(Outcome::Success, Duration::from_millis(10));
+            }
+        }
+        assert!(
+            fixed.current() > buggy.current(),
+            "MAX-threshold limiter ({}) must out-recover the ceiling-threshold one ({})",
+            fixed.current(),
+            buggy.current(),
+        );
+    }
+
+    #[test]
+    fn protected_slow_start_recovers_faster_than_additive() {
+        // After identical stress + recovery, a limiter with slow-start
+        // protected to the ceiling (fetch behaviour) must end at a
+        // higher cap than one that exits slow-start on first Decrease
+        // (quote/store behaviour): doubling outpaces +1-per-window.
+        let base = LimiterConfig {
+            max_concurrency: 256,
+            latency_decrease_enabled: false,
+            ..cfg_for_tests()
+        };
+        let protected = Limiter::new(
+            64,
+            LimiterConfig {
+                slow_start_ramp_threshold: 256,
+                ..base.clone()
+            },
+        );
+        let unprotected = Limiter::new(
+            64,
+            LimiterConfig {
+                slow_start_ramp_threshold: 0,
+                ..base.clone()
+            },
+        );
+
+        // Identical stress: a window of timeouts forces decreases on both.
+        for l in [&protected, &unprotected] {
+            for _ in 0..base.window_ops {
+                l.observe(Outcome::Timeout, Duration::from_millis(10));
+            }
+        }
+        // Identical recovery: a long stretch of healthy windows. The
+        // protected limiter doubles each window; the unprotected one
+        // only adds 1.
+        for l in [&protected, &unprotected] {
+            for _ in 0..(base.window_ops * 10) {
+                l.observe(Outcome::Success, Duration::from_millis(10));
+            }
+        }
+        assert!(
+            protected.current() > unprotected.current(),
+            "protected slow-start ({}) should recover faster than additive ({})",
+            protected.current(),
+            unprotected.current(),
+        );
+    }
+
+    #[test]
+    fn latency_decrease_disabled_ignores_p95_inflation() {
+        // With latency_decrease_enabled=false, a window of successes
+        // whose p95 latency is far above the baseline must NOT trigger
+        // a Decrease — only success/timeout rate can. (Fetch disables
+        // this because chunk_get's observed latency is polluted by
+        // retry-path variance.)
+        let cfg = LimiterConfig {
+            max_concurrency: 256,
+            slow_start_ramp_threshold: 256,
+            latency_decrease_enabled: false,
+            ..cfg_for_tests()
+        };
+        let l = Limiter::new(16, cfg.clone());
+        // Establish a fast baseline.
+        for _ in 0..cfg.window_ops {
+            l.observe(Outcome::Success, Duration::from_millis(5));
+        }
+        let after_baseline = l.current();
+        // Now a window of successes with 100x the latency. With the
+        // latency check disabled this is still a healthy window, so the
+        // cap must not drop.
+        for _ in 0..cfg.window_ops {
+            l.observe(Outcome::Success, Duration::from_millis(500));
+        }
+        assert!(
+            l.current() >= after_baseline,
+            "latency inflation must not shrink the cap when the check is disabled: {} < {}",
+            l.current(),
+            after_baseline,
+        );
+    }
+
+    #[test]
+    fn controller_sets_fetch_channel_download_tuning() {
+        // AdaptiveController::new must apply the download-specific
+        // tuning to fetch only, leaving quote/store on classic AIMD.
+        let c = AdaptiveController::new(ChannelStart::default(), AdaptiveConfig::default());
+        assert!(
+            !c.fetch.config.latency_decrease_enabled,
+            "fetch latency-decrease must be disabled",
+        );
+        assert_eq!(
+            c.fetch.config.slow_start_ramp_threshold,
+            usize::MAX,
+            "fetch slow-start must never exit (armed at every cap incl. ceiling)",
+        );
+        assert!(
+            c.quote.config.latency_decrease_enabled,
+            "quote must keep the latency-decrease check",
+        );
+        assert_eq!(
+            c.quote.config.slow_start_ramp_threshold, 0,
+            "quote must keep classic AIMD slow-start exit",
+        );
+        assert!(c.store.config.latency_decrease_enabled);
+        assert_eq!(c.store.config.slow_start_ramp_threshold, 0);
     }
 
     #[test]
@@ -1164,7 +1996,7 @@ mod tests {
         // The test cfg has max=64 for every channel (cfg_for_tests's
         // max_concurrency=64 -> ChannelMax::{quote: 64, store: 64, fetch: 64}).
         // Pick start values <= 64 so they survive cap clamping at
-        // construction. Pick values >= cold-defaults (32/8/64) so they
+        // construction. Pick values >= cold-defaults (32/8/4) so they
         // also survive the warm-start floor.
         let c = AdaptiveController::new(
             ChannelStart {
@@ -1240,6 +2072,27 @@ mod tests {
         assert!(load_snapshot(&path).is_none());
     }
 
+    #[test]
+    fn load_schema_one_preserves_quote_store_and_resets_fetch() {
+        const LEGACY_QUOTE_CAP: usize = 48;
+        const LEGACY_STORE_CAP: usize = 24;
+        const LEGACY_FETCH_CAP: usize = 96;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.json");
+        let payload = format!(
+            r#"{{"schema":{},"channels":{{"quote":{},"store":{},"fetch":{}}}}}"#,
+            PERSIST_SCHEMA_AIMD_FETCH, LEGACY_QUOTE_CAP, LEGACY_STORE_CAP, LEGACY_FETCH_CAP,
+        );
+        std::fs::write(&path, payload).unwrap();
+
+        let loaded = load_snapshot(&path).unwrap();
+
+        assert_eq!(loaded.quote, LEGACY_QUOTE_CAP);
+        assert_eq!(loaded.store, LEGACY_STORE_CAP);
+        assert_eq!(loaded.fetch, FETCH_COLD_START_CONCURRENCY);
+    }
+
     #[tokio::test]
     async fn observe_op_records_classified_error() {
         let cfg = cfg_for_tests();
@@ -1256,10 +2109,10 @@ mod tests {
     // These exist primarily to prove the controller never silently regresses
     // upload/download throughput and never panics under hostile workloads.
 
-    /// Cold-start defaults must equal-or-exceed the prior static knobs so
-    /// the very first batch on a fresh install is no slower than before
-    /// the adaptive controller existed. Hard-coded literals are intentional
-    /// — this is a guard against future commits accidentally lowering them.
+    /// Cold-start defaults for quote/store must preserve the prior static
+    /// knobs. Fetch intentionally starts at the validated residential floor
+    /// because the throughput hill climber now has to prove that higher
+    /// fan-out improves goodput.
     #[test]
     fn no_regression_cold_start_at_least_static_defaults() {
         let s = ChannelStart::default();
@@ -1273,10 +2126,10 @@ mod tests {
             "store cold-start regressed: got {}, prior static was 8",
             s.store,
         );
-        assert!(
-            s.fetch >= 64,
-            "fetch cold-start regressed: got {}, prior static was 64 (unbounded before)",
-            s.fetch,
+        assert_eq!(
+            s.fetch, FETCH_COLD_START_CONCURRENCY,
+            "fetch cold-start changed unexpectedly: got {}, expected {}",
+            s.fetch, FETCH_COLD_START_CONCURRENCY,
         );
     }
 
@@ -1929,32 +2782,171 @@ mod tests {
         }
         assert_eq!(c.quote.current(), 4, "quote should cap at 4");
         assert_eq!(c.store.current(), 8, "store should cap at 8");
-        // fetch starts at 64, slow-start doubles each window. With
-        // 1000 successes and window_ops=32, ~31 windows fire; cap
-        // doubles 64 -> 128 -> 256 -> 512 -> 1024 = 4 doublings. Cap
-        // MUST reach the channel's max of 1024.
-        assert_eq!(
-            c.fetch.current(),
-            1024,
-            "fetch did not reach its independent max of 1024; got {}",
+        // Fetch uses the hill climber now, so it should not blindly jump to
+        // its max on success-only samples. It still must prove the fetch
+        // ceiling is independent by climbing above the quote/store caps.
+        assert!(
+            c.fetch.current() > 8 && c.fetch.current() <= 1024,
+            "fetch did not use its independent ceiling; got {}",
             c.fetch.current()
         );
     }
 
-    /// Cold-start equals the prior static defaults so the FIRST batch
-    /// on a fresh install behaves identically. Guards against future
-    /// commits silently dropping cold-start values below the prior
-    /// statics.
+    #[test]
+    fn fetch_hill_rejects_upward_probe_without_goodput_gain() {
+        let cfg = hill_cfg_for_tests();
+        let l = fetch_hill_for_tests(HILL_TEST_START_CAP, cfg.clone());
+
+        observe_hill_success_epoch(&l, &cfg, HILL_TEST_CHUNK_BYTES);
+        assert_eq!(
+            l.current(),
+            HILL_TEST_UP_PROBE_CAP,
+            "first healthy epoch should probe upward"
+        );
+
+        observe_hill_success_epoch_with_latency(
+            &l,
+            &cfg,
+            HILL_TEST_CHUNK_BYTES,
+            Duration::from_millis(HILL_TEST_REJECT_LATENCY_MS),
+        );
+        assert_eq!(
+            l.current(),
+            HILL_TEST_START_CAP,
+            "slower higher-cap wave should reject the upward probe"
+        );
+        assert_eq!(l.snapshot(), HILL_TEST_START_CAP);
+    }
+
+    #[test]
+    fn fetch_hill_accepts_upward_probe_with_goodput_gain() {
+        let cfg = hill_cfg_for_tests();
+        let l = fetch_hill_for_tests(HILL_TEST_START_CAP, cfg.clone());
+
+        observe_hill_success_epoch(&l, &cfg, HILL_TEST_CHUNK_BYTES);
+        assert_eq!(l.current(), HILL_TEST_UP_PROBE_CAP);
+
+        observe_hill_success_epoch(&l, &cfg, HILL_TEST_CHUNK_BYTES);
+        assert_eq!(
+            l.snapshot(),
+            HILL_TEST_UP_PROBE_CAP,
+            "same-size chunks at same latency should promote the higher cap"
+        );
+        assert_eq!(
+            l.current(),
+            HILL_TEST_NEXT_UP_PROBE_CAP,
+            "after accepting an upward probe, hill climber should probe higher"
+        );
+    }
+
+    #[test]
+    fn fetch_hill_accepts_lower_probe_when_goodput_is_retained() {
+        let cfg = hill_cfg_for_tests();
+        let l = fetch_hill_for_tests(HILL_TEST_START_CAP, cfg.clone());
+
+        observe_hill_success_epoch(&l, &cfg, HILL_TEST_CHUNK_BYTES);
+        observe_hill_success_epoch_with_latency(
+            &l,
+            &cfg,
+            HILL_TEST_CHUNK_BYTES,
+            Duration::from_millis(HILL_TEST_REJECT_LATENCY_MS),
+        );
+        assert_eq!(l.current(), HILL_TEST_START_CAP);
+
+        for _ in 0..(HILL_REJECT_COOLDOWN_EPOCHS + HILL_STABLE_PROBE_EPOCHS) {
+            observe_hill_success_epoch(&l, &cfg, HILL_TEST_CHUNK_BYTES);
+        }
+        assert_eq!(
+            l.current(),
+            HILL_TEST_DOWN_PROBE_CAP,
+            "stable best should eventually probe a lower cap"
+        );
+
+        observe_hill_success_epoch_with_latency(
+            &l,
+            &cfg,
+            HILL_TEST_CHUNK_BYTES,
+            Duration::from_millis(HILL_TEST_RETAINED_DOWN_LATENCY_MS),
+        );
+        assert_eq!(
+            l.snapshot(),
+            HILL_TEST_DOWN_PROBE_CAP,
+            "retained goodput at lower concurrency should become the new best"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_hill_accepts_constant_size_upward_probe_from_timed_ops() {
+        let cfg = hill_cfg_for_tests();
+        let l = fetch_hill_for_tests(HILL_TEST_START_CAP, cfg.clone());
+        let total_ops = hill_epoch_target_samples(HILL_TEST_START_CAP, &cfg)
+            + hill_epoch_target_samples(HILL_TEST_UP_PROBE_CAP, &cfg);
+        let limiter_for_ops = l.clone();
+
+        let result: std::result::Result<Vec<()>, ()> =
+            rebucketed_unordered(&l, 0..total_ops, move |_| {
+                let limiter = limiter_for_ops.clone();
+                async move {
+                    observe_op_with_success_bytes(
+                        &limiter,
+                        || async {
+                            tokio::time::sleep(Duration::from_millis(HILL_TEST_ASYNC_LATENCY_MS))
+                                .await;
+                            Ok::<(), ()>(())
+                        },
+                        |_| Outcome::NetworkError,
+                        |_| HILL_TEST_CHUNK_BYTES,
+                    )
+                    .await
+                }
+            })
+            .await;
+        result.unwrap();
+
+        assert_eq!(
+            l.snapshot(),
+            HILL_TEST_UP_PROBE_CAP,
+            "timed constant-size chunks should prove the higher cap improves goodput"
+        );
+        assert_eq!(
+            l.current(),
+            HILL_TEST_NEXT_UP_PROBE_CAP,
+            "accepted upward probe should immediately test the next cap"
+        );
+    }
+
+    #[test]
+    fn fetch_hill_stress_cuts_before_full_epoch() {
+        let cfg = LimiterConfig {
+            window_ops: 8,
+            min_window_ops: 4,
+            ..hill_cfg_for_tests()
+        };
+        let l = fetch_hill_for_tests(16, cfg.clone());
+
+        for _ in 0..cfg.min_window_ops {
+            l.observe(Outcome::Timeout, Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            l.current(),
+            8,
+            "fetch hill climber should halve on early stress"
+        );
+    }
+
+    /// Quote/store cold-starts preserve prior static defaults. Fetch starts
+    /// at the new conservative hill-climb default to avoid download
+    /// overshoot on fresh installs.
     #[test]
     fn cold_start_at_least_prior_static_defaults() {
         let cs = ChannelStart::default();
-        // Prior statics: quote=32, store=8. Fetch was effectively
-        // unbounded (the entire self_encryption batch was fired at
-        // once); we picked 64 as a conservative substitute so the
-        // first batch of <= 64 chunks is indistinguishable.
         assert!(cs.quote >= 32, "quote cold-start regressed: {}", cs.quote);
         assert!(cs.store >= 8, "store cold-start regressed: {}", cs.store);
-        assert!(cs.fetch >= 64, "fetch cold-start regressed: {}", cs.fetch);
+        assert_eq!(
+            cs.fetch, FETCH_COLD_START_CONCURRENCY,
+            "fetch cold-start changed unexpectedly"
+        );
     }
 
     /// Reviewer N-M5 guard: with the new gated-decrease semantics
