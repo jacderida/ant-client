@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.2.5"
+version = "0.2.6-rc.1"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -835,11 +835,11 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.2.6"
+version = "0.2.7-rc.1"
 dependencies = [
  "alloy",
  "ant-node",
- "ant-protocol",
+ "ant-protocol 2.1.2-rc.1",
  "anyhow",
  "async-stream",
  "axum",
@@ -858,7 +858,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rmp-serde",
- "saorsa-core",
+ "saorsa-core 0.24.4",
  "self-replace",
  "self_encryption",
  "semver 1.0.28",
@@ -897,7 +897,7 @@ version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f82e91131d0e3d143bb92525d4c24c90709fc5d83cf831bb6599d84339c81d0a"
 dependencies = [
- "ant-protocol",
+ "ant-protocol 2.1.1",
  "blake3",
  "bytes",
  "chrono",
@@ -921,7 +921,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.13.4",
  "rmp-serde",
- "saorsa-core",
+ "saorsa-core 0.24.4",
  "saorsa-pqc 0.5.1",
  "self-replace",
  "semver 1.0.28",
@@ -953,7 +953,25 @@ dependencies = [
  "hex",
  "postcard",
  "rmp-serde",
- "saorsa-core",
+ "saorsa-core 0.24.4",
+ "saorsa-pqc 0.5.1",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ant-protocol"
+version = "2.1.2-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.5.5#88ae80b6125e88342092ddec4c1a7f77b011caf4"
+dependencies = [
+ "blake3",
+ "bytes",
+ "evmlib",
+ "hex",
+ "postcard",
+ "rmp-serde",
+ "saorsa-core 0.24.5-rc.1",
  "saorsa-pqc 0.5.1",
  "serde",
  "tokio",
@@ -5254,6 +5272,37 @@ name = "saorsa-core"
 version = "0.24.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c1267928da1bcc91748c314f95f7952bc01c0359a4ac70a0b111b0386898934"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "dashmap",
+ "dirs 6.0.0",
+ "futures",
+ "hex",
+ "lru",
+ "once_cell",
+ "parking_lot",
+ "postcard",
+ "rand 0.8.6",
+ "saorsa-pqc 0.5.1",
+ "saorsa-transport",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "wyz",
+]
+
+[[package]]
+name = "saorsa-core"
+version = "0.24.5-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.5.5#7d8816996bfcf04a2a3d9069bb8c6327ac11b2af"
 dependencies = [
  "anyhow",
  "async-trait",
