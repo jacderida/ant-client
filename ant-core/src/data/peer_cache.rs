@@ -2,8 +2,9 @@
 //!
 //! Client peer IDs are ephemeral, so this cache is not keyed by distance from
 //! the local client. It remembers authenticated node peers that we have already
-//! connected to, stores only their DHT `Direct`-tagged dial addresses, and
-//! prefers retaining peers that are spread across the peer-id keyspace.
+//! connected to directly during client runs, stores their dialable channel
+//! addresses, and prefers retaining peers that are spread across the peer-id
+//! keyspace.
 
 use crate::config;
 use ant_protocol::transport::{IPDiversityConfig, MultiAddr, P2PNode, PeerId};
@@ -37,10 +38,6 @@ const BITS_PER_BYTE: u8 = 8;
 const PEER_ID_SECTOR_BITS: u8 = 4;
 const PEER_ID_SECTOR_COUNT: usize = 1 << PEER_ID_SECTOR_BITS;
 const PEER_ID_XOR_DISTANCE_BYTES: usize = 32;
-
-// saorsa-core's AddressType enum is visible through the P2P node API but is not
-// re-exported by ant-protocol. `AddressType::Direct.priority()` is 1 there.
-const DIRECT_ADDRESS_TYPE_PRIORITY: u8 = 1;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -152,50 +149,45 @@ fn dedupe_bootstrap_peers(addrs: impl IntoIterator<Item = MultiAddr>) -> Vec<Mul
     deduped
 }
 
-/// Persist connected routing-table peers that also have Direct-tagged DHT
-/// addresses.
+/// Persist authenticated peers reached directly during this client run.
 ///
-/// The successful dial may have used any address type. The cache admission
-/// condition is stricter: the peer must currently be connected and its routing
-/// table record must contain at least one Direct-tagged, dialable address.
+/// A DHT Direct tag is not required here. The cache records dialable addresses
+/// from currently live peer connections so the next client run can try peers it
+/// actually reached.
 pub async fn promote_connected_direct_peers(node: &P2PNode, cache_path: &Path, k_value: usize) {
-    let connected_peers = node
-        .connected_peers()
-        .await
-        .into_iter()
-        .collect::<HashSet<_>>();
+    let connected_peers = node.connected_peers().await;
     if connected_peers.is_empty() {
         return;
     }
 
-    let routing_table_peers = node.dht().routing_table_peers().await;
+    let connected_peer_count = connected_peers.len();
     let mut cache = ClientPeerCacheFile::load(cache_path);
     let diversity_config = cache_diversity_config();
     let now = now_epoch_secs();
     let mut changed = false;
+    let mut cacheable_peer_count = 0usize;
+    let mut cacheable_address_count = 0usize;
 
-    for dht_node in routing_table_peers {
-        if !connected_peers.contains(&dht_node.peer_id) {
+    for peer_id in connected_peers {
+        let Some(peer_info) = node.peer_info(&peer_id).await else {
+            continue;
+        };
+
+        let channel_addresses = peer_info
+            .addresses
+            .into_iter()
+            .filter(|addr| addr.dialable_socket_addr().is_some())
+            .collect::<Vec<_>>();
+        if channel_addresses.is_empty() {
             continue;
         }
 
-        let direct_addresses = dht_node
-            .typed_addresses()
-            .into_iter()
-            .filter_map(|(addr, ty)| {
-                if ty.priority() == DIRECT_ADDRESS_TYPE_PRIORITY
-                    && addr.dialable_socket_addr().is_some()
-                {
-                    Some(addr.with_peer_id(dht_node.peer_id))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        cacheable_peer_count += 1;
+        cacheable_address_count += channel_addresses.len();
 
         changed |= cache.upsert_connected_peer(
-            dht_node.peer_id,
-            direct_addresses,
+            peer_id,
+            channel_addresses,
             now,
             &diversity_config,
             k_value,
@@ -203,6 +195,15 @@ pub async fn promote_connected_direct_peers(node: &P2PNode, cache_path: &Path, k
     }
 
     if changed {
+        info!(
+            path = %cache_path.display(),
+            connected_peers = connected_peer_count,
+            cacheable_peers = cacheable_peer_count,
+            cacheable_addresses = cacheable_address_count,
+            cached_peers = cache.peers.len(),
+            direct_addresses = cache.direct_address_count(),
+            "client peer bootstrap cache updated from live connected peers",
+        );
         cache.save(cache_path);
     }
 }
