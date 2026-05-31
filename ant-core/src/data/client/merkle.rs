@@ -4,7 +4,7 @@
 //! by paying for the entire batch in a single on-chain transaction instead
 //! of one transaction per chunk.
 
-use crate::data::client::adaptive::observe_op;
+use crate::data::client::adaptive::{observe_op, Outcome};
 use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
 use crate::data::client::Client;
@@ -195,6 +195,35 @@ pub(crate) fn chunk_contents_for_upload_addresses(
     Ok(selected)
 }
 
+/// Map a per-chunk quote-collection result to its merkle-preflight stored
+/// status, degrading gracefully on transient failures.
+///
+/// The preflight only needs to answer "is this chunk already on the network?"
+/// so it can be skipped before payment — it is an optimisation, never a gate.
+/// Therefore:
+/// - `Ok(_)` (quotes gathered) → `Ok(false)`: chunk is not stored, upload it.
+/// - `Err(AlreadyStored)` → `Ok(true)`: skip it.
+/// - a transient failure (timeout / insufficient peers / transport error) →
+///   `Ok(false)`: we could not confirm, so queue it for upload rather than
+///   aborting the whole batch. Re-storing an existing chunk is idempotent.
+/// - any other (application) error → propagate; it would recur on a healthy
+///   link and is not something the preflight should paper over.
+///
+/// Without this, a single chunk's transient quote timeout failed the entire
+/// upload — fatal for forced `--merkle` uploads, which (unlike `Auto`) have no
+/// wave-batch fallback, and catastrophic for large files via the multiplicative
+/// per-chunk effect.
+fn preflight_stored_status<T>(result: Result<T>) -> Result<bool> {
+    match result {
+        Ok(_) => Ok(false),
+        Err(Error::AlreadyStored) => Ok(true),
+        Err(e) if matches!(classify_error(&e), Outcome::Timeout | Outcome::NetworkError) => {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Determine whether to use merkle payments for a given batch size.
 /// Free function — no Client needed.
 #[must_use]
@@ -361,11 +390,17 @@ impl Client {
         data_type: u32,
         data_size: u64,
     ) -> Result<bool> {
-        match self.get_store_quotes(address, data_size, data_type).await {
-            Ok(_) => Ok(false),
-            Err(Error::AlreadyStored) => Ok(true),
-            Err(e) => Err(e),
+        let result = self.get_store_quotes(address, data_size, data_type).await;
+        if let Err(e) = &result {
+            if matches!(classify_error(e), Outcome::Timeout | Outcome::NetworkError) {
+                debug!(
+                    "Merkle preflight: could not determine stored status for {} ({e}); \
+                     treating as not stored and queuing for upload",
+                    hex::encode(address)
+                );
+            }
         }
+        preflight_stored_status(result)
     }
 
     /// Phase 1 of external-signer merkle payment: prepare batch without paying.
@@ -1101,6 +1136,52 @@ mod tests {
     #[test]
     fn test_threshold_value() {
         assert_eq!(DEFAULT_MERKLE_THRESHOLD, 64);
+    }
+
+    // =========================================================================
+    // preflight_stored_status — must degrade gracefully, never abort the batch
+    // =========================================================================
+
+    #[test]
+    fn test_preflight_quotes_gathered_means_not_stored() {
+        assert!(matches!(preflight_stored_status(Ok(())), Ok(false)));
+    }
+
+    #[test]
+    fn test_preflight_already_stored_is_stored() {
+        let r: Result<()> = Err(Error::AlreadyStored);
+        assert!(matches!(preflight_stored_status(r), Ok(true)));
+    }
+
+    /// The regression: a transient quote-quorum failure during the preflight
+    /// must NOT propagate (which would abort the whole forced-merkle upload).
+    /// It is treated as "not known to be stored" → queue the chunk for upload.
+    #[test]
+    fn test_preflight_transient_quote_failure_does_not_abort() {
+        // The exact error STG-01 hit: couldn't gather a 7-quote quorum.
+        let insufficient: Result<()> =
+            Err(Error::InsufficientPeers("Got 5 quotes, need 7".to_string()));
+        assert!(
+            matches!(preflight_stored_status(insufficient), Ok(false)),
+            "insufficient-peers during preflight must degrade to not-stored, not error"
+        );
+
+        let timeout: Result<()> = Err(Error::Timeout("Timeout waiting for quote".to_string()));
+        assert!(matches!(preflight_stored_status(timeout), Ok(false)));
+
+        let network: Result<()> = Err(Error::Network("connection reset".to_string()));
+        assert!(matches!(preflight_stored_status(network), Ok(false)));
+    }
+
+    /// Genuine application errors still propagate — the preflight should not
+    /// silently swallow problems that would recur on a healthy link.
+    #[test]
+    fn test_preflight_application_error_propagates() {
+        let payment: Result<()> = Err(Error::Payment("bad payment".to_string()));
+        assert!(matches!(
+            preflight_stored_status(payment),
+            Err(Error::Payment(_))
+        ));
     }
 
     #[test]
