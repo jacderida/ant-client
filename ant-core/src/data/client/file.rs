@@ -16,8 +16,9 @@ use crate::data::client::batch::{
 };
 use crate::data::client::classify_error;
 use crate::data::client::merkle::{
-    chunk_contents_for_upload_addresses, finalize_merkle_batch, should_use_merkle,
-    MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
+    chunk_contents_for_upload_addresses, finalize_merkle_batch, merkle_store_with_retry,
+    should_use_merkle, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
+    MERKLE_RETRY_BACKOFF, MERKLE_STORE_MAX_ATTEMPTS,
 };
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -422,6 +423,25 @@ fn cached_merkle_covers_addresses(
     addresses
         .iter()
         .all(|addr| cached.proofs.contains_key(addr))
+}
+
+/// Split `addresses` into `(to_store, missing_proof)`: those that have a merkle
+/// proof in `proofs`, and those that don't.
+///
+/// A partial [`MerkleBatchPaymentResult`] (from a `pay_for_merkle_multi_batch`
+/// where a later sub-batch's payment failed) carries proofs only for the
+/// already-paid sub-batches, so unpaid chunks reach the upload path with no
+/// proof. `upload_waves_merkle` reports those as failed via
+/// [`Error::PartialUpload`] rather than aborting the whole file. Order within
+/// each group follows `addresses`.
+fn partition_addresses_by_proof(
+    addresses: &[[u8; 32]],
+    proofs: &HashMap<[u8; 32], Vec<u8>>,
+) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
+    addresses
+        .iter()
+        .copied()
+        .partition(|addr| proofs.contains_key(addr))
 }
 
 /// Check that the spill directory has enough free space for the spilled chunks.
@@ -1940,8 +1960,22 @@ impl Client {
     /// Reads one wave at a time from disk, pairs each chunk with its proof,
     /// and uploads concurrently. Peak memory: ~`UPLOAD_WAVE_SIZE × MAX_CHUNK_SIZE`.
     ///
-    /// Returns `(chunks_stored, storage_cost_atto, gas_cost_wei)`.
+    /// A chunk that is transiently short of quorum (`InsufficientPeers`) does
+    /// **not** abort the file: each wave is driven through
+    /// [`merkle_store_with_retry`], which collects such chunks and retries them
+    /// — re-collecting their close group and reusing the same proof — for up to
+    /// [`MERKLE_STORE_MAX_ATTEMPTS`] rounds with a [`MERKLE_RETRY_BACKOFF`] wait
+    /// between rounds. Retry is per-wave to preserve the streaming memory bound.
+    /// Non-quorum errors (e.g. a missing proof) stay fatal and abort immediately.
+    ///
+    /// Returns `(chunks_stored, storage_cost_atto, gas_cost_wei)` on success.
     /// Costs come from the `batch_result` which was populated during payment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PartialUpload`] if any chunk is still short of quorum
+    /// after all retries across every wave (other chunks remain stored), or the
+    /// underlying error for a non-quorum failure.
     async fn upload_waves_merkle(
         &self,
         spill: &ChunkSpill,
@@ -1952,10 +1986,63 @@ impl Client {
     ) -> Result<(usize, String, u128, WaveAggregateStats)> {
         let mut total_stored = already_stored_addresses.len();
         let total_chunks = total_stored + addresses.len();
-        let waves: Vec<&[[u8; 32]]> = addresses.chunks(UPLOAD_WAVE_SIZE).collect();
-        let wave_count = waves.len();
         let mut stored_addresses: Vec<[u8; 32]> = already_stored_addresses.to_vec();
+        let mut failed: Vec<([u8; 32], String)> = Vec::new();
         let mut agg_stats = WaveAggregateStats::default();
+
+        // Chunks without a merkle proof were never paid for: a partial
+        // `pay_for_merkle_multi_batch` result carries proofs only for the
+        // sub-batches whose on-chain payment succeeded. Such a chunk cannot be
+        // stored, so record it as failed (surfaced via `PartialUpload` once the
+        // storable chunks have been attempted) rather than letting its
+        // "missing proof" error abort the whole file and discard every other
+        // chunk's progress.
+        let (to_store, missing_proof) =
+            partition_addresses_by_proof(addresses, &batch_result.proofs);
+        if !missing_proof.is_empty() {
+            warn!(
+                "{} chunk(s) lack a merkle proof (partial payment); reporting them as failed",
+                missing_proof.len()
+            );
+            for addr in &missing_proof {
+                failed.push((
+                    *addr,
+                    format!("Missing merkle proof for chunk {}", hex::encode(addr)),
+                ));
+            }
+        }
+
+        let waves: Vec<&[[u8; 32]]> = to_store.chunks(UPLOAD_WAVE_SIZE).collect();
+        let wave_count = waves.len();
+
+        let store_limiter = self.controller().store.clone();
+
+        // Store one chunk to its (freshly re-collected) close group, reusing the
+        // chunk's merkle proof. Shared across every retry round so a converged
+        // routing table yields a fresh group. Only `InsufficientPeers` is
+        // recoverable; a missing proof stays fatal. Mirrors the external-signer
+        // path's closure in `merkle_upload_chunks`.
+        let store_one = |addr: [u8; 32], content: Bytes| {
+            let limiter = store_limiter.clone();
+            let proof_bytes = batch_result.proofs.get(&addr).cloned();
+            async move {
+                let started = std::time::Instant::now();
+                let proof = proof_bytes.ok_or_else(|| {
+                    Error::Payment(format!(
+                        "Missing merkle proof for chunk {}",
+                        hex::encode(addr)
+                    ))
+                })?;
+                let peers = self.close_group_peers(&addr).await?;
+                observe_op(
+                    &limiter,
+                    || async move { self.chunk_put_to_close_group(content, proof, &peers).await },
+                    classify_error,
+                )
+                .await
+                .map(|_| started)
+            }
+        };
 
         for (wave_idx, wave_addrs) in waves.into_iter().enumerate() {
             let wave_num = wave_idx + 1;
@@ -1966,77 +2053,80 @@ impl Client {
                 wave.len()
             );
 
-            let store_limiter = self.controller().store.clone();
             // Clamp fan-out to wave size — partial last wave should
             // not pay for extra slots (see PERF-RESULTS.md).
             let store_concurrency = store_limiter.current().min(wave.len().max(1));
-            let mut upload_stream = stream::iter(wave.into_iter().map(|(content, addr)| {
-                let proof_bytes = batch_result.proofs.get(&addr).cloned();
-                let limiter = store_limiter.clone();
-                async move {
-                    let started = std::time::Instant::now();
-                    let proof = proof_bytes.ok_or_else(|| {
-                        (
-                            addr,
-                            Error::Payment(format!(
-                                "Missing merkle proof for chunk {}",
-                                hex::encode(addr)
-                            )),
-                            started,
-                        )
-                    })?;
-                    let peers = self
-                        .close_group_peers(&addr)
-                        .await
-                        .map_err(|e| (addr, e, started))?;
-                    observe_op(
-                        &limiter,
-                        || async move {
-                            self.chunk_put_to_close_group(content, proof, &peers).await
-                        },
-                        classify_error,
-                    )
-                    .await
-                    .map(|_| (addr, started))
-                    .map_err(|e| (addr, e, started))
-                }
-            }))
-            .buffer_unordered(store_concurrency);
+            let chunks: Vec<([u8; 32], Bytes)> = wave
+                .into_iter()
+                .map(|(content, addr)| (addr, content))
+                .collect();
 
-            while let Some(result) = upload_stream.next().await {
-                match result {
-                    Ok((addr, started)) => {
-                        let duration_ms =
-                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        agg_stats.store_durations_ms.push(duration_ms);
-                        agg_stats.chunk_attempts_total =
-                            agg_stats.chunk_attempts_total.saturating_add(1);
-                        agg_stats.retries_histogram[0] =
-                            agg_stats.retries_histogram[0].saturating_add(1);
-                        stored_addresses.push(addr);
-                        total_stored += 1;
-                        info!("Stored {total_stored}/{total_chunks}");
-                        if let Some(tx) = progress {
-                            let _ = tx
-                                .send(UploadEvent::ChunkStored {
-                                    stored: total_stored,
-                                    total: total_chunks,
-                                })
-                                .await;
-                        }
-                    }
-                    Err((addr, e, _started)) => {
-                        warn!("merkle upload failed for chunk {}: {e}", hex::encode(addr));
-                        return Err(Error::PartialUpload {
-                            stored: stored_addresses,
-                            stored_count: total_stored,
-                            failed: vec![(addr, e.to_string())],
-                            failed_count: 1,
-                            total_chunks,
-                            reason: format!("merkle chunk upload failed: {e}"),
-                        });
-                    }
+            // Retry quorum-short chunks instead of aborting on the first miss.
+            // `stored_offset` is the running cumulative count so the progress
+            // events the driver emits stay correctly numbered across waves.
+            let outcome = match merkle_store_with_retry(
+                chunks,
+                store_concurrency,
+                MERKLE_STORE_MAX_ATTEMPTS,
+                MERKLE_RETRY_BACKOFF,
+                progress,
+                total_stored,
+                total_chunks,
+                &store_one,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // A non-quorum store error is fatal for the retry helper
+                    // (missing proofs were filtered out above, so this is a
+                    // genuine network/store failure, e.g. a DHT lookup error).
+                    // Surface it at the file boundary as `PartialUpload` so the
+                    // chunks already stored in earlier waves — and any
+                    // missing-proof chunks already recorded — are preserved for
+                    // resume, rather than discarded with a generic error.
+                    warn!("merkle wave {wave_num}/{wave_count} aborted: {e}");
+                    let failed_count = failed.len();
+                    return Err(Error::PartialUpload {
+                        stored: stored_addresses,
+                        stored_count: total_stored,
+                        failed,
+                        failed_count,
+                        total_chunks,
+                        reason: format!("merkle chunk store aborted: {e}"),
+                    });
                 }
+            };
+
+            // Record which of this wave's chunks landed and which exhausted
+            // their retries, so a permanently-failed chunk can surface as
+            // `PartialUpload` once the whole file has been attempted.
+            let wave_failed: HashSet<[u8; 32]> = outcome
+                .failed_addresses
+                .iter()
+                .map(|(addr, _)| *addr)
+                .collect();
+            for addr in wave_addrs {
+                if !wave_failed.contains(addr) {
+                    stored_addresses.push(*addr);
+                }
+            }
+            failed.extend(outcome.failed_addresses);
+            total_stored = outcome.stored;
+
+            // Merge per-wave stats (durations, attempts, per-round histogram).
+            agg_stats.chunk_attempts_total = agg_stats
+                .chunk_attempts_total
+                .saturating_add(outcome.stats.chunk_attempts_total);
+            agg_stats
+                .store_durations_ms
+                .extend(outcome.stats.store_durations_ms);
+            for (slot, count) in agg_stats
+                .retries_histogram
+                .iter_mut()
+                .zip(outcome.stats.retries_histogram.iter())
+            {
+                *slot = slot.saturating_add(*count);
             }
 
             if let Some(tx) = progress {
@@ -2049,6 +2139,26 @@ impl Client {
                     })
                     .await;
             }
+        }
+
+        // A file with any permanently-failed chunk is not fully stored — surface
+        // it as `PartialUpload`, but only after retries across all waves are
+        // exhausted (never silently succeed with missing chunks).
+        if !failed.is_empty() {
+            let failed_count = failed.len();
+            warn!(
+                "merkle upload incomplete: {failed_count}/{total_chunks} chunks short of quorum after retries"
+            );
+            return Err(Error::PartialUpload {
+                stored: stored_addresses,
+                stored_count: total_stored,
+                failed,
+                failed_count,
+                total_chunks,
+                reason: format!(
+                    "{failed_count} chunk(s) short of quorum after {MERKLE_STORE_MAX_ATTEMPTS} attempts"
+                ),
+            });
         }
 
         Ok((
@@ -2580,6 +2690,44 @@ mod tests {
             &cached,
             &[covered, missing]
         ));
+    }
+
+    /// A partial merkle payment leaves some addresses without a proof. Those
+    /// must be split out so `upload_waves_merkle` reports them as failed
+    /// (`PartialUpload`) instead of aborting the whole file — preserving the
+    /// addresses' original order in each group.
+    #[test]
+    fn partition_addresses_by_proof_splits_paid_and_unpaid() {
+        let paid_a = [1u8; 32];
+        let unpaid_b = [2u8; 32];
+        let paid_c = [3u8; 32];
+        let unpaid_d = [4u8; 32];
+        let proofs: HashMap<[u8; 32], Vec<u8>> =
+            HashMap::from([(paid_a, vec![0xaa]), (paid_c, vec![0xcc])]);
+
+        let (to_store, missing) =
+            partition_addresses_by_proof(&[paid_a, unpaid_b, paid_c, unpaid_d], &proofs);
+
+        assert_eq!(to_store, vec![paid_a, paid_c]);
+        assert_eq!(missing, vec![unpaid_b, unpaid_d]);
+    }
+
+    #[test]
+    fn partition_addresses_by_proof_handles_all_or_nothing() {
+        let a = [5u8; 32];
+        let b = [6u8; 32];
+
+        // No proofs at all → every address is missing.
+        let empty: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        let (to_store, missing) = partition_addresses_by_proof(&[a, b], &empty);
+        assert!(to_store.is_empty());
+        assert_eq!(missing, vec![a, b]);
+
+        // All proofs present → nothing missing.
+        let full: HashMap<[u8; 32], Vec<u8>> = HashMap::from([(a, vec![1]), (b, vec![2])]);
+        let (to_store, missing) = partition_addresses_by_proof(&[a, b], &full);
+        assert_eq!(to_store, vec![a, b]);
+        assert!(missing.is_empty());
     }
 
     #[test]

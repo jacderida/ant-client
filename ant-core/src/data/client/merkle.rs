@@ -4,7 +4,7 @@
 //! by paying for the entire batch in a single on-chain transaction instead
 //! of one transaction per chunk.
 
-use crate::data::client::adaptive::observe_op;
+use crate::data::client::adaptive::{observe_op, Outcome};
 use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
 use crate::data::client::Client;
@@ -195,6 +195,35 @@ pub(crate) fn chunk_contents_for_upload_addresses(
     Ok(selected)
 }
 
+/// Map a per-chunk quote-collection result to its merkle-preflight stored
+/// status, degrading gracefully on transient failures.
+///
+/// The preflight only needs to answer "is this chunk already on the network?"
+/// so it can be skipped before payment — it is an optimisation, never a gate.
+/// Therefore:
+/// - `Ok(_)` (quotes gathered) → `Ok(false)`: chunk is not stored, upload it.
+/// - `Err(AlreadyStored)` → `Ok(true)`: skip it.
+/// - a transient failure (timeout / insufficient peers / transport error) →
+///   `Ok(false)`: we could not confirm, so queue it for upload rather than
+///   aborting the whole batch. Re-storing an existing chunk is idempotent.
+/// - any other (application) error → propagate; it would recur on a healthy
+///   link and is not something the preflight should paper over.
+///
+/// Without this, a single chunk's transient quote timeout failed the entire
+/// upload — fatal for forced `--merkle` uploads, which (unlike `Auto`) have no
+/// wave-batch fallback, and catastrophic for large files via the multiplicative
+/// per-chunk effect.
+fn preflight_stored_status<T>(result: Result<T>) -> Result<bool> {
+    match result {
+        Ok(_) => Ok(false),
+        Err(Error::AlreadyStored) => Ok(true),
+        Err(e) if matches!(classify_error(&e), Outcome::Timeout | Outcome::NetworkError) => {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Determine whether to use merkle payments for a given batch size.
 /// Free function — no Client needed.
 #[must_use]
@@ -361,11 +390,17 @@ impl Client {
         data_type: u32,
         data_size: u64,
     ) -> Result<bool> {
-        match self.get_store_quotes(address, data_size, data_type).await {
-            Ok(_) => Ok(false),
-            Err(Error::AlreadyStored) => Ok(true),
-            Err(e) => Err(e),
+        let result = self.get_store_quotes(address, data_size, data_type).await;
+        if let Err(e) = &result {
+            if matches!(classify_error(e), Outcome::Timeout | Outcome::NetworkError) {
+                debug!(
+                    "Merkle preflight: could not determine stored status for {} ({e}); \
+                     treating as not stored and queuing for upload",
+                    hex::encode(address)
+                );
+            }
         }
+        preflight_stored_status(result)
     }
 
     /// Phase 1 of external-signer merkle payment: prepare batch without paying.
@@ -853,14 +888,14 @@ impl Client {
 /// converges within minutes. Per-chunk proofs are reusable, so retrying the
 /// same proof after a short backoff recovers these shortfalls for free — no
 /// re-payment and no new pool.
-const MERKLE_STORE_MAX_ATTEMPTS: usize = 4;
+pub(crate) const MERKLE_STORE_MAX_ATTEMPTS: usize = 4;
 
 /// Base backoff between merkle store attempts. The routing-table divergence
 /// that causes `InsufficientPeers` resolves on the order of minutes, so a short
 /// sleep between rounds is enough to land on a converged close group. The
 /// actual wait is jittered by [`MERKLE_RETRY_JITTER`] so a large failed set
 /// does not re-fire against the same divergent nodes in lockstep.
-const MERKLE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+pub(crate) const MERKLE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Fractional jitter applied to [`MERKLE_RETRY_BACKOFF`] (±10%), spreading the
 /// retry wave so convergent nodes are not all probed at the same instant.
@@ -875,6 +910,11 @@ pub(crate) struct MerkleStoreOutcome {
     pub stored: usize,
     /// Chunks still short of quorum after [`MERKLE_STORE_MAX_ATTEMPTS`].
     pub failed: usize,
+    /// Addresses (and the last error message) of chunks still short of quorum
+    /// after all retries. Empty when `failed == 0`. Used by the CLI path to
+    /// build [`crate::data::Error::PartialUpload`]; the external-signer path
+    /// only reads the counts.
+    pub failed_addresses: Vec<([u8; 32], String)>,
     /// Aggregate store stats (durations, attempts, per-round retry histogram).
     pub stats: crate::data::client::batch::WaveAggregateStats,
 }
@@ -891,7 +931,7 @@ pub(crate) struct MerkleStoreOutcome {
 /// count and the progress numbering; `total` is the whole-file total reported
 /// in progress events. Non-quorum errors abort immediately.
 #[allow(clippy::too_many_arguments)]
-async fn merkle_store_with_retry<F, Fut>(
+pub(crate) async fn merkle_store_with_retry<F, Fut>(
     chunks: Vec<([u8; 32], Bytes)>,
     store_concurrency: usize,
     max_attempts: usize,
@@ -914,7 +954,10 @@ where
 
     for attempt in 0..attempts {
         let concurrency = store_concurrency.min(pending.len().max(1)).max(1);
-        let mut next_failed: Vec<([u8; 32], Bytes)> = Vec::new();
+        // Carries the chunk body forward for the next round plus the last
+        // quorum-shortfall message, so an exhausted set can report per-chunk
+        // errors via `failed_addresses`.
+        let mut next_failed: Vec<([u8; 32], Bytes, String)> = Vec::new();
 
         let mut upload_stream = stream::iter(pending.into_iter().map(|(addr, content)| {
             let fut = store_one(addr, content.clone());
@@ -941,7 +984,9 @@ where
                         });
                     }
                 }
-                Err(Error::InsufficientPeers(_)) => next_failed.push((addr, content)),
+                Err(e @ Error::InsufficientPeers(_)) => {
+                    next_failed.push((addr, content, e.to_string()));
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -956,7 +1001,10 @@ where
                 attempt = attempt + 1,
                 "merkle chunks short of quorum, retrying after backoff"
             );
-            pending = next_failed;
+            pending = next_failed
+                .into_iter()
+                .map(|(addr, content, _msg)| (addr, content))
+                .collect();
             if backoff > Duration::ZERO {
                 // Jitter the wait (±MERKLE_RETRY_JITTER) so a large failed set
                 // does not re-probe the same divergent nodes in lockstep.
@@ -971,6 +1019,10 @@ where
             }
         } else {
             outcome.failed = next_failed.len();
+            outcome.failed_addresses = next_failed
+                .into_iter()
+                .map(|(addr, _content, msg)| (addr, msg))
+                .collect();
             break;
         }
     }
@@ -1101,6 +1153,52 @@ mod tests {
     #[test]
     fn test_threshold_value() {
         assert_eq!(DEFAULT_MERKLE_THRESHOLD, 64);
+    }
+
+    // =========================================================================
+    // preflight_stored_status — must degrade gracefully, never abort the batch
+    // =========================================================================
+
+    #[test]
+    fn test_preflight_quotes_gathered_means_not_stored() {
+        assert!(matches!(preflight_stored_status(Ok(())), Ok(false)));
+    }
+
+    #[test]
+    fn test_preflight_already_stored_is_stored() {
+        let r: Result<()> = Err(Error::AlreadyStored);
+        assert!(matches!(preflight_stored_status(r), Ok(true)));
+    }
+
+    /// The regression: a transient quote-quorum failure during the preflight
+    /// must NOT propagate (which would abort the whole forced-merkle upload).
+    /// It is treated as "not known to be stored" → queue the chunk for upload.
+    #[test]
+    fn test_preflight_transient_quote_failure_does_not_abort() {
+        // The exact error STG-01 hit: couldn't gather a 7-quote quorum.
+        let insufficient: Result<()> =
+            Err(Error::InsufficientPeers("Got 5 quotes, need 7".to_string()));
+        assert!(
+            matches!(preflight_stored_status(insufficient), Ok(false)),
+            "insufficient-peers during preflight must degrade to not-stored, not error"
+        );
+
+        let timeout: Result<()> = Err(Error::Timeout("Timeout waiting for quote".to_string()));
+        assert!(matches!(preflight_stored_status(timeout), Ok(false)));
+
+        let network: Result<()> = Err(Error::Network("connection reset".to_string()));
+        assert!(matches!(preflight_stored_status(network), Ok(false)));
+    }
+
+    /// Genuine application errors still propagate — the preflight should not
+    /// silently swallow problems that would recur on a healthy link.
+    #[test]
+    fn test_preflight_application_error_propagates() {
+        let payment: Result<()> = Err(Error::Payment("bad payment".to_string()));
+        assert!(matches!(
+            preflight_stored_status(payment),
+            Err(Error::Payment(_))
+        ));
     }
 
     #[test]
@@ -1611,5 +1709,80 @@ mod tests {
         );
         // No successes, so the histogram stays empty.
         assert_eq!(outcome.stats.retries_histogram, [0; 4]);
+    }
+
+    /// D (CLI path): when retries are exhausted, `failed_addresses` names
+    /// exactly the still-short-of-quorum chunks (with their last error message)
+    /// and excludes the ones that stored. This is what `upload_waves_merkle`
+    /// uses to build `PartialUpload`.
+    #[tokio::test]
+    async fn store_with_retry_records_failed_addresses_when_exhausted() {
+        let chunks = make_chunks(6);
+        let failing: std::collections::HashSet<[u8; 32]> =
+            chunks.iter().take(2).map(|(a, _)| *a).collect();
+        let failing_for_closure = failing.clone();
+
+        let store_one = move |addr: [u8; 32], _content: Bytes| {
+            let fail = failing_for_closure.contains(&addr);
+            async move {
+                if fail {
+                    Err(Error::InsufficientPeers("permanent shortfall".into()))
+                } else {
+                    Ok(std::time::Instant::now())
+                }
+            }
+        };
+
+        let outcome = merkle_store_with_retry(
+            chunks,
+            8,
+            MERKLE_STORE_MAX_ATTEMPTS,
+            Duration::ZERO,
+            None,
+            0,
+            6,
+            store_one,
+        )
+        .await
+        .expect("quorum shortfalls must not abort the batch");
+
+        assert_eq!(outcome.stored, 4);
+        assert_eq!(outcome.failed, 2);
+        // `failed_addresses` names exactly the failing set, no stored chunks.
+        assert_eq!(outcome.failed_addresses.len(), 2);
+        let reported: std::collections::HashSet<[u8; 32]> =
+            outcome.failed_addresses.iter().map(|(a, _)| *a).collect();
+        assert_eq!(reported, failing);
+        // Each carries a non-empty error message for the PartialUpload report.
+        for (_, msg) in &outcome.failed_addresses {
+            assert!(msg.contains("permanent shortfall"));
+        }
+    }
+
+    /// `failed_addresses` is empty when every chunk reaches quorum (no
+    /// `PartialUpload` is raised by the CLI path in that case).
+    #[tokio::test]
+    async fn store_with_retry_failed_addresses_empty_on_full_success() {
+        let chunks = make_chunks(4);
+        let total = chunks.len();
+        let store_one =
+            |_addr: [u8; 32], _content: Bytes| async move { Ok(std::time::Instant::now()) };
+
+        let outcome = merkle_store_with_retry(
+            chunks,
+            8,
+            MERKLE_STORE_MAX_ATTEMPTS,
+            Duration::ZERO,
+            None,
+            0,
+            total,
+            store_one,
+        )
+        .await
+        .expect("all chunks store");
+
+        assert_eq!(outcome.stored, total);
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.failed_addresses.is_empty());
     }
 }
