@@ -259,8 +259,28 @@ async fn handle_file_upload(
         if let Some(s) = &spinner {
             s.finish_and_clear();
         }
-        let dm_address =
-            dm_result.map_err(|e| anyhow::anyhow!("Failed to store public DataMap: {e}"))?;
+        let dm_address = match dm_result {
+            Ok(addr) => addr,
+            Err(e) => {
+                // The file body is fully stored and paid for at this point —
+                // only the public DataMap chunk failed. In JSON mode emit a
+                // parseable failure record (like the PartialUpload arm above)
+                // so callers don't report 0/0 chunks for an upload that is one
+                // chunk away from being retrievable.
+                if json_output {
+                    let reason = format!("failed to store public DataMap: {e}");
+                    let out = UploadFailureJson {
+                        error: "datamap_store_failed",
+                        total_chunks: result.chunks_stored + 1,
+                        chunks_stored: result.chunks_stored,
+                        chunks_failed: 1,
+                        reason: &reason,
+                    };
+                    println!("{}", serde_json::to_string(&out)?);
+                }
+                anyhow::bail!("Failed to store public DataMap: {e}");
+            }
+        };
 
         let hex_addr = hex::encode(dm_address);
         let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
