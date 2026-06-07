@@ -22,7 +22,7 @@ use ant_protocol::{
 use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use rand::Rng;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -1030,6 +1030,169 @@ where
     Ok(outcome)
 }
 
+/// Round delays (seconds) for the merkle upload deferred-retry pass. Round 0
+/// fires immediately — most quorum shortfalls on a healthy network are
+/// momentary close-group divergence that clears in well under a second, and
+/// serializing them behind mandatory sleeps was the single biggest throughput
+/// sink in the wave path (one bad chunk parked the other 63 slots for minutes).
+/// Only chunks that survive a round get a longer back-off before the next, so a
+/// genuinely saturated/diverged group still gets time to settle. Mirrors the
+/// download path's `DEFERRED_ROUND_DELAYS_SECS`.
+pub(crate) const DEFERRED_ROUND_DELAYS_SECS: [u64; 3] = [0, 15, 45];
+
+/// Histogram slot for a deferred-retry round's successes.
+///
+/// The wave first pass lands in slot 0; deferred round `r` (0-indexed) lands in
+/// slot `r + 1`, clamped to the last slot so the four-slot
+/// [`WaveAggregateStats::retries_histogram`] keeps recording "which round a
+/// chunk landed on" under the post-wave deferred structure.
+pub(crate) fn deferred_round_histogram_slot(round: usize, hist_len: usize) -> usize {
+    (round + 1).min(hist_len.saturating_sub(1))
+}
+
+/// Outcome of the post-wave deferred-retry pass.
+#[derive(Debug, Default)]
+pub(crate) struct DeferredRetryOutcome {
+    /// Running total of stored chunks, seeded with the `stored_offset` passed in
+    /// (i.e. everything the wave passes already stored) and advanced by each
+    /// deferred round's successes.
+    pub stored: usize,
+    /// Addresses that reached quorum during the deferred rounds (to be appended
+    /// to the file's `stored` set).
+    pub stored_addresses: Vec<[u8; 32]>,
+    /// Count of chunks still short of quorum after the final deferred round.
+    pub failed: usize,
+    /// Addresses (and last quorum-shortfall message) still short after the final
+    /// round, or — when `fatal` is set — the chunks that were still pending when
+    /// a non-quorum error aborted the pass.
+    pub failed_addresses: Vec<([u8; 32], String)>,
+    /// Set when a deferred round hit a non-quorum (fatal) store error. The
+    /// caller surfaces this as `PartialUpload` preserving everything stored so
+    /// far, mirroring the wave path's fatal handling.
+    pub fatal: Option<String>,
+    /// Aggregate store stats merged across rounds, with each round's successes
+    /// already mapped into its [`deferred_round_histogram_slot`].
+    pub stats: crate::data::client::batch::WaveAggregateStats,
+}
+
+/// Retry a file-level set of quorum-short merkle chunks in concurrent rounds.
+///
+/// This is the upload analogue of the download path's deferred-retry loop. The
+/// wave passes store each wave in a single pass (no in-wave backoff barrier) and
+/// hand their quorum-short chunks here. Each round re-reads the still-pending
+/// chunk bodies via `read_bodies` (from the spill file, so nothing is pinned in
+/// RAM), stores them concurrently at `concurrency_for(len)` via the same
+/// single-pass [`merkle_store_with_retry`] primitive, and carries survivors to
+/// the next round after a `round_delays_secs` sleep. Chunks still short after
+/// the final round become `failed_addresses`; a non-quorum store error stops the
+/// pass and is reported via `fatal` (with the still-pending chunks recorded as
+/// `failed_addresses`) so the caller can surface `PartialUpload` without
+/// discarding earlier progress.
+///
+/// `store_one`, `progress`, `stored_offset` and `total` mirror
+/// [`merkle_store_with_retry`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn merkle_deferred_retry<RB, CF, SF, Fut>(
+    deferred: Vec<([u8; 32], String)>,
+    round_delays_secs: &[u64],
+    read_bodies: RB,
+    concurrency_for: CF,
+    progress: Option<&mpsc::Sender<UploadEvent>>,
+    stored_offset: usize,
+    total: usize,
+    store_one: SF,
+) -> Result<DeferredRetryOutcome>
+where
+    RB: Fn(&[[u8; 32]]) -> Result<Vec<([u8; 32], Bytes)>>,
+    CF: Fn(usize) -> usize,
+    SF: Fn([u8; 32], Bytes) -> Fut,
+    Fut: std::future::Future<Output = Result<std::time::Instant>>,
+{
+    let mut outcome = DeferredRetryOutcome {
+        stored: stored_offset,
+        ..DeferredRetryOutcome::default()
+    };
+    let mut remaining = deferred;
+    let rounds = round_delays_secs.len();
+
+    for (round, &delay_secs) in round_delays_secs.iter().enumerate() {
+        if remaining.is_empty() {
+            break;
+        }
+        if delay_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        }
+        info!(
+            "Deferred merkle retry round {}/{}: {} chunk(s) short of quorum",
+            round + 1,
+            rounds,
+            remaining.len(),
+        );
+
+        let round_addrs: Vec<[u8; 32]> = remaining.iter().map(|(addr, _)| *addr).collect();
+        // Re-read bodies from the spill at retry time (not pinned in RAM).
+        let chunks = read_bodies(&round_addrs)?;
+        let concurrency = concurrency_for(round_addrs.len());
+
+        let round_outcome = match merkle_store_with_retry(
+            chunks,
+            concurrency,
+            1,
+            Duration::ZERO,
+            progress,
+            outcome.stored,
+            total,
+            &store_one,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                // A non-quorum error is fatal, exactly as in the wave path.
+                // Hand back everything still pending so the caller can build a
+                // `PartialUpload` that preserves earlier-round successes.
+                outcome.fatal = Some(e.to_string());
+                outcome.failed_addresses = remaining;
+                outcome.failed = outcome.failed_addresses.len();
+                return Ok(outcome);
+            }
+        };
+
+        let round_failed: HashSet<[u8; 32]> = round_outcome
+            .failed_addresses
+            .iter()
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in &round_addrs {
+            if !round_failed.contains(addr) {
+                outcome.stored_addresses.push(*addr);
+            }
+        }
+        outcome.stored = round_outcome.stored;
+
+        // Merge stats; a single-pass round records every success in its own
+        // histogram slot 0, so redirect that count to this round's slot.
+        outcome.stats.chunk_attempts_total = outcome
+            .stats
+            .chunk_attempts_total
+            .saturating_add(round_outcome.stats.chunk_attempts_total);
+        outcome
+            .stats
+            .store_durations_ms
+            .extend(round_outcome.stats.store_durations_ms);
+        let landed: usize = round_outcome.stats.retries_histogram.iter().sum();
+        let slot = deferred_round_histogram_slot(round, outcome.stats.retries_histogram.len());
+        outcome.stats.retries_histogram[slot] =
+            outcome.stats.retries_histogram[slot].saturating_add(landed);
+
+        remaining = round_outcome.failed_addresses;
+    }
+
+    outcome.failed = remaining.len();
+    outcome.failed_addresses = remaining;
+    Ok(outcome)
+}
+
 /// Phase 2 of external-signer merkle payment: generate proofs from winner.
 ///
 /// Takes the prepared batch and the winner pool hash returned by the
@@ -1784,5 +1947,203 @@ mod tests {
         assert_eq!(outcome.stored, total);
         assert_eq!(outcome.failed, 0);
         assert!(outcome.failed_addresses.is_empty());
+    }
+
+    // =========================================================================
+    // merkle_deferred_retry: download-style concurrent post-wave retry (V2-466)
+    // =========================================================================
+
+    /// The histogram slot mapping: the wave first pass is slot 0; deferred
+    /// round `r` is slot `r + 1`, clamped to the last slot.
+    #[test]
+    fn deferred_round_histogram_slot_maps_and_clamps() {
+        assert_eq!(deferred_round_histogram_slot(0, 4), 1);
+        assert_eq!(deferred_round_histogram_slot(1, 4), 2);
+        assert_eq!(deferred_round_histogram_slot(2, 4), 3);
+        // Beyond the histogram width, clamp to the final slot.
+        assert_eq!(deferred_round_histogram_slot(3, 4), 3);
+        assert_eq!(deferred_round_histogram_slot(9, 4), 3);
+    }
+
+    /// Re-read bodies for a deferred set from a fake "spill": every requested
+    /// address is returned paired with a stub body. Zero delays so tests do not
+    /// actually sleep between rounds.
+    fn fake_read_bodies(addrs: &[[u8; 32]]) -> Result<Vec<([u8; 32], Bytes)>> {
+        Ok(addrs
+            .iter()
+            .map(|a| (*a, Bytes::from_static(b"deferred-body")))
+            .collect())
+    }
+
+    fn deferred_set(count: usize) -> Vec<([u8; 32], String)> {
+        make_test_addresses(count)
+            .into_iter()
+            .map(|addr| (addr, "short of quorum".to_string()))
+            .collect()
+    }
+
+    /// A chunk that is quorum-short on early rounds but succeeds on a later
+    /// round is stored exactly once, recorded in that round's histogram slot,
+    /// and reported with no failures.
+    #[tokio::test]
+    async fn deferred_retry_succeeds_on_a_later_round() {
+        let deferred = deferred_set(3);
+        // Each chunk fails its first attempt (round 0) and succeeds the second
+        // (round 1 → histogram slot 2).
+        let attempts = Arc::new(Mutex::new(HashMap::<[u8; 32], usize>::new()));
+        let attempts_for_closure = attempts.clone();
+        let store_one = move |addr: [u8; 32], _content: Bytes| {
+            let attempts = attempts_for_closure.clone();
+            async move {
+                let n = {
+                    let mut map = attempts.lock().unwrap();
+                    let e = map.entry(addr).or_insert(0);
+                    *e += 1;
+                    *e
+                };
+                if n < 2 {
+                    Err(Error::InsufficientPeers("still short".into()))
+                } else {
+                    Ok(std::time::Instant::now())
+                }
+            }
+        };
+
+        let outcome = merkle_deferred_retry(
+            deferred,
+            &[0, 0, 0],
+            fake_read_bodies,
+            |n: usize| n.max(1),
+            None,
+            0,
+            3,
+            store_one,
+        )
+        .await
+        .expect("deferred retry must not abort on quorum shortfalls");
+
+        assert_eq!(outcome.stored, 3, "all three land by round 1");
+        assert_eq!(outcome.stored_addresses.len(), 3);
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.failed_addresses.is_empty());
+        assert!(outcome.fatal.is_none());
+        // Round 1 → slot 2; round 0 (slot 1) saw zero successes.
+        assert_eq!(outcome.stats.retries_histogram[1], 0);
+        assert_eq!(outcome.stats.retries_histogram[2], 3);
+        // Each chunk attempted twice: one failed round + one success round.
+        assert_eq!(outcome.stats.chunk_attempts_total, 6);
+    }
+
+    /// Chunks still short of quorum after the final deferred round become
+    /// `failed`, not silently dropped, and no fatal error is set.
+    #[tokio::test]
+    async fn deferred_retry_leftovers_become_failed() {
+        let deferred = deferred_set(2);
+        let store_one = |_addr: [u8; 32], _content: Bytes| async move {
+            Err::<std::time::Instant, _>(Error::InsufficientPeers("always short".into()))
+        };
+
+        let outcome = merkle_deferred_retry(
+            deferred,
+            &[0, 0, 0],
+            fake_read_bodies,
+            |n: usize| n.max(1),
+            None,
+            0,
+            2,
+            store_one,
+        )
+        .await
+        .expect("exhausted retries report failures, not an error");
+
+        assert_eq!(outcome.stored, 0);
+        assert!(outcome.stored_addresses.is_empty());
+        assert_eq!(outcome.failed, 2);
+        assert_eq!(outcome.failed_addresses.len(), 2);
+        assert!(outcome.fatal.is_none());
+        // Three rounds × two chunks, all failing.
+        assert_eq!(outcome.stats.chunk_attempts_total, 6);
+    }
+
+    /// A non-quorum (fatal) error during a deferred round stops the pass, is
+    /// surfaced via `fatal`, and preserves an earlier round's success in
+    /// `stored`/`stored_addresses` while the still-pending chunk is reported as
+    /// failed.
+    #[tokio::test]
+    async fn deferred_retry_fatal_error_preserves_prior_progress() {
+        let addrs = make_test_addresses(2);
+        let good = addrs[0];
+        let bad = addrs[1];
+        let deferred = vec![(good, "short".to_string()), (bad, "short".to_string())];
+
+        // `good` succeeds on round 0; `bad` is quorum-short on round 0, then
+        // hits a fatal Payment error on round 1.
+        let attempts = Arc::new(Mutex::new(HashMap::<[u8; 32], usize>::new()));
+        let attempts_for_closure = attempts.clone();
+        let store_one = move |addr: [u8; 32], _content: Bytes| {
+            let attempts = attempts_for_closure.clone();
+            async move {
+                let n = {
+                    let mut map = attempts.lock().unwrap();
+                    let e = map.entry(addr).or_insert(0);
+                    *e += 1;
+                    *e
+                };
+                if addr == good {
+                    Ok(std::time::Instant::now())
+                } else if n == 1 {
+                    Err(Error::InsufficientPeers("short".into()))
+                } else {
+                    Err(Error::Payment("fatal on retry".into()))
+                }
+            }
+        };
+
+        let outcome = merkle_deferred_retry(
+            deferred,
+            &[0, 0, 0],
+            fake_read_bodies,
+            |n: usize| n.max(1),
+            None,
+            0,
+            2,
+            store_one,
+        )
+        .await
+        .expect("a fatal round error is reported via `fatal`, not as Err");
+
+        assert!(outcome.fatal.is_some(), "fatal error must be captured");
+        assert_eq!(outcome.stored, 1, "round-0 success preserved");
+        assert_eq!(outcome.stored_addresses, vec![good]);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.failed_addresses.len(), 1);
+        assert_eq!(outcome.failed_addresses[0].0, bad);
+    }
+
+    /// An empty deferred set is a no-op: no rounds run, nothing stored or failed.
+    #[tokio::test]
+    async fn deferred_retry_empty_set_is_a_noop() {
+        let store_one = |_addr: [u8; 32], _content: Bytes| async move {
+            Err::<std::time::Instant, _>(Error::InsufficientPeers("unused".into()))
+        };
+
+        let outcome = merkle_deferred_retry(
+            Vec::new(),
+            &DEFERRED_ROUND_DELAYS_SECS,
+            fake_read_bodies,
+            |n: usize| n.max(1),
+            None,
+            7,
+            7,
+            store_one,
+        )
+        .await
+        .expect("empty deferred set is a no-op");
+
+        assert_eq!(outcome.stored, 7, "stored_offset carried through unchanged");
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.stored_addresses.is_empty());
+        assert!(outcome.failed_addresses.is_empty());
+        assert!(outcome.fatal.is_none());
     }
 }
