@@ -334,21 +334,6 @@ async fn build_data_client(
         let wallet = create_wallet(key, network)?;
         info!("Wallet configured for EVM payments");
         client = client.with_wallet(wallet);
-
-        if !quiet {
-            info!("Approving token spend");
-            let spinner = progress::new_spinner("Approving token spend...");
-            let approval = client.approve_token_spend().await;
-            spinner.finish_and_clear();
-            approval.map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
-            info!("Token spend approved");
-            eprintln!("Token spend approved");
-        } else {
-            client
-                .approve_token_spend()
-                .await
-                .map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
-        }
     }
 
     Ok(client)
