@@ -61,9 +61,11 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # Must track the same `saorsa-core` / `ant-protocol` line as the
 # `ant-protocol` pin above — a version skew pulls a second copy of
 # `saorsa-core` into the graph and makes `ant_node`'s and `ant_protocol`'s
-# `MultiAddr` mutually incompatible in `node/devnet.rs`. ant-node 0.11.6
-# tracks saorsa-core 0.24.5 / ant-protocol 2.1.2, matching the pins here.
-ant-node = { version = "0.11.6", optional = true }
+# `MultiAddr` mutually incompatible in `node/devnet.rs`. During an RC the
+# runtime `ant-protocol` pin above points at a git rc branch, so this
+# ant-node must point at the matching ant-node rc branch (carrying the same
+# saorsa-core / ant-protocol lineage) rather than a released version.
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", branch = "rc-2026.6.2", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -91,7 +93,7 @@ devnet = ["dep:ant-node"]
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = "0.11.6"
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", branch = "rc-2026.6.2" }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
@@ -101,9 +103,9 @@ rmp-serde = "1"
 # which populates a cache via `add_peer_trusted` (bypasses Sybil rate limits)
 # and then verifies reload after save. Test-only — no runtime version-pin
 # concern. Tracks ant-node's transitive saorsa-core dep, so it must match
-# the version ant-node 0.11.6 pins to avoid a duplicate saorsa-core in
-# the graph.
-saorsa-core = "0.24.5"
+# the ant-node rc branch's saorsa-core lineage to avoid a duplicate
+# saorsa-core in the graph.
+saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core", branch = "rc-2026.6.2" }
 
 [[example]]
 name = "start-local-devnet"

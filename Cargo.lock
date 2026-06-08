@@ -839,7 +839,7 @@ version = "0.2.8-rc.1"
 dependencies = [
  "alloy",
  "ant-node",
- "ant-protocol 2.1.3-rc.1",
+ "ant-protocol",
  "anyhow",
  "async-stream",
  "axum",
@@ -858,7 +858,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rmp-serde",
- "saorsa-core 0.24.5",
+ "saorsa-core",
  "self-replace",
  "self_encryption",
  "semver 1.0.28",
@@ -893,11 +893,10 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.11.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7b9db385f7dc01a18dd6921f54999e03de4d11fcbb1493493e86a062ab75b5e"
+version = "0.12.1-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.6.2#8f941b84751b1f3743be7ea915ab269378063e2d"
 dependencies = [
- "ant-protocol 2.1.2",
+ "ant-protocol",
  "blake3",
  "bytes",
  "chrono",
@@ -921,7 +920,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.13.4",
  "rmp-serde",
- "saorsa-core 0.24.5",
+ "saorsa-core",
  "saorsa-pqc 0.5.1",
  "self-replace",
  "semver 1.0.28",
@@ -943,25 +942,6 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e950d12c9f6d08d0ea560573729d93f15e105d53b669defa682f5e6f92da4b1"
-dependencies = [
- "blake3",
- "bytes",
- "evmlib",
- "hex",
- "postcard",
- "rmp-serde",
- "saorsa-core 0.24.5",
- "saorsa-pqc 0.5.1",
- "serde",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ant-protocol"
 version = "2.1.3-rc.1"
 source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.6.2#053be60ced998c6a4c0833b4560f1ddb89a86514"
 dependencies = [
@@ -971,7 +951,7 @@ dependencies = [
  "hex",
  "postcard",
  "rmp-serde",
- "saorsa-core 0.25.0-rc.1",
+ "saorsa-core",
  "saorsa-pqc 0.5.1",
  "serde",
  "tokio",
@@ -1848,7 +1828,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2344,7 +2324,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2543,7 +2523,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3280,7 +3260,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -3961,7 +3941,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4629,7 +4609,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.4",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4642,7 +4622,7 @@ dependencies = [
  "libc",
  "socket2 0.6.4",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5105,7 +5085,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5172,7 +5152,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5193,7 +5173,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5269,38 +5249,6 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.24.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c0f8952fc5a4d37eb0bca7de0740830f40347f9da663effde3ddd6b68bcd2fb"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "bytes",
- "dashmap",
- "dirs 6.0.0",
- "futures",
- "hex",
- "lru",
- "once_cell",
- "parking_lot",
- "postcard",
- "rand 0.8.6",
- "saorsa-pqc 0.5.1",
- "saorsa-transport 0.34.2",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "wyz",
-]
-
-[[package]]
-name = "saorsa-core"
 version = "0.25.0-rc.1"
 source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.2#088c3552bf7257ee10b5a670cd4990d1c0e7b8af"
 dependencies = [
@@ -5318,7 +5266,7 @@ dependencies = [
  "postcard",
  "rand 0.8.6",
  "saorsa-pqc 0.5.1",
- "saorsa-transport 0.35.0-rc.1",
+ "saorsa-transport",
  "serde",
  "serde_json",
  "tempfile",
@@ -5410,66 +5358,6 @@ dependencies = [
  "tokio",
  "tracing",
  "wide",
- "zeroize",
-]
-
-[[package]]
-name = "saorsa-transport"
-version = "0.34.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "852400712537856ab6fec5293be4290daf0130df0dbcb249a6e8280f9257665f"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-lc-rs",
- "blake3",
- "bytes",
- "chrono",
- "clap",
- "core-foundation 0.9.4",
- "dashmap",
- "dirs 5.0.1",
- "enum_dispatch",
- "futures-util",
- "hex",
- "igd-next",
- "indexmap 2.14.0",
- "keyring",
- "libc",
- "lru-slab",
- "nix",
- "once_cell",
- "parking_lot",
- "pin-project-lite",
- "quinn-udp 0.6.1",
- "rand 0.8.6",
- "rcgen",
- "regex",
- "reqwest 0.13.4",
- "rustc-hash",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "rustls-platform-verifier 0.6.2",
- "rustls-post-quantum",
- "saorsa-pqc 0.4.2",
- "serde",
- "serde_json",
- "serde_yaml",
- "slab",
- "socket2 0.5.10",
- "system-configuration 0.6.1",
- "thiserror 2.0.18",
- "time",
- "tinyvec",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "unicode-width",
- "uuid",
- "windows 0.58.0",
- "x25519-dalek",
  "zeroize",
 ]
 
@@ -6226,7 +6114,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7045,7 +6933,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7100,19 +6988,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement 0.60.2",
- "windows-interface 0.59.3",
- "windows-link",
- "windows-result 0.4.1",
- "windows-strings 0.5.1",
-]
-
-[[package]]
 name = "windows-implement"
 version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7135,17 +7010,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-implement"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "windows-interface"
 version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7161,17 +7025,6 @@ name = "windows-interface"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "053c4c462dc91d3b1504c6fe5a726dd15e216ba718e84a0e46a88fbe5ded3515"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "windows-interface"
-version = "0.59.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7279,15 +7132,6 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
-dependencies = [
- "windows-targets 0.53.5",
-]
-
-[[package]]
-name = "windows-sys"
 version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
@@ -7334,28 +7178,11 @@ dependencies = [
  "windows_aarch64_gnullvm 0.52.6",
  "windows_aarch64_msvc 0.52.6",
  "windows_i686_gnu 0.52.6",
- "windows_i686_gnullvm 0.52.6",
+ "windows_i686_gnullvm",
  "windows_i686_msvc 0.52.6",
  "windows_x86_64_gnu 0.52.6",
  "windows_x86_64_gnullvm 0.52.6",
  "windows_x86_64_msvc 0.52.6",
-]
-
-[[package]]
-name = "windows-targets"
-version = "0.53.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4945f9f551b88e0d65f3db0bc25c33b8acea4d9e41163edf90dcd0b19f9069f3"
-dependencies = [
- "windows-link",
- "windows_aarch64_gnullvm 0.53.1",
- "windows_aarch64_msvc 0.53.1",
- "windows_i686_gnu 0.53.1",
- "windows_i686_gnullvm 0.53.1",
- "windows_i686_msvc 0.53.1",
- "windows_x86_64_gnu 0.53.1",
- "windows_x86_64_gnullvm 0.53.1",
- "windows_x86_64_msvc 0.53.1",
 ]
 
 [[package]]
@@ -7377,12 +7204,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
 
 [[package]]
-name = "windows_aarch64_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9d8416fa8b42f5c947f8482c43e7d89e73a173cead56d044f6a56104a6d1b53"
-
-[[package]]
 name = "windows_aarch64_msvc"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7399,12 +7220,6 @@ name = "windows_aarch64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
-
-[[package]]
-name = "windows_aarch64_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
 
 [[package]]
 name = "windows_i686_gnu"
@@ -7425,22 +7240,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e9b5ad5ab802e97eb8e295ac6720e509ee4c243f69d781394014ebfe8bbfa0b"
 
 [[package]]
-name = "windows_i686_gnu"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "960e6da069d81e09becb0ca57a65220ddff016ff2d6af6a223cf372a506593a3"
-
-[[package]]
 name = "windows_i686_gnullvm"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66"
-
-[[package]]
-name = "windows_i686_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa7359d10048f68ab8b09fa71c3daccfb0e9b559aed648a8f95469c27057180c"
 
 [[package]]
 name = "windows_i686_msvc"
@@ -7461,12 +7264,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
 
 [[package]]
-name = "windows_i686_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e7ac75179f18232fe9c285163565a57ef8d3c89254a30685b57d83a38d326c2"
-
-[[package]]
 name = "windows_x86_64_gnu"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7483,12 +7280,6 @@ name = "windows_x86_64_gnu"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78"
-
-[[package]]
-name = "windows_x86_64_gnu"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c3842cdd74a865a8066ab39c8a7a473c0778a3f29370b5fd6b4b9aa7df4a499"
 
 [[package]]
 name = "windows_x86_64_gnullvm"
@@ -7509,12 +7300,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
 
 [[package]]
-name = "windows_x86_64_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ffa179e2d07eee8ad8f57493436566c7cc30ac536a3379fdf008f47f6bb7ae1"
-
-[[package]]
 name = "windows_x86_64_msvc"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7531,12 +7316,6 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
-
-[[package]]
-name = "windows_x86_64_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winnow"
