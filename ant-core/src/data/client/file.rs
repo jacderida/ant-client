@@ -2331,7 +2331,6 @@ impl Client {
     ///
     /// Returns an error if any chunk cannot be retrieved, decryption fails,
     /// or the file cannot be written.
-    #[allow(clippy::unused_async)]
     pub async fn file_download_from_closest_peers(
         &self,
         data_map: &DataMap,
@@ -2340,31 +2339,6 @@ impl Client {
     ) -> Result<u64> {
         self.file_download_with_progress_using_peer_count(data_map, output, None, peer_count.get())
             .await
-    }
-
-    /// Download and decrypt a file with progress events.
-    ///
-    /// Same as [`Client::file_download`] but sends [`DownloadEvent`]s for UI feedback.
-    ///
-    /// Progress reporting:
-    /// 1. Resolves hierarchical DataMaps to the root level first (reports as
-    ///    `ChunksFetched` with `total: 0` during resolution)
-    /// 2. Once the root DataMap is known, sends `total_chunks` with accurate count
-    /// 3. Fetches data chunks with accurate `fetched/total` progress
-    #[allow(clippy::unused_async)]
-    pub async fn file_download_with_progress(
-        &self,
-        data_map: &DataMap,
-        output: &Path,
-        progress: Option<mpsc::Sender<DownloadEvent>>,
-    ) -> Result<u64> {
-        self.file_download_with_progress_using_peer_count(
-            data_map,
-            output,
-            progress,
-            self.config().close_group_size,
-        )
-        .await
     }
 
     /// Download and decrypt a file with progress events, trying the
@@ -2377,7 +2351,6 @@ impl Client {
     ///
     /// Returns an error if any chunk cannot be retrieved, decryption fails,
     /// or the file cannot be written.
-    #[allow(clippy::unused_async)]
     pub async fn file_download_with_progress_from_closest_peers(
         &self,
         data_map: &DataMap,
@@ -2394,16 +2367,33 @@ impl Client {
         .await
     }
 
-    #[allow(clippy::unused_async)]
-    async fn file_download_with_progress_using_peer_count(
+    /// Shared download core: resolve the DataMap, then fetch + streaming-decrypt
+    /// the file one batch at a time, handing each decrypted plaintext segment
+    /// (in order) to `on_chunk`. Constant memory — only one decrypt batch is
+    /// resident at a time. Returns the total plaintext bytes produced.
+    ///
+    /// `on_chunk` is async so a sink can apply backpressure (e.g. a bounded
+    /// channel). Driving the decrypt iterator runs the batched chunk fetch via
+    /// `block_in_place`, so this requires a multi-threaded Tokio runtime.
+    ///
+    /// Every chunk fetch tries `peer_count` closest peers.
+    ///
+    /// Progress reporting (via `progress`):
+    /// 1. Resolves hierarchical DataMaps to the root level first (reports as
+    ///    `ChunksFetched` with `total: 0` during resolution)
+    /// 2. Once the root DataMap is known, sends `total_chunks` with accurate count
+    /// 3. Fetches data chunks with accurate `fetched/total` progress
+    async fn download_decrypted_chunks<F, Fut>(
         &self,
         data_map: &DataMap,
-        output: &Path,
         progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: usize,
-    ) -> Result<u64> {
-        debug!("Downloading file to {}", output.display());
-
+        mut on_chunk: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(Bytes) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         let handle = Handle::current();
 
         // Phase 1: Resolve hierarchical DataMap to root level.
@@ -2749,23 +2739,71 @@ impl Client {
         )
         .map_err(|e| Error::Encryption(format!("streaming decrypt failed: {e}")))?;
 
-        // Write decrypted chunks to a temp file, then rename atomically.
+        // Drive the iterator (each `next()` runs the batched fetch via
+        // block_in_place) and hand each decrypted segment to the sink in
+        // order. Awaiting the sink between items yields back to the runtime so
+        // a bounded sink can apply backpressure.
+        let mut bytes_total = 0u64;
+        for chunk_result in stream {
+            let chunk: Bytes = chunk_result
+                .map_err(|e| Error::Encryption(format!("decryption failed: {e}")))?
+                .into();
+            bytes_total += chunk.len() as u64;
+            on_chunk(chunk).await?;
+        }
+        Ok(bytes_total)
+    }
+
+    /// Download and decrypt a file to disk, with optional progress events.
+    ///
+    /// Same as [`Client::file_download`] but sends [`DownloadEvent`]s for UI
+    /// feedback. Streams to a temp file (one decrypt batch resident at a time)
+    /// and renames atomically on success.
+    pub async fn file_download_with_progress(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+    ) -> Result<u64> {
+        self.file_download_with_progress_using_peer_count(
+            data_map,
+            output,
+            progress,
+            self.config().close_group_size,
+        )
+        .await
+    }
+
+    /// Download and decrypt a file to disk with progress events, trying
+    /// `peer_count` closest peers for every chunk fetch.
+    ///
+    /// Streams to a temp file (one decrypt batch resident at a time) and
+    /// renames atomically on success.
+    async fn file_download_with_progress_using_peer_count(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+        peer_count: usize,
+    ) -> Result<u64> {
+        debug!("Downloading file to {}", output.display());
+
         let parent = output.parent().unwrap_or_else(|| Path::new("."));
         let unique: u64 = rand::random();
-        let tmp_path = parent.join(format!(".ant_download_{}_{unique}.tmp", std::process::id()));
+        let tmp_path =
+            parent.join(format!(".ant_download_{}_{unique}.tmp", std::process::id()));
 
-        let write_result = (|| -> Result<u64> {
-            let mut file = std::fs::File::create(&tmp_path)?;
-            let mut bytes_written = 0u64;
-            for chunk_result in stream {
-                let chunk_bytes = chunk_result
-                    .map_err(|e| Error::Encryption(format!("decryption failed: {e}")))?;
-                file.write_all(&chunk_bytes)?;
-                bytes_written += chunk_bytes.len() as u64;
-            }
-            file.flush()?;
-            Ok(bytes_written)
-        })();
+        let mut file = std::fs::File::create(&tmp_path)?;
+        let write_result = self
+            .download_decrypted_chunks(data_map, progress, peer_count, |bytes| {
+                let r = file.write_all(&bytes).map_err(Error::from);
+                std::future::ready(r)
+            })
+            .await
+            .and_then(|bytes_written| {
+                file.flush()?;
+                Ok(bytes_written)
+            });
 
         match write_result {
             Ok(bytes_written) => match std::fs::rename(&tmp_path, output) {
@@ -2796,6 +2834,36 @@ impl Client {
                 Err(e)
             }
         }
+    }
+
+    /// Download and decrypt a file, streaming the plaintext to `sink` instead
+    /// of writing to disk.
+    ///
+    /// Constant memory (one decrypt batch resident at a time); the caller
+    /// receives bytes progressively as each batch decrypts, suitable for
+    /// forwarding to an HTTP chunked body or a gRPC response stream. The
+    /// bounded `sink` applies backpressure. If the receiver is dropped (e.g.
+    /// the client disconnected) the download stops early and returns an error.
+    ///
+    /// Typically the caller `tokio::spawn`s this and converts the matching
+    /// `Receiver` into its response stream. Requires a multi-threaded Tokio
+    /// runtime (the decrypt iterator uses `block_in_place`).
+    pub async fn file_download_to_sender(
+        &self,
+        data_map: &DataMap,
+        sink: mpsc::Sender<std::result::Result<Bytes, Error>>,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+    ) -> Result<u64> {
+        let peer_count = self.config().close_group_size;
+        self.download_decrypted_chunks(data_map, progress, peer_count, |bytes| {
+            let sink = sink.clone();
+            async move {
+                sink.send(Ok(bytes))
+                    .await
+                    .map_err(|_| Error::Network("download stream receiver dropped".into()))
+            }
+        })
+        .await
     }
 }
 

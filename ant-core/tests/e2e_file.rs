@@ -64,6 +64,56 @@ async fn test_file_upload_download_round_trip() {
     testnet.teardown().await;
 }
 
+/// Streaming download: `file_download_to_sender` must yield exactly the bytes,
+/// in order, that the file contained — without buffering the whole file. Uses
+/// a multi-batch payload so the streaming-decrypt path runs more than one
+/// batch, then reassembles the stream and asserts equality with the source.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_file_download_to_sender_streaming() {
+    use tokio::sync::mpsc;
+
+    let (client, testnet) = setup().await;
+
+    let mut input_file = NamedTempFile::new().expect("create temp file");
+    // ~1 MiB of varied bytes → many self-encryption chunks (multiple batches).
+    let data: Vec<u8> = (0..1_048_576u32).map(|i| (i % 251) as u8).collect();
+    input_file.write_all(&data).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    let result = client
+        .file_upload(input_file.path())
+        .await
+        .expect("file_upload should succeed");
+
+    // Channel item type is inferred from `file_download_to_sender`'s signature.
+    let (tx, mut rx) = mpsc::channel(8);
+    let data_map = result.data_map.clone();
+    let dl = tokio::spawn(async move {
+        client.file_download_to_sender(&data_map, tx, None).await
+    });
+
+    let mut streamed: Vec<u8> = Vec::with_capacity(data.len());
+    while let Some(item) = rx.recv().await {
+        let chunk = item.expect("stream chunk should be Ok");
+        streamed.extend_from_slice(&chunk);
+    }
+
+    let bytes_streamed = dl
+        .await
+        .expect("download task should join")
+        .expect("file_download_to_sender should succeed");
+
+    assert_eq!(streamed, data, "streamed content should match original");
+    assert_eq!(
+        bytes_streamed,
+        data.len() as u64,
+        "bytes_streamed should match original size"
+    );
+
+    testnet.teardown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_file_large_content() {
