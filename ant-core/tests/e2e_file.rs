@@ -89,9 +89,7 @@ async fn test_file_download_to_sender_streaming() {
     // Channel item type is inferred from `file_download_to_sender`'s signature.
     let (tx, mut rx) = mpsc::channel(8);
     let data_map = result.data_map.clone();
-    let dl = tokio::spawn(async move {
-        client.file_download_to_sender(&data_map, tx, None).await
-    });
+    let dl = tokio::spawn(async move { client.file_download_to_sender(&data_map, tx, None).await });
 
     let mut streamed: Vec<u8> = Vec::with_capacity(data.len());
     while let Some(item) = rx.recv().await {

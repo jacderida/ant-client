@@ -2745,9 +2745,8 @@ impl Client {
         // a bounded sink can apply backpressure.
         let mut bytes_total = 0u64;
         for chunk_result in stream {
-            let chunk: Bytes = chunk_result
-                .map_err(|e| Error::Encryption(format!("decryption failed: {e}")))?
-                .into();
+            let chunk: Bytes =
+                chunk_result.map_err(|e| Error::Encryption(format!("decryption failed: {e}")))?;
             bytes_total += chunk.len() as u64;
             on_chunk(chunk).await?;
         }
@@ -2790,8 +2789,7 @@ impl Client {
 
         let parent = output.parent().unwrap_or_else(|| Path::new("."));
         let unique: u64 = rand::random();
-        let tmp_path =
-            parent.join(format!(".ant_download_{}_{unique}.tmp", std::process::id()));
+        let tmp_path = parent.join(format!(".ant_download_{}_{unique}.tmp", std::process::id()));
 
         let mut file = std::fs::File::create(&tmp_path)?;
         let write_result = self
