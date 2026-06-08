@@ -49,6 +49,9 @@ use tracing::debug;
 ///   `Serialization`, `InvalidData`, `SignatureVerification`,
 ///   `Config`, `InsufficientDiskSpace`, `CostEstimationInconclusive`
 ///   -> `ApplicationError` (would happen on a perfectly healthy link)
+/// - `RemotePut` -> `ApplicationError` (the remote node responded with a
+///   structured rejection — the transport succeeded, so the node declined
+///   at the application layer; not a local capacity signal)
 pub(crate) fn classify_error(err: &Error) -> Outcome {
     match err {
         Error::Timeout(_) => Outcome::Timeout,
@@ -68,7 +71,12 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         | Error::Config(_)
         | Error::InsufficientDiskSpace(_)
         | Error::CostEstimationInconclusive(_)
-        | Error::BadQuoteBinding { .. } => Outcome::ApplicationError,
+        | Error::BadQuoteBinding { .. }
+        // A remote node responded with a structured rejection — the
+        // transport round-trip succeeded, so the node declined at the
+        // application layer (payment/disk/quote/pool). Not a local
+        // capacity signal; recorded but must not push the limiter down.
+        | Error::RemotePut { .. } => Outcome::ApplicationError,
     }
 }
 
@@ -601,6 +609,23 @@ mod tests {
                 },
                 Outcome::NetworkError,
             ),
+            (
+                Error::BadQuoteBinding {
+                    peer_id: "peer".to_string(),
+                    detail: "mismatch".to_string(),
+                },
+                Outcome::ApplicationError,
+            ),
+            // A remote application rejection: the node responded with a
+            // structured `ProtocolError`, so the transport succeeded and
+            // this must NOT register as a capacity signal (V2-468).
+            (
+                Error::RemotePut {
+                    address: "abcd".to_string(),
+                    source: ant_protocol::ProtocolError::PaymentFailed("stale quote".to_string()),
+                },
+                Outcome::ApplicationError,
+            ),
         ];
         for (err, expected) in &cases {
             let got = classify_error(err);
@@ -680,7 +705,8 @@ mod tests {
             | Error::InsufficientDiskSpace(_)
             | Error::CostEstimationInconclusive(_)
             | Error::PartialUpload { .. }
-            | Error::BadQuoteBinding { .. } => (),
+            | Error::BadQuoteBinding { .. }
+            | Error::RemotePut { .. } => (),
         };
     }
 }

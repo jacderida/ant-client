@@ -280,6 +280,17 @@ impl Client {
 
         let mut success_count = 0usize;
         let mut failures: Vec<String> = Vec::new();
+        // Distinguish the *cause* of a quorum shortfall so it feeds the
+        // store AIMD limiter correctly (V2-468). If every failure was a
+        // structured remote application rejection (`Error::RemotePut` — the
+        // node responded and declined: pool-rejected / quote-stale /
+        // disk-full), the shortfall is not evidence the client is sending
+        // too fast and must not push the limiter down. Anything else
+        // (transport failure, or a different error) keeps it a real
+        // capacity signal. Hold the first remote rejection as the
+        // representative reason to surface when the shortfall is app-only.
+        let mut had_non_rejection_failure = false;
+        let mut first_remote_rejection: Option<Error> = None;
         let mut fallback_iter = fallback_peers.iter();
 
         while let Some((peer_id, result)) = put_futures.next().await {
@@ -297,6 +308,13 @@ impl Client {
                 Err(e) => {
                     warn!("Failed to store chunk on {peer_id}: {e}");
                     failures.push(format!("{peer_id}: {e}"));
+                    if matches!(e, Error::RemotePut { .. }) {
+                        if first_remote_rejection.is_none() {
+                            first_remote_rejection = Some(e);
+                        }
+                    } else {
+                        had_non_rejection_failure = true;
+                    }
 
                     if let Some((fb_peer, fb_addrs)) = fallback_iter.next() {
                         debug!(
@@ -311,6 +329,17 @@ impl Client {
                         ));
                     }
                 }
+            }
+        }
+
+        // Quorum not reached. If the only failures were structured remote
+        // rejections, surface a representative `RemotePut` (classifies
+        // `ApplicationError`, still recoverable in the merkle retry path)
+        // so the shortfall doesn't suppress the store limiter. Otherwise
+        // it's a real capacity shortfall.
+        if !had_non_rejection_failure {
+            if let Some(remote_rejection) = first_remote_rejection {
+                return Err(remote_rejection);
             }
         }
 
@@ -394,9 +423,17 @@ impl Client {
                 ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message }) => {
                     Some(Err(Error::Payment(format!("Payment required: {message}"))))
                 }
-                ChunkMessageBody::PutResponse(ChunkPutResponse::Error(e)) => Some(Err(
-                    Error::Protocol(format!("Remote PUT error for {addr_hex}: {e}")),
-                )),
+                ChunkMessageBody::PutResponse(ChunkPutResponse::Error(e)) => {
+                    // Preserve the structured remote reason instead of
+                    // flattening it into `Error::Protocol`. The node
+                    // responded, so the transport round-trip succeeded —
+                    // this is an application-level rejection and must not
+                    // suppress the store AIMD limiter (V2-468).
+                    Some(Err(Error::RemotePut {
+                        address: addr_hex.clone(),
+                        source: e,
+                    }))
+                }
                 _ => None,
             },
             |e| Error::Network(format!("Failed to send PUT to peer: {e}")),

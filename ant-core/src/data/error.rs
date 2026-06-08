@@ -24,6 +24,25 @@ pub enum Error {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    /// A remote node rejected a chunk PUT at the application layer.
+    ///
+    /// The node responded with a structured `ProtocolError`, so the
+    /// transport round-trip succeeded — this is an application-level
+    /// rejection (payment-failed, storage/disk-full, quote-stale,
+    /// merkle-pool-rejected), NOT evidence the client is sending too
+    /// fast. It therefore classifies as `Outcome::ApplicationError`
+    /// (see `classify_error`) and does not push the adaptive store
+    /// limiter down. The structured `source` is preserved (rather than
+    /// flattened into `Protocol`) so the controller — and a future
+    /// full-node skip-list (V2-469) — can key on the reason.
+    #[error("remote PUT rejected for {address}: {source}")]
+    RemotePut {
+        /// Hex-encoded chunk address the rejection was for.
+        address: String,
+        /// The structured remote rejection reason.
+        source: ant_protocol::ProtocolError,
+    },
+
     /// Invalid data received.
     #[error("invalid data: {0}")]
     InvalidData(String),

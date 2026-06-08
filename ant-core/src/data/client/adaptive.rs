@@ -1059,7 +1059,31 @@ impl AdaptiveController {
         let mut config = config;
         config.sanitize();
         let quote_cfg = LimiterConfig::from_adaptive(&config, config.max.quote);
-        let store_cfg = LimiterConfig::from_adaptive(&config, config.max.store);
+        let mut store_cfg = LimiterConfig::from_adaptive(&config, config.max.store);
+        // Store-channel growth/decision tuning (V2-468). The store limiter
+        // starts at 8 (correct — deliberately low for low-bandwidth uplinks)
+        // but on the merkle upload path its health signals are polluted by two
+        // things that are NOT local-capacity signals, so it never ramps and
+        // gets crushed to a +1-per-window crawl. Both are the structural twin
+        // of the fetch-channel overrides below (verification variance instead
+        // of retry variance); the cold-start floor is deliberately untouched.
+        //
+        // - Disable the p95-latency Decrease. Node-side PUT latency is
+        //   dominated by the ~28s synchronous merkle closeness lookup, giving a
+        //   client-observed p95/median of ~3-6x that straddles
+        //   `latency_inflation_factor` (4.0) and trips Decrease even though
+        //   nothing about it is local congestion. Genuine store congestion
+        //   still surfaces via the timeout-rate ceiling.
+        // - Never exit slow-start. With the default threshold 0, any single
+        //   Decrease at any cap permanently drops the store cap to additive
+        //   +1-per-healthy-window growth, which cannot reach a useful cap
+        //   before a file finishes (843 chunks stuck at effective ~5-9 in the
+        //   PROD-UL-01 incident). `usize::MAX` keeps slow-start armed at every
+        //   cap, so a transient Decrease still halves but the next healthy
+        //   window doubles it back instead of condemning the rest of the file
+        //   to a crawl. See the fetch override and `LimiterConfig` field docs.
+        store_cfg.latency_decrease_enabled = false;
+        store_cfg.slow_start_ramp_threshold = usize::MAX;
         let mut fetch_cfg = LimiterConfig::from_adaptive(&config, config.max.fetch);
         // Lift the fetch channel's floor above the global
         // `min_concurrency`. Reasoning is specific to download: on
@@ -1823,8 +1847,9 @@ mod tests {
 
     #[test]
     fn controller_sets_fetch_channel_download_tuning() {
-        // AdaptiveController::new must apply the download-specific
-        // tuning to fetch only, leaving quote/store on classic AIMD.
+        // AdaptiveController::new must apply the slow-start /
+        // latency-decrease tuning to fetch AND store (V2-468), leaving
+        // quote on classic AIMD.
         let c = AdaptiveController::new(ChannelStart::default(), AdaptiveConfig::default());
         assert!(
             !c.fetch.config.latency_decrease_enabled,
@@ -1843,8 +1868,116 @@ mod tests {
             c.quote.config.slow_start_ramp_threshold, 0,
             "quote must keep classic AIMD slow-start exit",
         );
-        assert!(c.store.config.latency_decrease_enabled);
-        assert_eq!(c.store.config.slow_start_ramp_threshold, 0);
+        // Store now mirrors fetch on these two knobs: node-side merkle
+        // verification latency is not local congestion, and a transient
+        // Decrease must not condemn the cap to a +1-per-window crawl.
+        assert!(
+            !c.store.config.latency_decrease_enabled,
+            "store latency-decrease must be disabled (verification variance is not congestion)",
+        );
+        assert_eq!(
+            c.store.config.slow_start_ramp_threshold,
+            usize::MAX,
+            "store slow-start must never exit so a transient Decrease re-doubles",
+        );
+        // The store floor must stay at the cold-start value — V2-468 does
+        // NOT change the floor, only the polluted ramp/decrease signals.
+        assert_eq!(
+            c.store.current(),
+            ChannelStart::default().store,
+            "store cold-start floor must remain unchanged at 8",
+        );
+    }
+
+    #[test]
+    fn store_channel_ramps_and_recovers_under_v2_468_tuning() {
+        // End-to-end on the real `controller.store` limiter: with the
+        // V2-468 tuning, (a) verification-latency p95 inflation alone must
+        // not shrink the cap, (b) a genuine timeout burst still cuts it,
+        // and (c) the cap re-doubles on the next healthy window instead of
+        // crawling +1 (slow-start stays armed).
+        let mut adaptive = adaptive_cfg_for_tests();
+        // Give the store channel real headroom to ramp.
+        adaptive.max.store = 256;
+        let c = AdaptiveController::new(
+            ChannelStart {
+                quote: 8,
+                store: 8,
+                fetch: 8,
+            },
+            adaptive,
+        );
+        let store = &c.store;
+        let win = c.config().window_ops;
+
+        // (a) Establish a fast baseline, then a window of slow successes
+        // (the ~28s verification tail). The cap must not drop.
+        for _ in 0..win {
+            store.observe(Outcome::Success, Duration::from_millis(5));
+        }
+        let after_baseline = store.current();
+        assert!(after_baseline >= 8, "store should ramp on healthy windows");
+        for _ in 0..win {
+            store.observe(Outcome::Success, Duration::from_secs(30));
+        }
+        assert!(
+            store.current() >= after_baseline,
+            "verification-latency p95 must not shrink store cap: {} < {}",
+            store.current(),
+            after_baseline,
+        );
+
+        // (b) A genuine local-congestion timeout burst must still cut it.
+        let before_stress = store.current();
+        for _ in 0..win {
+            store.observe(Outcome::Timeout, Duration::from_millis(50));
+        }
+        let after_stress = store.current();
+        assert!(
+            after_stress < before_stress,
+            "timeout-rate breach must still cut the store cap: {after_stress} !< {before_stress}",
+        );
+
+        // (c) Slow-start stays armed, so healthy windows re-DOUBLE the cap
+        // back to where it was instead of crawling +1 per window. Over this
+        // many windows additive +1 recovery could not climb back to
+        // `before_stress` from the stressed floor — only multiplicative
+        // doubling can — so reaching it proves the crawl pathology is gone.
+        for _ in 0..(win * 8) {
+            store.observe(Outcome::Success, Duration::from_millis(5));
+        }
+        assert!(
+            store.current() >= before_stress,
+            "store must re-double back to {before_stress} after a transient Decrease, got {}",
+            store.current(),
+        );
+    }
+
+    #[test]
+    fn store_application_rejections_do_not_move_cap() {
+        // The merkle incident's 397 remote app-rejections (now classified
+        // ApplicationError via `Error::RemotePut`) must not push the store
+        // cap down — they are not capacity signals.
+        let mut adaptive = adaptive_cfg_for_tests();
+        adaptive.max.store = 256;
+        let c = AdaptiveController::new(
+            ChannelStart {
+                quote: 8,
+                store: 8,
+                fetch: 8,
+            },
+            adaptive,
+        );
+        let store = &c.store;
+        let start = store.current();
+        for _ in 0..(c.config().window_ops * 5) {
+            store.observe(Outcome::ApplicationError, Duration::from_secs(30));
+        }
+        assert_eq!(
+            store.current(),
+            start,
+            "remote app-rejections must not move the store cap",
+        );
     }
 
     #[test]

@@ -984,7 +984,12 @@ where
                         });
                     }
                 }
-                Err(e @ Error::InsufficientPeers(_)) => {
+                // A quorum shortfall — whether reported as a transport
+                // shortfall (`InsufficientPeers`) or an app-only rejection
+                // (`RemotePut`, e.g. pool-rejected / quote-stale / disk-full,
+                // which are transient) — is recoverable: defer and retry the
+                // chunk rather than aborting the whole upload (V2-468).
+                Err(e @ (Error::InsufficientPeers(_) | Error::RemotePut { .. })) => {
                     next_failed.push((addr, content, e.to_string()));
                 }
                 Err(e) => return Err(e),
@@ -1733,6 +1738,41 @@ mod tests {
         // Single attempt → all successes recorded in round 0.
         assert_eq!(outcome.stats.retries_histogram[0], 4);
         assert_eq!(outcome.stats.chunk_attempts_total, 6);
+    }
+
+    /// V2-468: an app-only quorum shortfall surfaces as `Error::RemotePut`
+    /// (pool-rejected / quote-stale / disk-full — transient), which must be
+    /// treated as recoverable just like `InsufficientPeers`: collected and
+    /// retried, never aborting the whole batch.
+    #[tokio::test]
+    async fn store_with_retry_treats_remote_put_as_recoverable() {
+        let chunks = make_chunks(6);
+        let failing: std::collections::HashSet<[u8; 32]> =
+            chunks.iter().take(2).map(|(a, _)| *a).collect();
+        let failing_for_closure = failing.clone();
+
+        let store_one = move |addr: [u8; 32], _content: Bytes| {
+            let fail = failing_for_closure.contains(&addr);
+            async move {
+                if fail {
+                    Err(Error::RemotePut {
+                        address: hex::encode(addr),
+                        source: ant_protocol::ProtocolError::StorageFailed(
+                            "insufficient disk space".into(),
+                        ),
+                    })
+                } else {
+                    Ok(std::time::Instant::now())
+                }
+            }
+        };
+
+        let outcome = merkle_store_with_retry(chunks, 8, 1, Duration::ZERO, None, 0, 6, store_one)
+            .await
+            .expect("remote app-rejections must not abort the batch");
+
+        assert_eq!(outcome.stored, 4);
+        assert_eq!(outcome.failed, 2);
     }
 
     /// A non-quorum error (e.g. a missing proof) stays fatal and aborts.
