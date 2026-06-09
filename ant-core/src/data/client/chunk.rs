@@ -178,8 +178,17 @@ impl Client {
     /// sustained run of close-group exhaustions correctly drives the
     /// cap down rather than silently inflating it.
     pub(crate) async fn chunk_get_observed(&self, address: &XorName) -> Result<Option<DataChunk>> {
+        self.chunk_get_observed_from_closest_peers(address, self.config().close_group_size)
+            .await
+    }
+
+    pub(crate) async fn chunk_get_observed_from_closest_peers(
+        &self,
+        address: &XorName,
+        peer_count: usize,
+    ) -> Result<Option<DataChunk>> {
         let started = Instant::now();
-        let result = self.chunk_get(address).await;
+        let result = self.chunk_get_from_closest_peers(address, peer_count).await;
         let latency = started.elapsed();
         let bytes = result
             .as_ref()
