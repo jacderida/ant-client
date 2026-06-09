@@ -2805,7 +2805,7 @@ impl Client {
     ///
     /// Same as [`Client::file_download`] but sends [`DownloadEvent`]s for UI
     /// feedback. Streams to a temp file (one decrypt batch resident at a time)
-    /// and renames atomically on success. A [`TempDownload`] guard removes the
+    /// and renames atomically on success. A `TempDownload` guard removes the
     /// staging file on any error path, including a panic.
     pub async fn file_download_with_progress(
         &self,
