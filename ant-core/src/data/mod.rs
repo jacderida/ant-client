@@ -6,6 +6,7 @@
 pub mod client;
 pub mod error;
 pub mod network;
+pub mod peer_cache;
 
 pub use client::cache::ChunkCache;
 pub use client::{Client, ClientConfig};
