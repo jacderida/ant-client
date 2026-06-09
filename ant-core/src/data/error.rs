@@ -79,6 +79,14 @@ pub enum Error {
     #[error("encryption error: {0}")]
     Encryption(String),
 
+    /// The operation was cancelled by the caller rather than failing.
+    ///
+    /// Returned, for example, by streaming downloads when the consumer drops
+    /// its receiver (a client disconnect) — distinct from a transport
+    /// [`Error::Network`] failure, since nothing went wrong on the wire.
+    #[error("operation cancelled: {0}")]
+    Cancelled(String),
+
     /// Data already exists on the network — no payment needed.
     #[error("already stored on network")]
     AlreadyStored,
@@ -224,6 +232,15 @@ mod tests {
     fn test_display_encryption() {
         let err = Error::Encryption("decrypt failed".to_string());
         assert_eq!(err.to_string(), "encryption error: decrypt failed");
+    }
+
+    #[test]
+    fn test_display_cancelled() {
+        let err = Error::Cancelled("download stream receiver dropped".to_string());
+        assert_eq!(
+            err.to_string(),
+            "operation cancelled: download stream receiver dropped"
+        );
     }
 
     #[test]

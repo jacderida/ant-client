@@ -70,7 +70,7 @@ async fn test_file_upload_download_round_trip() {
 /// batch, then reassembles the stream and asserts equality with the source.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_file_download_to_sender_streaming() {
+async fn test_file_download_to_sender_multibatch_round_trip() {
     use tokio::sync::mpsc;
 
     let (client, testnet) = setup().await;
@@ -92,8 +92,13 @@ async fn test_file_download_to_sender_streaming() {
     let dl = tokio::spawn(async move { client.file_download_to_sender(&data_map, tx, None).await });
 
     let mut streamed: Vec<u8> = Vec::with_capacity(data.len());
+    let mut chunk_count = 0usize;
     while let Some(item) = rx.recv().await {
         let chunk = item.expect("stream chunk should be Ok");
+        // A buggy "send one empty/sentinel then drop" producer would still
+        // close the channel; assert each delivered chunk carries real bytes.
+        assert!(!chunk.is_empty(), "streamed chunk should be non-empty");
+        chunk_count += 1;
         streamed.extend_from_slice(&chunk);
     }
 
@@ -102,6 +107,12 @@ async fn test_file_download_to_sender_streaming() {
         .expect("download task should join")
         .expect("file_download_to_sender should succeed");
 
+    // The whole point of the streaming path: a multi-batch payload must arrive
+    // as more than one segment, not buffered and emitted in one shot.
+    assert!(
+        chunk_count >= 2,
+        "multi-batch payload should stream as ≥2 segments, got {chunk_count}"
+    );
     assert_eq!(streamed, data, "streamed content should match original");
     assert_eq!(
         bytes_streamed,

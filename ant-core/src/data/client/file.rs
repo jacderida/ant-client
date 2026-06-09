@@ -824,6 +824,55 @@ fn spawn_file_encryption(path: PathBuf) -> Result<EncryptionChannels> {
     Ok((chunk_rx, datamap_rx, handle))
 }
 
+/// RAII guard for the staging temp file used during a disk download.
+///
+/// Removes the file on drop — including a panic unwind out of the
+/// `block_in_place` decrypt loop — unless [`commit`](Self::commit) has
+/// promoted it to its final path. Centralizes the cleanup the explicit error
+/// arms used to repeat.
+struct TempDownload {
+    /// `Some` while the staging file may need cleanup; `None` once committed.
+    path: Option<PathBuf>,
+}
+
+impl TempDownload {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// Path of the staging file (valid until `commit`).
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("TempDownload::path called after commit")
+    }
+
+    /// Rename the staged file to `dest`. On success the guard is defused so
+    /// `Drop` is a no-op; on failure the guard stays armed and `Drop` removes
+    /// the orphaned temp file.
+    fn commit(mut self, dest: &Path) -> std::io::Result<()> {
+        std::fs::rename(self.path(), dest)?; // err → guard armed → Drop cleans up
+        self.path = None; // success → nothing left to clean
+        Ok(())
+    }
+}
+
+impl Drop for TempDownload {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                // Absent file is fine (never created / already gone).
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "Failed to remove temp download file {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl Client {
     /// Upload a file to the network using streaming self-encryption.
     ///
@@ -2316,7 +2365,6 @@ impl Client {
     ///
     /// Returns an error if any chunk cannot be retrieved, decryption fails,
     /// or the file cannot be written.
-    #[allow(clippy::unused_async)]
     pub async fn file_download(&self, data_map: &DataMap, output: &Path) -> Result<u64> {
         self.file_download_with_progress(data_map, output, None)
             .await
@@ -2757,7 +2805,8 @@ impl Client {
     ///
     /// Same as [`Client::file_download`] but sends [`DownloadEvent`]s for UI
     /// feedback. Streams to a temp file (one decrypt batch resident at a time)
-    /// and renames atomically on success.
+    /// and renames atomically on success. A [`TempDownload`] guard removes the
+    /// staging file on any error path, including a panic.
     pub async fn file_download_with_progress(
         &self,
         data_map: &DataMap,
@@ -2791,47 +2840,28 @@ impl Client {
         let unique: u64 = rand::random();
         let tmp_path = parent.join(format!(".ant_download_{}_{unique}.tmp", std::process::id()));
 
-        let mut file = std::fs::File::create(&tmp_path)?;
-        let write_result = self
+        // Guard removes the staging file on any early return OR a panic unwind
+        // out of the `block_in_place` decrypt loop; defused only by a
+        // successful commit(). Centralizes what used to be three duplicated
+        // cleanup arms.
+        let tmp = TempDownload::new(tmp_path);
+        let mut file = std::fs::File::create(tmp.path())?;
+
+        let bytes_written = self
             .download_decrypted_chunks(data_map, progress, peer_count, |bytes| {
                 let r = file.write_all(&bytes).map_err(Error::from);
                 std::future::ready(r)
             })
-            .await
-            .and_then(|bytes_written| {
-                file.flush()?;
-                Ok(bytes_written)
-            });
+            .await?;
+        file.flush()?;
+        drop(file); // close the handle before rename (Windows won't rename an open file)
 
-        match write_result {
-            Ok(bytes_written) => match std::fs::rename(&tmp_path, output) {
-                Ok(()) => {
-                    info!(
-                        "File downloaded: {bytes_written} bytes written to {}",
-                        output.display()
-                    );
-                    Ok(bytes_written)
-                }
-                Err(rename_err) => {
-                    if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
-                        warn!(
-                            "Failed to remove temp download file {}: {cleanup_err}",
-                            tmp_path.display()
-                        );
-                    }
-                    Err(rename_err.into())
-                }
-            },
-            Err(e) => {
-                if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
-                    warn!(
-                        "Failed to remove temp download file {}: {cleanup_err}",
-                        tmp_path.display()
-                    );
-                }
-                Err(e)
-            }
-        }
+        tmp.commit(output)?;
+        info!(
+            "File downloaded: {bytes_written} bytes written to {}",
+            output.display()
+        );
+        Ok(bytes_written)
     }
 
     /// Download and decrypt a file, streaming the plaintext to `sink` instead
@@ -2841,7 +2871,14 @@ impl Client {
     /// receives bytes progressively as each batch decrypts, suitable for
     /// forwarding to an HTTP chunked body or a gRPC response stream. The
     /// bounded `sink` applies backpressure. If the receiver is dropped (e.g.
-    /// the client disconnected) the download stops early and returns an error.
+    /// the client disconnected) the download stops early and returns
+    /// [`Error::Cancelled`].
+    ///
+    /// The channel item type is `Result<Bytes, Error>`, so the caller sets up:
+    ///
+    /// ```ignore
+    /// let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Error>>(8);
+    /// ```
     ///
     /// Typically the caller `tokio::spawn`s this and converts the matching
     /// `Receiver` into its response stream. Requires a multi-threaded Tokio
@@ -2858,7 +2895,7 @@ impl Client {
             async move {
                 sink.send(Ok(bytes))
                     .await
-                    .map_err(|_| Error::Network("download stream receiver dropped".into()))
+                    .map_err(|_| Error::Cancelled("download stream receiver dropped".into()))
             }
         })
         .await
