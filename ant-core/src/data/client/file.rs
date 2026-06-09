@@ -444,6 +444,51 @@ fn partition_addresses_by_proof(
         .partition(|addr| proofs.contains_key(addr))
 }
 
+/// Build a `PartialUpload` after a fatal merkle store error, with accurate
+/// counts.
+///
+/// A fatal abort can leave chunks in three states: confirmed stored (in
+/// `stored_addresses`), known-failed (in `known_failed` — missing proofs, the
+/// quorum shortfalls and the fatal chunk seen so far), and "in flight when the
+/// abort hit" (neither). Rather than trust the helpers to enumerate the last
+/// group, this derives the failed set authoritatively as *every* `addresses`
+/// entry not in `stored_addresses`, preferring a known per-chunk message and
+/// falling back to the fatal `reason`. That guarantees
+/// `stored_count + failed_count` accounts for the whole file — fixing the
+/// under-reporting where a fatal wave could surface `failed_count = 0` and omit
+/// same-pass successes.
+fn partial_upload_after_fatal(
+    addresses: &[[u8; 32]],
+    stored_addresses: Vec<[u8; 32]>,
+    stored_count: usize,
+    total_chunks: usize,
+    known_failed: Vec<([u8; 32], String)>,
+    reason: String,
+) -> Error {
+    let stored_set: HashSet<[u8; 32]> = stored_addresses.iter().copied().collect();
+    let mut failed_map: HashMap<[u8; 32], String> = HashMap::new();
+    for (addr, msg) in known_failed {
+        if !stored_set.contains(&addr) {
+            failed_map.entry(addr).or_insert(msg);
+        }
+    }
+    for addr in addresses {
+        if !stored_set.contains(addr) {
+            failed_map.entry(*addr).or_insert_with(|| reason.clone());
+        }
+    }
+    let failed: Vec<([u8; 32], String)> = failed_map.into_iter().collect();
+    let failed_count = failed.len();
+    Error::PartialUpload {
+        stored: stored_addresses,
+        stored_count,
+        failed,
+        failed_count,
+        total_chunks,
+        reason,
+    }
+}
+
 /// Check that the spill directory has enough free space for the spilled chunks.
 ///
 /// `file_size` is the source file's byte count. We require
@@ -2075,7 +2120,7 @@ impl Client {
             // behind a backoff. `stored_offset` is the running cumulative count
             // so the progress events the driver emits stay correctly numbered
             // across waves.
-            let outcome = match merkle_store_with_retry(
+            let outcome = merkle_store_with_retry(
                 chunks,
                 store_concurrency,
                 1,
@@ -2085,45 +2130,14 @@ impl Client {
                 total_chunks,
                 &store_one,
             )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    // A non-quorum store error is fatal for the retry helper
-                    // (missing proofs were filtered out above, so this is a
-                    // genuine network/store failure, e.g. a DHT lookup error).
-                    // Surface it at the file boundary as `PartialUpload` so the
-                    // chunks already stored in earlier waves — and any
-                    // missing-proof chunks already recorded — are preserved for
-                    // resume, rather than discarded with a generic error.
-                    warn!("merkle wave {wave_num}/{wave_count} aborted: {e}");
-                    let failed_count = failed.len();
-                    return Err(Error::PartialUpload {
-                        stored: stored_addresses,
-                        stored_count: total_stored,
-                        failed,
-                        failed_count,
-                        total_chunks,
-                        reason: format!("merkle chunk store aborted: {e}"),
-                    });
-                }
-            };
+            .await?;
 
-            // Record which of this wave's chunks landed; the rest are short of
-            // quorum on this single pass and are deferred (not failed yet) for
-            // the post-wave concurrent retry. A deferred chunk joins
-            // `stored_addresses` only if/when a later round stores it.
-            let wave_failed: HashSet<[u8; 32]> = outcome
-                .failed_addresses
-                .iter()
-                .map(|(addr, _)| *addr)
-                .collect();
-            for addr in wave_addrs {
-                if !wave_failed.contains(addr) {
-                    stored_addresses.push(*addr);
-                }
-            }
-            deferred.extend(outcome.failed_addresses);
+            // Record this wave's confirmed stores from the explicit set the
+            // store helper reports. Using that set (rather than inferring
+            // "wave chunks minus failed") keeps `stored_addresses` correct even
+            // when a fatal abort leaves some of the wave neither stored nor
+            // reported short of quorum.
+            stored_addresses.extend(&outcome.stored_addresses);
             total_stored = outcome.stored;
 
             // Merge per-wave stats (durations, attempts, per-round histogram).
@@ -2140,6 +2154,34 @@ impl Client {
             {
                 *slot = slot.saturating_add(*count);
             }
+
+            if let Some(e) = outcome.fatal {
+                // A non-quorum store error is fatal (missing proofs were
+                // filtered out above, so this is a genuine network/store
+                // failure). Preserve every chunk stored so far — including this
+                // wave's same-pass successes — and report every not-stored chunk
+                // as failed, so the `PartialUpload` counts are accurate rather
+                // than omitting same-wave stores and under-counting failures.
+                warn!("merkle wave {wave_num}/{wave_count} aborted: {e}");
+                // Best per-chunk messages we already have: missing-proof, this
+                // wave's shortfalls, and earlier waves' deferred shortfalls.
+                let mut known_failed = failed;
+                known_failed.extend(outcome.failed_addresses);
+                known_failed.extend(std::mem::take(&mut deferred));
+                return Err(partial_upload_after_fatal(
+                    addresses,
+                    stored_addresses,
+                    total_stored,
+                    total_chunks,
+                    known_failed,
+                    format!("merkle chunk store aborted: {e}"),
+                ));
+            }
+
+            // Non-fatal: this wave's quorum-short chunks are deferred (not failed
+            // yet) for the post-wave concurrent retry. A deferred chunk joins
+            // `stored_addresses` only if/when a later round stores it.
+            deferred.extend(outcome.failed_addresses);
 
             if let Some(tx) = progress {
                 let _ = tx
@@ -2166,6 +2208,10 @@ impl Client {
             let dr = merkle_deferred_retry(
                 deferred,
                 &DEFERRED_ROUND_DELAYS_SECS,
+                // Read and store at most one wave's worth of bodies at a time so
+                // the deferred path keeps the wave path's ~256 MB peak-memory
+                // bound regardless of how many chunks were deferred file-wide.
+                UPLOAD_WAVE_SIZE,
                 |addrs: &[[u8; 32]]| {
                     spill.read_wave(addrs).map(|wave| {
                         wave.into_iter()
@@ -2203,18 +2249,18 @@ impl Client {
             if let Some(reason) = dr.fatal {
                 // A non-quorum store error during a deferred round is fatal, the
                 // same as in the wave path: preserve everything stored so far and
-                // the still-pending chunks as `PartialUpload`.
-                failed.extend(dr.failed_addresses);
-                let failed_count = failed.len();
+                // report every not-stored chunk as failed.
                 warn!("merkle deferred retry aborted: {reason}");
-                return Err(Error::PartialUpload {
-                    stored: stored_addresses,
-                    stored_count: total_stored,
-                    failed,
-                    failed_count,
+                let mut known_failed = failed;
+                known_failed.extend(dr.failed_addresses);
+                return Err(partial_upload_after_fatal(
+                    addresses,
+                    stored_addresses,
+                    total_stored,
                     total_chunks,
-                    reason: format!("merkle chunk store aborted: {reason}"),
-                });
+                    known_failed,
+                    format!("merkle chunk store aborted: {reason}"),
+                ));
             }
             failed.extend(dr.failed_addresses);
         }
