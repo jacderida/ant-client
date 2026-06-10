@@ -124,9 +124,27 @@ pub enum Error {
         failed_count: usize,
         /// Total number of chunks the upload was attempting to store.
         total_chunks: usize,
+        /// On-chain spend incurred so far. Boxed to keep the `Error` enum small
+        /// (the variant is returned in `Result` across the crate; without the
+        /// box the two cost fields would trip `clippy::result_large_err`).
+        spend: Box<PartialUploadSpend>,
         /// Root cause description.
         reason: String,
     },
+}
+
+/// On-chain spend recorded on a [`Error::PartialUpload`].
+///
+/// A partial upload still spends money for the chunks it paid for. In the
+/// single-node path payment precedes store, so this includes a failed wave's
+/// chunks; surfacing it lets the caller report real spend rather than silently
+/// dropping it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialUploadSpend {
+    /// Storage cost paid on-chain so far, in atto-tokens.
+    pub storage_cost_atto: String,
+    /// Gas cost paid on-chain so far, in wei.
+    pub gas_cost_wei: u128,
 }
 
 // ant-node is only linked when the `devnet` feature is on, so the

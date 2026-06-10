@@ -233,6 +233,7 @@ async fn handle_file_upload(
             stored_count,
             failed_count,
             total_chunks,
+            spend,
             reason,
             ..
         }) => {
@@ -242,12 +243,18 @@ async fn handle_file_upload(
                     total_chunks,
                     chunks_stored: stored_count,
                     chunks_failed: failed_count,
+                    storage_cost_atto: spend.storage_cost_atto.clone(),
+                    gas_cost_wei: spend.gas_cost_wei.to_string(),
                     reason: &reason,
                 };
                 println!("{}", serde_json::to_string(&out)?);
             }
+            // The partial upload still spent money on-chain for the chunks it
+            // paid for; report it so the user knows what the failed attempt cost.
+            let cost_display = format_cost(&spend.storage_cost_atto, spend.gas_cost_wei);
             anyhow::bail!(
-                "Upload failed: {stored_count}/{total_chunks} stored, {failed_count} failed: {reason}"
+                "Upload failed: {stored_count}/{total_chunks} stored, {failed_count} failed \
+                 (spent {cost_display}): {reason}"
             );
         }
         Err(e) => anyhow::bail!("File upload failed: {e}"),
@@ -280,6 +287,8 @@ async fn handle_file_upload(
                         total_chunks: result.chunks_stored + 1,
                         chunks_stored: result.chunks_stored,
                         chunks_failed: 1,
+                        storage_cost_atto: result.storage_cost_atto.clone(),
+                        gas_cost_wei: result.gas_cost_wei.to_string(),
                         reason: &reason,
                     };
                     println!("{}", serde_json::to_string(&out)?);
@@ -659,6 +668,11 @@ struct UploadFailureJson<'a> {
     total_chunks: usize,
     chunks_stored: usize,
     chunks_failed: usize,
+    /// Storage cost paid on-chain so far, in atto-tokens. A partial upload
+    /// still spends money for the chunks it paid for.
+    storage_cost_atto: String,
+    /// Gas cost paid on-chain so far, in wei.
+    gas_cost_wei: String,
     reason: &'a str,
 }
 
