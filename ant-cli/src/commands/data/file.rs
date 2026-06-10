@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -68,6 +69,9 @@ pub enum FileAction {
         /// written to the current directory).
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Number of closest peers to try for each chunk fetch.
+        #[arg(long, alias = "peer-count", value_name = "COUNT")]
+        peers: Option<NonZeroUsize>,
     },
     /// Estimate the cost of uploading a file without uploading.
     ///
@@ -153,6 +157,7 @@ impl FileAction {
                 address,
                 datamap,
                 output,
+                peers,
             } => {
                 let resolved_output = resolve_download_output(output, datamap.as_deref())?;
                 handle_file_download(
@@ -161,6 +166,7 @@ impl FileAction {
                     datamap.as_deref(),
                     resolved_output,
                     json,
+                    peers,
                 )
                 .await
             }
@@ -445,22 +451,34 @@ async fn handle_file_download(
     datamap_path: Option<&Path>,
     output: PathBuf,
     json_output: bool,
+    peer_count: Option<NonZeroUsize>,
 ) -> anyhow::Result<()> {
     let output_path = output;
     let start = Instant::now();
 
     let data_map = if let Some(addr_hex) = address {
         info!("Downloading public file from address {addr_hex}");
+        let address = parse_address(addr_hex)?;
         if !json_output {
             let spinner = progress::new_spinner("Fetching data map...");
-            let result = client.data_map_fetch(&parse_address(addr_hex)?).await;
+            let result = if let Some(peer_count) = peer_count {
+                client
+                    .data_map_fetch_from_closest_peers(&address, peer_count)
+                    .await
+            } else {
+                client.data_map_fetch(&address).await
+            };
             spinner.finish_and_clear();
             result.map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
         } else {
-            client
-                .data_map_fetch(&parse_address(addr_hex)?)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
+            if let Some(peer_count) = peer_count {
+                client
+                    .data_map_fetch_from_closest_peers(&address, peer_count)
+                    .await
+            } else {
+                client.data_map_fetch(&address).await
+            }
+            .map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
         }
     } else {
         let dm_path = datamap_path
@@ -470,10 +488,15 @@ async fn handle_file_download(
     };
 
     if json_output {
-        client
-            .file_download(&data_map, &output_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+        let download_result = if let Some(peer_count) = peer_count {
+            client
+                .file_download_from_closest_peers(&data_map, &output_path, peer_count)
+                .await
+        } else {
+            client.file_download(&data_map, &output_path).await
+        };
+
+        download_result.map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
     } else {
         let (tx, mut rx) = mpsc::channel(64);
 
@@ -512,9 +535,20 @@ async fn handle_file_download(
             pb.finish_and_clear();
         });
 
-        let download_result = client
-            .file_download_with_progress(&data_map, &output_path, Some(tx))
-            .await;
+        let download_result = if let Some(peer_count) = peer_count {
+            client
+                .file_download_with_progress_from_closest_peers(
+                    &data_map,
+                    &output_path,
+                    Some(tx),
+                    peer_count,
+                )
+                .await
+        } else {
+            client
+                .file_download_with_progress(&data_map, &output_path, Some(tx))
+                .await
+        };
 
         // Wait for progress bar cleanup (sender dropped → receiver exits)
         let _ = progress_handle.await;
@@ -697,6 +731,21 @@ fn format_cost(storage_cost_atto: &str, gas_cost_wei: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct TestFileCli {
+        #[command(subcommand)]
+        action: FileAction,
+    }
+
+    const TEST_ADDRESS_BYTE_LEN: usize = 32;
+    const PUBLIC_DOWNLOAD_PEERS: usize = 12;
+    const PRIVATE_DOWNLOAD_PEERS: usize = 9;
+
+    fn test_address() -> String {
+        "00".repeat(TEST_ADDRESS_BYTE_LEN)
+    }
 
     #[test]
     fn resolve_download_output_returns_explicit_output_unchanged() {
@@ -753,5 +802,72 @@ mod tests {
         let datamap = PathBuf::from("photo.jpg");
         let err = resolve_download_output(None, Some(datamap.as_path())).unwrap_err();
         assert!(err.to_string().contains("Cannot derive"));
+    }
+
+    #[test]
+    fn download_peers_is_accepted_for_public_download() {
+        let address = test_address();
+        let peer_count = PUBLIC_DOWNLOAD_PEERS.to_string();
+        let cli = TestFileCli::try_parse_from([
+            "test",
+            "download",
+            address.as_str(),
+            "--peers",
+            peer_count.as_str(),
+            "--output",
+            "out.bin",
+        ])
+        .expect("--peers must parse for address downloads");
+
+        match cli.action {
+            FileAction::Download { peers, address, .. } => {
+                assert!(address.is_some());
+                assert_eq!(peers.map(NonZeroUsize::get), Some(PUBLIC_DOWNLOAD_PEERS));
+            }
+            FileAction::Upload { .. } | FileAction::Cost { .. } => {
+                panic!("expected file download action")
+            }
+        }
+    }
+
+    #[test]
+    fn download_peers_is_accepted_for_private_download() {
+        let peer_count = PRIVATE_DOWNLOAD_PEERS.to_string();
+        let cli = TestFileCli::try_parse_from([
+            "test",
+            "download",
+            "--datamap",
+            "photo.jpg.datamap",
+            "--peers",
+            peer_count.as_str(),
+        ])
+        .expect("--peers must parse for datamap downloads");
+
+        match cli.action {
+            FileAction::Download { peers, datamap, .. } => {
+                assert!(datamap.is_some());
+                assert_eq!(peers.map(NonZeroUsize::get), Some(PRIVATE_DOWNLOAD_PEERS));
+            }
+            FileAction::Upload { .. } | FileAction::Cost { .. } => {
+                panic!("expected file download action")
+            }
+        }
+    }
+
+    #[test]
+    fn download_peers_rejects_zero() {
+        let address = test_address();
+        let err = TestFileCli::try_parse_from([
+            "test",
+            "download",
+            address.as_str(),
+            "--peers",
+            "0",
+            "--output",
+            "out.bin",
+        ])
+        .expect_err("--peers=0 must fail");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 }

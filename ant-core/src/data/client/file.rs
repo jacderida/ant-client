@@ -34,6 +34,7 @@ use self_encryption::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
@@ -2321,6 +2322,26 @@ impl Client {
             .await
     }
 
+    /// Download and decrypt a file, trying the requested number of
+    /// closest peers for every chunk fetch.
+    ///
+    /// Returns the number of bytes written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any chunk cannot be retrieved, decryption fails,
+    /// or the file cannot be written.
+    #[allow(clippy::unused_async)]
+    pub async fn file_download_from_closest_peers(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        peer_count: NonZeroUsize,
+    ) -> Result<u64> {
+        self.file_download_with_progress_using_peer_count(data_map, output, None, peer_count.get())
+            .await
+    }
+
     /// Download and decrypt a file with progress events.
     ///
     /// Same as [`Client::file_download`] but sends [`DownloadEvent`]s for UI feedback.
@@ -2336,6 +2357,50 @@ impl Client {
         data_map: &DataMap,
         output: &Path,
         progress: Option<mpsc::Sender<DownloadEvent>>,
+    ) -> Result<u64> {
+        self.file_download_with_progress_using_peer_count(
+            data_map,
+            output,
+            progress,
+            self.config().close_group_size,
+        )
+        .await
+    }
+
+    /// Download and decrypt a file with progress events, trying the
+    /// requested number of closest peers for every chunk fetch.
+    ///
+    /// Same as [`Client::file_download_from_closest_peers`] but sends
+    /// [`DownloadEvent`]s for UI feedback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any chunk cannot be retrieved, decryption fails,
+    /// or the file cannot be written.
+    #[allow(clippy::unused_async)]
+    pub async fn file_download_with_progress_from_closest_peers(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+        peer_count: NonZeroUsize,
+    ) -> Result<u64> {
+        self.file_download_with_progress_using_peer_count(
+            data_map,
+            output,
+            progress,
+            peer_count.get(),
+        )
+        .await
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn file_download_with_progress_using_peer_count(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+        peer_count: usize,
     ) -> Result<u64> {
         debug!("Downloading file to {}", output.display());
 
@@ -2386,7 +2451,7 @@ impl Client {
                                     // load-shedding signal for
                                     // sustained close-group exhaustion).
                                     let chunk = self
-                                        .chunk_get_observed(&addr)
+                                        .chunk_get_observed_from_closest_peers(&addr, peer_count)
                                         .await
                                         .map_err(|e| {
                                             self_encryption::Error::Generic(format!(
@@ -2498,7 +2563,10 @@ impl Client {
                                 async move {
                                     let addr = hash.0;
                                     let addr_hex = hex::encode(addr);
-                                    match self.chunk_get_observed(&addr).await {
+                                    match self
+                                        .chunk_get_observed_from_closest_peers(&addr, peer_count)
+                                        .await
+                                    {
                                         Ok(Some(chunk)) => {
                                             let fetched = fetched_ref.fetch_add(
                                                 1,
@@ -2610,7 +2678,12 @@ impl Client {
                                             // next round rather than
                                             // aborting; only the final
                                             // round's leftovers are fatal.
-                                            match self.chunk_get_observed(&addr).await {
+                                            match self
+                                                .chunk_get_observed_from_closest_peers(
+                                                    &addr, peer_count,
+                                                )
+                                                .await
+                                            {
                                                 Ok(Some(chunk)) => {
                                                     let fetched = fetched_ref.fetch_add(
                                                         1,
