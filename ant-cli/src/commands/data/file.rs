@@ -8,7 +8,8 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use ant_core::data::{
-    Client, CollisionPolicy, DownloadEvent, Error as DataError, PaymentMode, UploadEvent,
+    Client, CollisionPolicy, CostEstimateConfidence, DownloadEvent, Error as DataError,
+    PaymentMode, UploadEvent,
 };
 use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
 
@@ -565,24 +566,26 @@ async fn handle_file_cost(
         result
     };
 
-    let estimate = match raw_result {
-        Ok(e) => e,
-        Err(DataError::CostEstimationInconclusive(msg)) => {
-            anyhow::bail!(
-                "Cost estimation inconclusive: {msg}. The sampled chunks are \
-                 already stored on the network, so we can't sample a representative \
-                 price for the rest of the file. Try again later or upload a file \
-                 that contains some new data."
-            );
-        }
-        Err(e) => anyhow::bail!("Cost estimation failed: {e}"),
-    };
+    let estimate = raw_result.map_err(|e| anyhow::anyhow!("Cost estimation failed: {e}"))?;
 
     if json_output {
         println!("{}", serde_json::to_string(&estimate)?);
     } else {
-        let gas_wei: u128 = estimate.estimated_gas_cost_wei.parse().unwrap_or(0);
-        let cost_display = format_cost(&estimate.storage_cost_atto, gas_wei);
+        // The estimate is display-only; the real upload reconciles the true
+        // cost at payment time. When every sampled chunk is already stored we
+        // say so rather than print a misleading priced number.
+        let cost_display = match estimate.confidence {
+            CostEstimateConfidence::VerifiedAllAlreadyStored => {
+                "already stored on the network — free".to_string()
+            }
+            CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete => {
+                "likely already stored — free (confirmed at payment)".to_string()
+            }
+            CostEstimateConfidence::PricedSample => {
+                let gas_wei: u128 = estimate.estimated_gas_cost_wei.parse().unwrap_or(0);
+                format_cost(&estimate.storage_cost_atto, gas_wei)
+            }
+        };
 
         println!();
         println!("Estimated upload cost for {}", path.display());
