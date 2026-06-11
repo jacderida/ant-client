@@ -29,6 +29,13 @@ use tracing::{debug, info, warn};
 /// Number of chunks per payment wave.
 const PAYMENT_WAVE_SIZE: usize = 64;
 
+/// Soft ceiling on the combined body size of chunks stored concurrently in a
+/// single wave. Caps store concurrency for large chunks so the send path's
+/// per-peer body buffers can't pin multiple GB at once (see V2-461). At ~4 MB
+/// chunks this permits ~16 concurrent stores; small chunks hit the chunk-count
+/// / adaptive limits instead and are unaffected.
+const STORE_INFLIGHT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+
 /// Chunk quoted but not yet paid. Produced by [`Client::prepare_chunk_payment`].
 #[derive(Debug)]
 pub struct PreparedChunk {
@@ -736,6 +743,22 @@ impl Client {
             first_seen.entry(chunk.address).or_insert_with(Instant::now);
         }
 
+        // Bound concurrency by IN-FLIGHT BYTES, not just chunk count. Each
+        // concurrently-stored chunk is held in memory while it is sent to its
+        // close group, and the send path re-serializes the body once per peer,
+        // so a wave of large (~4 MB) chunks at full store concurrency can pin
+        // multiple GB and OOM a small host. Cap how many chunks store at once
+        // so their combined body size stays under the budget; small chunks are
+        // unaffected (the byte bound exceeds the chunk-count bound). The budget
+        // is deliberately conservative for the current per-peer send
+        // amplification and can be raised once that is reduced upstream.
+        let max_chunk_bytes = to_retry.iter().map(|c| c.content.len()).max().unwrap_or(0);
+        // `checked_div` yields `None` only when `max_chunk_bytes == 0` (an
+        // empty/zero-length wave), in which case there is no byte limit.
+        let byte_bound = STORE_INFLIGHT_BYTE_BUDGET
+            .checked_div(max_chunk_bytes)
+            .map_or(usize::MAX, |n| n.max(1));
+
         let mut chunk_attempts_total: usize = 0;
         let mut store_durations_ms: Vec<u64> = Vec::new();
         let mut retries_per_chunk: Vec<u32> = Vec::new();
@@ -754,7 +777,10 @@ impl Client {
             chunk_attempts_total = chunk_attempts_total.saturating_add(to_retry.len());
 
             let store_limiter = self.controller().store.clone();
-            let store_concurrency = store_limiter.current().min(to_retry.len().max(1));
+            let store_concurrency = store_limiter
+                .current()
+                .min(to_retry.len().max(1))
+                .min(byte_bound);
             let mut upload_stream = stream::iter(to_retry)
                 .map(|chunk| {
                     let chunk_clone = chunk.clone();
