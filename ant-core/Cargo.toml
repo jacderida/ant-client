@@ -37,7 +37,7 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "rc-2026.6.2" }
+ant-protocol = { git = "https://github.com/jacderida/ant-protocol", branch = "v2-463" }
 xor_name = "5"
 self_encryption = "0.36"
 futures = "0.3"
