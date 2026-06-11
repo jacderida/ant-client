@@ -47,8 +47,10 @@ use tracing::debug;
 ///   chunks could not be stored)
 /// - `AlreadyStored`, `Encryption`, `Crypto`, `Payment`,
 ///   `Serialization`, `InvalidData`, `SignatureVerification`,
-///   `Config`, `InsufficientDiskSpace`, `CostEstimationInconclusive`
-///   -> `ApplicationError` (would happen on a perfectly healthy link)
+///   `Config`, `InsufficientDiskSpace`, `CostEstimationInconclusive`,
+///   `Cancelled` -> `ApplicationError` (would happen on a perfectly
+///   healthy link; `Cancelled` is caller-initiated and must not be retried
+///   as a transport failure)
 /// - `RemotePut` -> `ApplicationError` (the remote node responded with a
 ///   structured rejection — the transport succeeded, so the node declined
 ///   at the application layer; not a local capacity signal)
@@ -71,6 +73,7 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         | Error::Config(_)
         | Error::InsufficientDiskSpace(_)
         | Error::CostEstimationInconclusive(_)
+        | Error::Cancelled(_)
         | Error::BadQuoteBinding { .. }
         // A remote node responded with a structured rejection — the
         // transport round-trip succeeded, so the node declined at the
@@ -730,6 +733,7 @@ mod tests {
             | Error::AlreadyStored
             | Error::InsufficientDiskSpace(_)
             | Error::CostEstimationInconclusive(_)
+            | Error::Cancelled(_)
             | Error::PartialUpload { .. }
             | Error::BadQuoteBinding { .. }
             | Error::RemotePut { .. } => (),
