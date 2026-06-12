@@ -21,7 +21,7 @@ use crate::data::client::merkle::{
     PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
 };
 use crate::data::client::Client;
-use crate::data::error::{Error, Result};
+use crate::data::error::{Error, PartialUploadSpend, Result};
 use ant_protocol::evm::{Amount, PaymentQuote, QuoteHash, TxHash, MAX_LEAVES};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{compute_address, DATA_TYPE_CHUNK};
@@ -464,6 +464,7 @@ fn partial_upload_after_fatal(
     stored_count: usize,
     total_chunks: usize,
     known_failed: Vec<([u8; 32], String)>,
+    spend: PartialUploadSpend,
     reason: String,
 ) -> Error {
     let stored_set: HashSet<[u8; 32]> = stored_addresses.iter().copied().collect();
@@ -486,7 +487,62 @@ fn partial_upload_after_fatal(
         failed,
         failed_count,
         total_chunks,
+        spend: Box::new(spend),
         reason,
+    }
+}
+
+/// One wave's contribution to a single-node upload, distilled from its
+/// `batch_upload_chunks_with_events` result.
+#[derive(Debug)]
+struct SingleWaveOutcome {
+    /// Addresses confirmed stored in this wave.
+    stored: Vec<[u8; 32]>,
+    /// Chunks that failed after retries in this wave.
+    failed: Vec<([u8; 32], String)>,
+    /// Storage cost paid on-chain for this wave, in atto-tokens.
+    storage_atto: Amount,
+    /// Gas paid on-chain for this wave, in wei.
+    gas_wei: u128,
+    /// Per-wave store/retry statistics. Empty for a quorum-short wave, whose
+    /// `PartialUpload` carries no stats.
+    stats: WaveAggregateStats,
+}
+
+/// Fold one wave's batch-upload result for the single-node path.
+///
+/// A `PartialUpload` (chunks short of quorum after retries) is **recoverable**:
+/// its stored/failed chunks and on-chain spend are returned so the caller
+/// records them and continues to the next wave, making the file make maximum
+/// progress exactly like `upload_waves_merkle`. Every other error is **fatal**
+/// (wallet/payment-infrastructure failures, missing proofs, spill reads) and is
+/// returned via `Err` to abort the file. Because `UPLOAD_WAVE_SIZE ==
+/// PAYMENT_WAVE_SIZE`, each batch call is exactly one payment wave, so folding a
+/// `PartialUpload` leaves nothing un-attempted within the wave.
+fn fold_single_wave(
+    result: Result<(Vec<[u8; 32]>, String, u128, WaveAggregateStats)>,
+) -> Result<SingleWaveOutcome> {
+    match result {
+        Ok((stored, storage, gas, stats)) => Ok(SingleWaveOutcome {
+            stored,
+            failed: Vec::new(),
+            storage_atto: storage.parse().unwrap_or(Amount::ZERO),
+            gas_wei: gas,
+            stats,
+        }),
+        Err(Error::PartialUpload {
+            stored,
+            failed,
+            spend,
+            ..
+        }) => Ok(SingleWaveOutcome {
+            stored,
+            failed,
+            storage_atto: spend.storage_cost_atto.parse().unwrap_or(Amount::ZERO),
+            gas_wei: spend.gas_cost_wei,
+            stats: WaveAggregateStats::default(),
+        }),
+        Err(e) => Err(e),
     }
 }
 
@@ -1429,7 +1485,7 @@ impl Client {
         match prepared.payment_info {
             ExternalPaymentInfo::WaveBatch {
                 prepared_chunks,
-                payment_intent: _,
+                payment_intent,
             } => {
                 let paid_chunks = finalize_batch_payment(prepared_chunks, tx_hash_map)?;
                 let wave_result = self
@@ -1451,6 +1507,13 @@ impl Client {
                         failed: wave_result.failed,
                         failed_count,
                         total_chunks,
+                        // Report the storage spend known from the payment intent
+                        // the external signer was handed. Gas is paid by the
+                        // signer out-of-band, so it stays unknown (0).
+                        spend: Box::new(PartialUploadSpend {
+                            storage_cost_atto: payment_intent.total_amount.to_string(),
+                            gas_cost_wei: 0,
+                        }),
                         reason: "finalize_upload: chunk storage failed after retries".into(),
                     });
                 }
@@ -1467,7 +1530,9 @@ impl Client {
                     chunks_failed: 0,
                     total_chunks,
                     payment_mode_used: PaymentMode::Single,
-                    storage_cost_atto: "0".into(),
+                    // Storage spend is known from the payment intent; gas is
+                    // paid by the external signer out-of-band (unknown here).
+                    storage_cost_atto: payment_intent.total_amount.to_string(),
                     gas_cost_wei: 0,
                     data_map_address,
                     chunk_attempts_total: stats.chunk_attempts_total,
@@ -1770,7 +1835,7 @@ impl Client {
                             &spill,
                             &merkle_plan.to_upload,
                             progress.as_ref(),
-                            merkle_plan.already_stored.len(),
+                            &merkle_plan.already_stored,
                             chunk_count,
                             Some(&file_path_key),
                         )
@@ -1832,7 +1897,7 @@ impl Client {
                                 &spill,
                                 &merkle_plan.to_upload,
                                 progress.as_ref(),
-                                merkle_plan.already_stored.len(),
+                                &merkle_plan.already_stored,
                                 chunk_count,
                                 Some(&file_path_key),
                             )
@@ -1958,7 +2023,7 @@ impl Client {
             spill,
             &spill.addresses,
             progress,
-            0,
+            &[],
             spill.len(),
             resume_key,
         )
@@ -1970,16 +2035,37 @@ impl Client {
         spill: &ChunkSpill,
         addresses: &[[u8; 32]],
         progress: Option<&mpsc::Sender<UploadEvent>>,
-        stored_offset: usize,
+        already_stored_addresses: &[[u8; 32]],
         total_chunks: usize,
         resume_key: Option<&str>,
     ) -> Result<(usize, String, u128, WaveAggregateStats)> {
-        let mut total_stored = stored_offset;
+        let mut total_stored = already_stored_addresses.len();
         let mut total_storage = Amount::ZERO;
         let mut total_gas: u128 = 0;
         let mut agg_stats = WaveAggregateStats::default();
+        // A wave whose chunks fall short of quorum after retries must not abort
+        // the file: its failures are accumulated here and surfaced as a single
+        // `PartialUpload` only after every wave has been attempted, mirroring
+        // `upload_waves_merkle`. Aborting on the first failed wave (the old `?`)
+        // discarded all later waves' progress — already self-encrypted, spilled,
+        // and in some cases already paid for — converting high per-chunk success
+        // into 0% per-file success.
+        // Seed with the addresses a preflight already confirmed stored (e.g.
+        // the merkle-fallback path passes `merkle_plan.already_stored`), so a
+        // returned `PartialUpload.stored` lists every stored chunk and
+        // `stored_count == stored.len()` holds for programmatic callers.
+        let mut stored_addresses: Vec<[u8; 32]> = already_stored_addresses.to_vec();
+        let mut failed: Vec<([u8; 32], String)> = Vec::new();
         let waves: Vec<&[[u8; 32]]> = addresses.chunks(UPLOAD_WAVE_SIZE).collect();
         let wave_count = waves.len();
+
+        // Unconditional breadcrumb: lets a clean run confirm the continue-on-
+        // partial single-node path is in effect (the old path aborted the file
+        // on the first failed wave instead of continuing across all waves).
+        info!(
+            "single-node upload: {} chunk(s) in {wave_count} wave(s) (continue-on-partial)",
+            addresses.len()
+        );
 
         for (wave_idx, wave_addrs) in waves.into_iter().enumerate() {
             let wave_num = wave_idx + 1;
@@ -2001,35 +2087,50 @@ impl Client {
                     })
                     .await;
             }
-            let (addresses, wave_storage, wave_gas, wave_stats) = self
-                .batch_upload_chunks_with_events(
+            // Fold this wave's result. A quorum shortfall (`PartialUpload`) is
+            // recoverable and its parts are returned to be recorded here;
+            // genuinely fatal errors propagate via `?` and abort the file, as in
+            // `upload_waves_merkle`.
+            let outcome = fold_single_wave(
+                self.batch_upload_chunks_with_events(
                     wave_data,
                     progress,
                     total_stored,
                     total_chunks,
                     resume_key,
                 )
-                .await?;
-            total_stored += addresses.len();
-            if let Ok(cost) = wave_storage.parse::<Amount>() {
-                total_storage += cost;
+                .await,
+            )?;
+
+            if !outcome.failed.is_empty() {
+                warn!(
+                    "Wave {wave_num}/{wave_count}: {} chunk(s) failed to store after retries; \
+                     continuing with remaining waves",
+                    outcome.failed.len()
+                );
             }
-            total_gas = total_gas.saturating_add(wave_gas);
-            // Merge per-call stats (each call already aggregates across the
-            // waves it ran internally, so a simple sum/extend is correct).
+
+            total_stored += outcome.stored.len();
+            stored_addresses.extend(outcome.stored);
+            failed.extend(outcome.failed);
+            total_storage += outcome.storage_atto;
+            total_gas = total_gas.saturating_add(outcome.gas_wei);
+            // Merge per-wave stats (a quorum-short wave contributes none, since
+            // `PartialUpload` carries no stats).
             agg_stats.chunk_attempts_total = agg_stats
                 .chunk_attempts_total
-                .saturating_add(wave_stats.chunk_attempts_total);
+                .saturating_add(outcome.stats.chunk_attempts_total);
             agg_stats
                 .store_durations_ms
-                .extend(wave_stats.store_durations_ms);
+                .extend(outcome.stats.store_durations_ms);
             for (slot, count) in agg_stats
                 .retries_histogram
                 .iter_mut()
-                .zip(wave_stats.retries_histogram.iter())
+                .zip(outcome.stats.retries_histogram.iter())
             {
                 *slot = slot.saturating_add(*count);
             }
+
             if let Some(tx) = progress {
                 let _ = tx
                     .send(UploadEvent::WaveComplete {
@@ -2040,6 +2141,28 @@ impl Client {
                     })
                     .await;
             }
+        }
+
+        // Any chunk still failed after every wave was attempted means the file
+        // is not fully stored — surface it as `PartialUpload` (never silently
+        // succeed with missing chunks), carrying the real on-chain spend.
+        if !failed.is_empty() {
+            let failed_count = failed.len();
+            warn!(
+                "single-node upload incomplete: {failed_count}/{total_chunks} chunks failed after retries"
+            );
+            return Err(Error::PartialUpload {
+                stored: stored_addresses,
+                stored_count: total_stored,
+                failed,
+                failed_count,
+                total_chunks,
+                spend: Box::new(PartialUploadSpend {
+                    storage_cost_atto: total_storage.to_string(),
+                    gas_cost_wei: total_gas,
+                }),
+                reason: format!("{failed_count} chunk(s) failed to store after retries"),
+            });
         }
 
         Ok((
@@ -2224,6 +2347,10 @@ impl Client {
                     total_stored,
                     total_chunks,
                     known_failed,
+                    PartialUploadSpend {
+                        storage_cost_atto: batch_result.storage_cost_atto.clone(),
+                        gas_cost_wei: batch_result.gas_cost_wei,
+                    },
                     format!("merkle chunk store aborted: {e}"),
                 ));
             }
@@ -2309,6 +2436,10 @@ impl Client {
                     total_stored,
                     total_chunks,
                     known_failed,
+                    PartialUploadSpend {
+                        storage_cost_atto: batch_result.storage_cost_atto.clone(),
+                        gas_cost_wei: batch_result.gas_cost_wei,
+                    },
                     format!("merkle chunk store aborted: {reason}"),
                 ));
             }
@@ -2331,6 +2462,10 @@ impl Client {
                 failed,
                 failed_count,
                 total_chunks,
+                spend: Box::new(PartialUploadSpend {
+                    storage_cost_atto: batch_result.storage_cost_atto.clone(),
+                    gas_cost_wei: batch_result.gas_cost_wei,
+                }),
                 reason: format!(
                     "{failed_count} chunk(s) short of quorum after {total_attempts} attempts"
                 ),
@@ -3012,6 +3147,68 @@ mod tests {
 
         assert_eq!(to_store, vec![paid_a, paid_c]);
         assert_eq!(missing, vec![unpaid_b, unpaid_d]);
+    }
+
+    /// A wave that returns `Ok` contributes its stored chunks, parsed cost, and
+    /// stats; nothing is recorded as failed.
+    #[test]
+    fn fold_single_wave_keeps_ok_wave() {
+        let stored = vec![[1u8; 32], [2u8; 32]];
+        let stats = WaveAggregateStats {
+            chunk_attempts_total: 7,
+            ..Default::default()
+        };
+
+        let outcome = fold_single_wave(Ok((stored.clone(), "100".to_string(), 9, stats))).unwrap();
+
+        assert_eq!(outcome.stored, stored);
+        assert!(outcome.failed.is_empty());
+        assert_eq!(outcome.storage_atto.to_string(), "100");
+        assert_eq!(outcome.gas_wei, 9);
+        assert_eq!(outcome.stats.chunk_attempts_total, 7);
+    }
+
+    /// The core V2-461 semantic: a wave short of quorum (`PartialUpload`) is
+    /// recoverable — its stored chunks, failed chunks, and on-chain spend are
+    /// folded so the caller can continue to the next wave rather than aborting
+    /// the whole file.
+    #[test]
+    fn fold_single_wave_folds_partial_upload() {
+        let stored = vec![[3u8; 32]];
+        let failed = vec![([4u8; 32], "short of quorum".to_string())];
+        let err = Error::PartialUpload {
+            stored: stored.clone(),
+            stored_count: 1,
+            failed: failed.clone(),
+            failed_count: 1,
+            total_chunks: 2,
+            spend: Box::new(PartialUploadSpend {
+                storage_cost_atto: "250".to_string(),
+                gas_cost_wei: 11,
+            }),
+            reason: "wave store failed after retries".to_string(),
+        };
+
+        let outcome = fold_single_wave(Err(err)).unwrap();
+
+        assert_eq!(outcome.stored, stored);
+        assert_eq!(outcome.failed, failed);
+        assert_eq!(outcome.storage_atto.to_string(), "250");
+        assert_eq!(outcome.gas_wei, 11);
+        // `PartialUpload` carries no stats, so the failed wave contributes none.
+        assert_eq!(outcome.stats.chunk_attempts_total, 0);
+    }
+
+    /// A non-`PartialUpload` error (wallet/payment-infrastructure failure) is
+    /// fatal and must abort the file, not be folded into the failed set.
+    #[test]
+    fn fold_single_wave_propagates_fatal_error() {
+        let result = fold_single_wave(Err(Error::Payment("wallet unavailable".to_string())));
+
+        assert!(
+            matches!(result, Err(Error::Payment(_))),
+            "fatal payment error must propagate, got: {result:?}"
+        );
     }
 
     #[test]

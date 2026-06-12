@@ -634,6 +634,10 @@ mod tests {
                     failed: vec![],
                     failed_count: 0,
                     total_chunks: 0,
+                    spend: Box::new(crate::data::error::PartialUploadSpend {
+                        storage_cost_atto: "0".to_string(),
+                        gas_cost_wei: 0,
+                    }),
                     reason: "r".to_string(),
                 },
                 Outcome::NetworkError,
