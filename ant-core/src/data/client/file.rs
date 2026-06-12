@@ -111,6 +111,33 @@ const DOWNLOAD_STREAM_BATCH_BYTES_PER_CHUNK_MULTIPLIER: u64 = 3;
 /// of a file already live on the network.
 const ESTIMATE_SAMPLE_CAP: usize = 5;
 
+/// Pick up to `cap` chunk indices spread evenly across `[0, total)`, always
+/// including the first and last chunk.
+///
+/// Sampling the *first* N chunks biases the probe: a file sharing a leading
+/// prefix with a prior upload (compressed archives, similar headers) reports
+/// those chunks as `AlreadyStored` even when the tail is new, so a positional
+/// sample looks in the worst possible place. Spreading the sample means a
+/// single new chunk anywhere in the file yields a real price.
+///
+/// Returns `[0]` for a single chunk and every index when `total <= cap`, so
+/// [`Client::estimate_upload_cost`] can still detect the "whole file sampled"
+/// case. Indices are strictly increasing.
+fn distributed_sample_indices(total: usize, cap: usize) -> Vec<usize> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let sample_limit = total.min(cap);
+    if sample_limit <= 1 {
+        return vec![0];
+    }
+    let mut indices: Vec<usize> = (0..sample_limit)
+        .map(|i| i * (total - 1) / (sample_limit - 1))
+        .collect();
+    indices.dedup(); // defensive: already strictly increasing for cap >= 2
+    indices
+}
+
 /// Gas used by one `pay_for_quotes` transaction that packs up to
 /// `UPLOAD_WAVE_SIZE` (quote_hash, rewards_address, amount) entries.
 ///
@@ -672,9 +699,38 @@ pub enum Visibility {
     Public,
 }
 
+/// Confidence attached to an [`UploadCostEstimate`]'s `storage_cost_atto`.
+///
+/// `estimate_upload_cost` prices a file by sampling a few of its chunk
+/// addresses and extrapolating. When every sampled chunk is already stored
+/// there is no live price to extrapolate from, so a `"0"` cost can mean either
+/// "provably free" (the whole file was sampled) or only "probably free" (the
+/// tail was unsampled). This lets callers tell those apart instead of treating
+/// every `"0"` as unconditionally free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostEstimateConfidence {
+    /// At least one sampled chunk returned a live quote; `storage_cost_atto`
+    /// is extrapolated from a real per-chunk price. The normal case.
+    #[default]
+    PricedSample,
+    /// Every chunk in the file was sampled and every one was already stored.
+    /// `storage_cost_atto` is exactly `"0"` — the upload is genuinely free.
+    VerifiedAllAlreadyStored,
+    /// Every *sampled* chunk was already stored, but not all chunks were
+    /// sampled. `storage_cost_atto` is `"0"` as a best-effort guess; the real
+    /// upload reconciles the true cost at payment time. Render this as "likely
+    /// already stored", not a guaranteed-free price.
+    AllSamplesAlreadyStoredIncomplete,
+}
+
 /// Estimated cost of uploading a file, returned by
 /// [`Client::estimate_upload_cost`].
+///
+/// Marked `#[non_exhaustive]` so adding a field later is not a breaking change
+/// for downstream consumers that construct or pattern-match on this struct.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct UploadCostEstimate {
     /// Original file size in bytes.
     pub file_size: u64,
@@ -688,6 +744,9 @@ pub struct UploadCostEstimate {
     pub estimated_gas_cost_wei: String,
     /// Payment mode that would be used.
     pub payment_mode: PaymentMode,
+    /// How much to trust `storage_cost_atto`. See [`CostEstimateConfidence`].
+    #[serde(default)]
+    pub confidence: CostEstimateConfidence,
 }
 
 /// Result of a file upload: the `DataMap` needed to retrieve the file.
@@ -958,19 +1017,22 @@ impl Client {
     /// `GAS_PER_MERKLE_TX`) priced at `ARBITRUM_GAS_PRICE_WEI`. Real gas
     /// varies with network conditions.
     ///
-    /// If the first sampled chunk is already stored on the network, the
-    /// function retries with subsequent chunk addresses (up to
-    /// `ESTIMATE_SAMPLE_CAP`). If every sampled address reports stored,
-    /// a [`Error::CostEstimationInconclusive`] is returned so callers can
-    /// decide how to react rather than trust a bogus "free" estimate. Only
-    /// when every address in the file is stored do we return a zero-cost
-    /// estimate.
+    /// Sampled chunk addresses are spread across the whole file (not the first
+    /// N) so a shared leading prefix doesn't bias the sample. When a sample
+    /// returns a live quote the per-chunk price is extrapolated and the result
+    /// is tagged [`CostEstimateConfidence::PricedSample`].
+    ///
+    /// When every sampled chunk is already stored the result is still `Ok`
+    /// with `storage_cost_atto: "0"`, tagged either
+    /// [`CostEstimateConfidence::VerifiedAllAlreadyStored`] when the whole file
+    /// was sampled (exactly free) or
+    /// [`CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete`] when the
+    /// tail was unsampled (a best-effort guess that payment reconciles).
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read, encryption fails,
-    /// the network cannot provide a quote, or every sampled chunk is
-    /// already stored ([`Error::CostEstimationInconclusive`]).
+    /// Returns an error if the file cannot be read, encryption fails, or the
+    /// network cannot provide a quote.
     pub async fn estimate_upload_cost(
         &self,
         path: &Path,
@@ -1005,17 +1067,19 @@ impl Client {
 
         info!("Encrypted into {chunk_count} chunks, requesting quote");
 
-        // Sample up to ESTIMATE_SAMPLE_CAP distinct chunk addresses. A single
-        // AlreadyStored result says nothing about the rest of the file — the
-        // first chunk is often a DataMap-adjacent chunk that collides with
-        // prior uploads even when 99% of the file is new. Only treat the
-        // whole file as "fully stored" when every sample comes back stored.
-        let sample_limit = spill.addresses.len().min(ESTIMATE_SAMPLE_CAP);
+        // Sample chunk addresses spread evenly across the file (see
+        // `distributed_sample_indices`) rather than the first N. A single
+        // AlreadyStored result says nothing about the rest of the file, and a
+        // positional sample lands on a shared leading prefix in the worst case,
+        // so we spread the probe and only treat the whole file as "fully
+        // stored" when every sample comes back stored.
+        let sample_indices = distributed_sample_indices(spill.addresses.len(), ESTIMATE_SAMPLE_CAP);
         let mut sampled = 0usize;
         let mut all_already_stored = true;
         let mut quotes_opt: Option<Vec<QuoteEntry>> = None;
 
-        for addr in spill.addresses.iter().take(sample_limit) {
+        for &idx in &sample_indices {
+            let addr = &spill.addresses[idx];
             sampled += 1;
             let chunk_bytes = spill.read_chunk(addr)?;
             let data_size = u64::try_from(chunk_bytes.len())
@@ -1031,8 +1095,9 @@ impl Client {
                 }
                 Err(Error::AlreadyStored) => {
                     debug!(
-                        "Sample chunk {} already stored; trying next address ({sampled}/{sample_limit})",
-                        hex::encode(addr)
+                        "Sample chunk {} already stored; trying next address ({sampled}/{})",
+                        hex::encode(addr),
+                        sample_indices.len()
                     );
                     continue;
                 }
@@ -1046,8 +1111,7 @@ impl Client {
             Some(q) => q,
             None if all_already_stored && sampled == chunk_count => {
                 // Every address in the file was sampled and every one is
-                // already on the network — returning a zero-cost estimate is
-                // accurate in this case.
+                // already on the network — a zero-cost estimate is exact here.
                 info!("All {chunk_count} chunks already stored; returning zero-cost estimate");
                 return Ok(UploadCostEstimate {
                     file_size,
@@ -1059,14 +1123,31 @@ impl Client {
                     } else {
                         PaymentMode::Single
                     },
+                    confidence: CostEstimateConfidence::VerifiedAllAlreadyStored,
                 });
             }
             None => {
-                return Err(Error::CostEstimationInconclusive(format!(
-                    "sampled {sampled} chunk addresses out of {chunk_count} and every \
-                     one reported AlreadyStored; cannot infer a representative price \
-                     for the remaining chunks"
-                )));
+                // Every sampled chunk was already stored but the tail was not
+                // sampled, so there is no live price to extrapolate. The
+                // estimate is display-only and payment reconciles the true
+                // cost, so return an optimistic zero flagged as incomplete
+                // rather than erroring — callers still get a value to show.
+                info!(
+                    "All {sampled}/{chunk_count} sampled chunks already stored; \
+                     returning incomplete zero-cost estimate"
+                );
+                return Ok(UploadCostEstimate {
+                    file_size,
+                    chunk_count,
+                    storage_cost_atto: "0".into(),
+                    estimated_gas_cost_wei: "0".into(),
+                    payment_mode: if uses_merkle {
+                        PaymentMode::Merkle
+                    } else {
+                        PaymentMode::Single
+                    },
+                    confidence: CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete,
+                });
             }
         };
 
@@ -1124,6 +1205,7 @@ impl Client {
             } else {
                 PaymentMode::Single
             },
+            confidence: CostEstimateConfidence::PricedSample,
         })
     }
 
@@ -3041,6 +3123,33 @@ impl Client {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distributed_sample_indices_spreads_across_large_file() {
+        // cap 5 over 100 chunks: first and last included, evenly spread.
+        assert_eq!(distributed_sample_indices(100, 5), vec![0, 24, 49, 74, 99]);
+    }
+
+    #[test]
+    fn distributed_sample_indices_covers_whole_small_file() {
+        // total <= cap returns every index, preserving the exact
+        // "whole file sampled" detection in estimate_upload_cost.
+        assert_eq!(distributed_sample_indices(3, 5), vec![0, 1, 2]);
+        assert_eq!(distributed_sample_indices(5, 5), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn distributed_sample_indices_is_in_range_and_increasing() {
+        assert!(distributed_sample_indices(0, 5).is_empty());
+        assert_eq!(distributed_sample_indices(1, 5), vec![0]);
+        for total in 1..200usize {
+            let idx = distributed_sample_indices(total, 5);
+            assert_eq!(*idx.first().unwrap(), 0);
+            assert_eq!(*idx.last().unwrap(), total - 1);
+            assert!(idx.iter().all(|&i| i < total));
+            assert!(idx.windows(2).all(|w| w[0] < w[1]));
+        }
+    }
 
     #[test]
     fn disk_space_check_passes_for_small_file() {
