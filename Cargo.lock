@@ -892,8 +892,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.12.1-rc.1"
-source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.6.2#8f941b84751b1f3743be7ea915ab269378063e2d"
+version = "0.12.1-rc.4"
+source = "git+https://github.com/mickvandijke/saorsa-node.git?branch=snp-witnessed-close-group#d037b1ef2f609c92fa3c3af9cf0fc8fa80cc2a10"
 dependencies = [
  "ant-protocol",
  "blake3",
@@ -941,8 +941,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.1.3-rc.1"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.6.2#053be60ced998c6a4c0833b4560f1ddb89a86514"
+version = "2.1.3"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=snp-witnessed-close-group#0cb92b50d980cff3547ba49706a03ff2d3ac8217"
 dependencies = [
  "blake3",
  "bytes",
@@ -5248,8 +5248,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.25.0-rc.1"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.2#088c3552bf7257ee10b5a670cd4990d1c0e7b8af"
+version = "0.25.0"
+source = "git+https://github.com/mickvandijke/saorsa-core.git?branch=snp-witnessed-close-group#354a9d7d4d4f44edaa61a6fbf2393535df607019"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5362,8 +5362,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.35.0-rc.1"
-source = "git+https://github.com/saorsa-labs/saorsa-transport?branch=rc-2026.6.2#48b0874adaefcf26650634a5f93a9618715518ca"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "621d0a207914a8fd6453f25e4bcc369914cbfaf59a2857e898c079b95f52f5bb"
 dependencies = [
  "anyhow",
  "async-trait",
