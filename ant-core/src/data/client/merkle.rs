@@ -390,7 +390,9 @@ impl Client {
         data_type: u32,
         data_size: u64,
     ) -> Result<bool> {
-        let result = self.get_store_quotes(address, data_size, data_type).await;
+        let result = self
+            .get_store_quotes_with_fault_tolerance(address, data_size, data_type)
+            .await;
         if let Err(e) = &result {
             if matches!(classify_error(e), Outcome::Timeout | Outcome::NetworkError) {
                 debug!(

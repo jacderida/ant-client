@@ -46,19 +46,19 @@ const STABILIZATION_TIMEOUT_SECS: u64 = 180;
 /// Default node count for standard E2E tests.
 ///
 /// `CLOSE_GROUP_SIZE` (7) is the quorum the client needs for a quote to
-/// succeed, so spawning exactly that many — or `+ 1` — leaves zero slack:
-/// a single slow peer drops the count to 6 and fails the whole test with
-/// `InsufficientPeers("Got 6 quotes, need 7. ...")`.
+/// succeed. Spawning only that many nodes leaves the DHT and direct
+/// connection set too thin during startup, especially while every test node is
+/// still stabilising.
 ///
 /// This is systematic on macOS CI runners, which are heavily virtualised
 /// (nested virt) and roughly half the CPU throughput of Linux runners.
-/// The 8-node QUIC handshake burst saturates the CPU and at least one
-/// peer consistently can't complete its handshake within the 10 s default
-/// per-peer timeout. Linux runners finish all 8 handshakes comfortably.
+/// The QUIC handshake burst saturates the CPU and can leave too few peers
+/// ready for a `CLOSE_GROUP_SIZE` quote attempt. Linux runners finish those
+/// handshakes more comfortably.
 ///
-/// Spawning `CLOSE_GROUP_SIZE * 2` gives us one full group of slack — if
-/// up to 7 peers are slow, quote collection still reaches quorum. Each
-/// extra node is cheap (~200 ms spawn delay) compared to a flaky suite.
+/// Spawning `CLOSE_GROUP_SIZE * 2` gives the lookup layer enough nearby peers
+/// to return a full close group reliably. Each extra node is cheap (~200 ms
+/// spawn delay) compared to a flaky suite.
 pub const DEFAULT_NODE_COUNT: usize = CLOSE_GROUP_SIZE * 2;
 
 /// Index of the median quote in a `SingleNodePayment` quotes array.
@@ -77,7 +77,7 @@ const TEST_MAX_RECORDS: usize = 1280;
 /// DHT lookups, and payment round-trips compete for the same cores. On
 /// heavily-virtualised runners (macOS GitHub Actions in particular), the
 /// 10 s per-peer timeout fires before the slowest peer can finish its
-/// handshake, which surfaces as `InsufficientPeers("Got 6 quotes, need 7")`.
+/// handshake, which can surface as `InsufficientPeers`.
 ///
 /// 60 s is deliberately conservative: in the happy path everything completes
 /// in well under a second, so the larger budget only shows up on flakes.
