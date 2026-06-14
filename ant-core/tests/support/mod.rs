@@ -286,6 +286,7 @@ impl MiniTestnet {
                 network: evm_network.clone(),
             },
             cache_capacity: 1000,
+            close_group_size: CLOSE_GROUP_SIZE,
             local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
