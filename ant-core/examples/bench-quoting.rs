@@ -309,11 +309,11 @@ async fn bench_normal_once(client: &Client, rep: usize) -> Rep {
     rand::thread_rng().fill(&mut content[..]);
     let address = compute_address(&content);
 
-    // 2. find_closest_peers (same call single-node quoting uses).
+    // 2. find_closest_peers (same strict close-group call single-node quoting uses).
     let t0 = Instant::now();
     let peers = match client
         .network()
-        .find_closest_peers(&address, CLOSE_GROUP_SIZE * 2)
+        .find_closest_peers(&address, CLOSE_GROUP_SIZE)
         .await
     {
         Ok(p) => p,
@@ -417,7 +417,7 @@ async fn bench_normal_once(client: &Client, rep: usize) -> Rep {
         stages.push(("quote_rpc_max".into(), *s.last().unwrap_or(&0)));
     }
 
-    let ok = collect_res.is_ok() && successes >= CLOSE_GROUP_SIZE;
+    let ok = collect_res.is_ok() && successes == CLOSE_GROUP_SIZE;
     Rep {
         rep,
         stages_ms: stages,

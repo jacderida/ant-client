@@ -1066,6 +1066,7 @@ impl Client {
         }
 
         info!("Encrypted into {chunk_count} chunks, requesting quote");
+        let uses_merkle = should_use_merkle(chunk_count, mode);
 
         // Sample chunk addresses spread evenly across the file (see
         // `distributed_sample_indices`) rather than the first N. A single
@@ -1084,10 +1085,14 @@ impl Client {
             let chunk_bytes = spill.read_chunk(addr)?;
             let data_size = u64::try_from(chunk_bytes.len())
                 .map_err(|e| Error::InvalidData(format!("chunk size too large: {e}")))?;
-            match self
-                .get_store_quotes(addr, data_size, DATA_TYPE_CHUNK)
-                .await
-            {
+            let result = if uses_merkle {
+                self.get_store_quotes_with_fault_tolerance(addr, data_size, DATA_TYPE_CHUNK)
+                    .await
+            } else {
+                self.get_store_quotes(addr, data_size, DATA_TYPE_CHUNK)
+                    .await
+            };
+            match result {
                 Ok(q) => {
                     quotes_opt = Some(q);
                     all_already_stored = false;
@@ -1104,8 +1109,6 @@ impl Client {
                 Err(e) => return Err(e),
             }
         }
-
-        let uses_merkle = should_use_merkle(chunk_count, mode);
 
         let quotes = match quotes_opt {
             Some(q) => q,

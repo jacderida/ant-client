@@ -16,6 +16,17 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+/// Fault-tolerant quote collection asks one extra close group of peers and
+/// keeps the closest successful `CLOSE_GROUP_SIZE` responders. This remains
+/// useful for merkle preflight probes, but single-node payments deliberately
+/// ask only the actual close group.
+const FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER: usize = 2;
+
+/// Overall timeout for collecting quote responses. Must accommodate
+/// connect_with_fallback cascade (direct 5s + hole-punch 15s×3 + relay 30s ≈
+/// 80s) plus the per-peer quote timeout.
+const QUOTE_COLLECTION_TIMEOUT_SECS: u64 = 120;
+
 /// ML-DSA-65 public key length in bytes. Mirrors the same value defined as
 /// `pub const ML_DSA_65_PUBLIC_KEY_SIZE` in `saorsa-pqc::pqc::types`, which
 /// the storer's `peer_id_from_public_key_bytes` enforces. We keep a local
@@ -38,9 +49,9 @@ const ML_DSA_PUB_KEY_LEN: usize = 1952;
 ///
 /// We mirror the cheap structural check here. The storer also runs
 /// `verify_quote_content` and `verify_quote_signature`; those are ML-DSA
-/// verifications (~1 ms × 14 quotes × every chunk) and are deliberately NOT
-/// mirrored on the client to keep upload latency unchanged. They are tracked
-/// as a follow-up if a real attack surfaces them.
+/// verifications (~1 ms per requested quote) and are deliberately NOT mirrored
+/// on the client to keep upload latency unchanged. They are tracked as a
+/// follow-up if a real attack surfaces them.
 fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
     if quote.pub_key.len() != ML_DSA_PUB_KEY_LEN {
         return false;
@@ -134,12 +145,20 @@ fn drop_quotes_with_bad_bindings(
     before - quotes.len()
 }
 
+fn single_node_quote_query_count() -> usize {
+    CLOSE_GROUP_SIZE
+}
+
+fn fault_tolerant_quote_query_count() -> usize {
+    CLOSE_GROUP_SIZE * FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER
+}
+
 impl Client {
     /// Get storage quotes from the closest peers for a given address.
     ///
-    /// Queries 2x `CLOSE_GROUP_SIZE` peers from the DHT for fault tolerance,
-    /// requests quotes from all of them concurrently, and returns the
-    /// `CLOSE_GROUP_SIZE` closest successful responders sorted by XOR distance.
+    /// Queries exactly `CLOSE_GROUP_SIZE` peers from the DHT, requests quotes
+    /// from all of them concurrently, and returns those responders sorted by
+    /// XOR distance.
     ///
     /// Returns `Error::AlreadyStored` early if `CLOSE_GROUP_MAJORITY` peers
     /// report the chunk is already stored.
@@ -147,25 +166,62 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if insufficient quotes can be collected.
-    #[allow(clippy::too_many_lines)]
     pub async fn get_store_quotes(
         &self,
         address: &[u8; 32],
         data_size: u64,
         data_type: u32,
     ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
+        self.get_store_quotes_from_peers(
+            address,
+            data_size,
+            data_type,
+            single_node_quote_query_count(),
+        )
+        .await
+    }
+
+    /// Get storage quotes with the previous over-query behaviour.
+    ///
+    /// Merkle preflight uses quote responses only as an already-stored probe;
+    /// the actual payment still happens through merkle candidate pools. Keep
+    /// the extra peer buffer there so merkle upload behaviour remains
+    /// unchanged when a few peers are slow or return unusable quote bindings.
+    pub(crate) async fn get_store_quotes_with_fault_tolerance(
+        &self,
+        address: &[u8; 32],
+        data_size: u64,
+        data_type: u32,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
+        self.get_store_quotes_from_peers(
+            address,
+            data_size,
+            data_type,
+            fault_tolerant_quote_query_count(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn get_store_quotes_from_peers(
+        &self,
+        address: &[u8; 32],
+        data_size: u64,
+        data_type: u32,
+        peer_query_count: usize,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
+        debug_assert!(peer_query_count >= CLOSE_GROUP_SIZE);
+
         let node = self.network().node();
 
-        // Over-query for fault tolerance: ask 2x peers, keep closest successful ones.
-        let over_query_count = CLOSE_GROUP_SIZE * 2;
         debug!(
-            "Requesting quotes from up to {over_query_count} peers for address {} (size: {data_size})",
+            "Requesting quotes from up to {peer_query_count} peers for address {} (size: {data_size})",
             hex::encode(address)
         );
 
         let remote_peers = self
             .network()
-            .find_closest_peers(address, over_query_count)
+            .find_closest_peers(address, peer_query_count)
             .await?;
 
         if remote_peers.len() < CLOSE_GROUP_SIZE {
@@ -176,10 +232,7 @@ impl Client {
         }
 
         let per_peer_timeout = Duration::from_secs(self.config().quote_timeout_secs);
-        // Overall timeout for collecting all quotes. Must accommodate
-        // connect_with_fallback cascade (direct 5s + hole-punch 15s×3 + relay 30s ≈ 80s)
-        // plus the per-peer quote timeout. 120s is generous.
-        let overall_timeout = Duration::from_secs(120);
+        let overall_timeout = Duration::from_secs(QUOTE_COLLECTION_TIMEOUT_SECS);
 
         // Request quotes from all peers concurrently
         let mut quote_futures = FuturesUnordered::new();
@@ -246,8 +299,7 @@ impl Client {
         }
 
         // Collect all responses with an overall timeout to prevent indefinite stalls.
-        // Over-query means we have 2x peers, so we can tolerate failures.
-        let mut quotes = Vec::with_capacity(over_query_count);
+        let mut quotes = Vec::with_capacity(peer_query_count);
         let mut already_stored_peers: Vec<(PeerId, [u8; 32])> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
 
@@ -529,6 +581,16 @@ mod tests {
     // ============================================================
 
     #[test]
+    fn quote_query_counts_keep_single_node_close_group_only() {
+        assert_eq!(single_node_quote_query_count(), CLOSE_GROUP_SIZE);
+        assert_eq!(
+            fault_tolerant_quote_query_count(),
+            CLOSE_GROUP_SIZE * FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER
+        );
+        assert!(fault_tolerant_quote_query_count() > single_node_quote_query_count());
+    }
+
+    #[test]
     fn filter_drops_only_bad_bindings_and_leaves_storer_acceptable_quotes() {
         let mut quotes = vec![
             good_quote_real(),
@@ -570,15 +632,15 @@ mod tests {
 
     #[test]
     fn filter_drops_all_when_every_responder_is_bad() {
-        // The "all hostile" case: every over-queried peer returned a bad
-        // binding. The patch should leave us with zero quotes (not panic,
-        // not skip the filter, not return malformed quotes). The caller in
-        // get_store_quotes then surfaces InsufficientPeers.
-        let mut quotes: Vec<_> = (0..CLOSE_GROUP_SIZE * 2)
+        // The "all hostile" case: every peer returned a bad binding. The
+        // patch should leave us with zero quotes (not panic, not skip the
+        // filter, not return malformed quotes). The caller then surfaces
+        // InsufficientPeers.
+        let mut quotes: Vec<_> = (0..fault_tolerant_quote_query_count())
             .map(|_| bad_quote_real())
             .collect();
         let dropped = drop_quotes_with_bad_bindings(&mut quotes);
-        assert_eq!(dropped, CLOSE_GROUP_SIZE * 2);
+        assert_eq!(dropped, fault_tolerant_quote_query_count());
         assert!(quotes.is_empty());
     }
 
@@ -618,10 +680,11 @@ mod tests {
     /// quote, and the storer's `validate_peer_bindings` rejected the
     /// entire close-group proof — burning the chunk's payment.
     ///
-    /// This test is the strongest proof the patch fixes that failure shape:
+    /// This test proves the fault-tolerant quote path still fixes that failure
+    /// shape:
     ///
     /// 1. We assemble `2x CLOSE_GROUP_SIZE` real ML-DSA-65 quotes — the same
-    ///    over-query buffer the production code uses (line 93 of this file).
+    ///    buffer merkle preflight and merkle-mode estimates retain for probes.
     /// 2. One of them is a *crossed-key* quote — the production failure shape.
     /// 3. We run an independent `storer_would_accept` check (re-derived from
     ///    the storer spec, not from `quote_binding_is_valid`) over the
@@ -629,14 +692,14 @@ mod tests {
     ///    storer **would** burn the chunk's payment if we proceeded unfiltered.
     /// 4. We run `drop_quotes_with_bad_bindings`.
     /// 5. We re-run `storer_would_accept` over the post-filter set; we confirm
-    ///    EVERY remaining quote would be accepted, proving the patched
-    ///    `ProofOfPayment` will not trigger the `validate_peer_bindings`
-    ///    rejection that caused the Apr 30 outage.
+    ///    EVERY remaining quote would be accepted, proving the filtered set
+    ///    will not trigger the `validate_peer_bindings` rejection that caused
+    ///    the Apr 30 outage.
     /// 6. We confirm the post-filter set has at least `CLOSE_GROUP_SIZE`
     ///    quotes — the over-query buffer (2x) is sufficient.
     #[test]
     fn repro_apr_30_storer_would_have_rejected_pre_filter_and_accepts_post_filter() {
-        let over_query_count = CLOSE_GROUP_SIZE * 2;
+        let over_query_count = fault_tolerant_quote_query_count();
         let mut quotes: Vec<_> = (0..over_query_count - 1)
             .map(|_| good_quote_real())
             .collect();
@@ -664,7 +727,7 @@ mod tests {
             assert!(
                 storer_binding_would_accept(peer_id, quote),
                 "every post-filter quote must be accepted by the storer spec — \
-                 this is what the patch guarantees: no more burned payments"
+                 this is what the filter guarantees before any quote set is used"
             );
         }
 
@@ -672,7 +735,7 @@ mod tests {
         assert!(
             quotes.len() >= CLOSE_GROUP_SIZE,
             "after filtering, at least CLOSE_GROUP_SIZE good quotes must remain \
-             so we can build a non-rejected ProofOfPayment"
+             so a fault-tolerant probe can still return a full close group"
         );
     }
 
@@ -682,9 +745,8 @@ mod tests {
     /// and return `InsufficientPeers`.
     #[test]
     fn filter_leaves_short_set_when_too_many_bad_peers() {
-        // Buffer is 2x; if more than half are bad, there's no way to refill.
-        let bad_count = CLOSE_GROUP_SIZE + 1;
         let good_count = CLOSE_GROUP_SIZE - 1;
+        let bad_count = fault_tolerant_quote_query_count() - good_count;
         let mut quotes: Vec<_> = std::iter::repeat_with(bad_quote_real)
             .take(bad_count)
             .chain(std::iter::repeat_with(good_quote_real).take(good_count))
