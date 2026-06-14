@@ -5,7 +5,7 @@
 
 use crate::data::error::{Error, Result};
 use ant_protocol::transport::{
-    CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, PeerId,
+    CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, PeerId, WitnessedCloseGroup,
 };
 use ant_protocol::MAX_WIRE_MESSAGE_SIZE;
 use std::net::SocketAddr;
@@ -129,6 +129,30 @@ impl Network {
                 (n.peer_id, addrs)
             })
             .collect())
+    }
+
+    /// Find a quorum-witnessed close group for a target address.
+    ///
+    /// The underlying DHT method returns the initial client K, each responder's
+    /// self-inclusive closest-K view, vote counts, and the final
+    /// quorum-recognised set ordered by pure XOR distance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DHT lookup itself fails. The returned witnessed
+    /// group may still be inconclusive; callers should check
+    /// `WitnessedCloseGroup::is_complete`.
+    pub async fn find_witnessed_close_group(
+        &self,
+        target: &[u8; 32],
+        count: usize,
+        quorum: usize,
+    ) -> Result<WitnessedCloseGroup> {
+        self.node
+            .dht()
+            .find_witnessed_close_group(target, count, quorum)
+            .await
+            .map_err(|e| Error::Network(format!("DHT witnessed close-group lookup failed: {e}")))
     }
 
     /// Get all currently connected peers.

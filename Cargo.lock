@@ -942,7 +942,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.1.4-rc.1"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.6.2#9aef3e94f5f55ca338fca2b478eea8d9bcccf739"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.6.2#1da819bc1ccf9e393ed658b1510cefb2060c3d73"
 dependencies = [
  "blake3",
  "bytes",
@@ -3259,7 +3259,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -5249,7 +5249,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.25.1-rc.1"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.2#8b866a94b3b3d95bef85204ce52dbe1512494bf8"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.2#1e1ce1449b08411426adb95ad1c4eea5b9b19f49"
 dependencies = [
  "anyhow",
  "async-trait",

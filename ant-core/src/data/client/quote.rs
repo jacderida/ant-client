@@ -7,7 +7,7 @@ use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{Amount, PaymentQuote};
-use ant_protocol::transport::{MultiAddr, PeerId};
+use ant_protocol::transport::{MultiAddr, PeerId, WitnessedCloseGroup};
 use ant_protocol::{
     compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
     ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
@@ -21,6 +21,15 @@ use tracing::{debug, info, warn};
 /// useful for merkle preflight probes, but single-node payments deliberately
 /// ask only the actual close group.
 const FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER: usize = 2;
+
+/// Witnessed close-group quorum as a fraction of the initial close group.
+/// For today's `CLOSE_GROUP_SIZE = 7`, this yields the requested 5-of-7
+/// quorum.
+const WITNESSED_QUORUM_NUMERATOR: usize = 2;
+const WITNESSED_QUORUM_DENOMINATOR: usize = 3;
+
+/// Index of the paid median quote after sorting by quoted price.
+const MEDIAN_QUOTE_INDEX: usize = CLOSE_GROUP_SIZE / 2;
 
 /// Overall timeout for collecting quote responses. Must accommodate
 /// connect_with_fallback cascade (direct 5s + hole-punch 15s×3 + relay 30s ≈
@@ -153,12 +162,112 @@ fn fault_tolerant_quote_query_count() -> usize {
     CLOSE_GROUP_SIZE * FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER
 }
 
+fn witnessed_close_group_quorum() -> usize {
+    (CLOSE_GROUP_SIZE * WITNESSED_QUORUM_NUMERATOR).div_ceil(WITNESSED_QUORUM_DENOMINATOR)
+}
+
+fn peer_list(peers: &[PeerId]) -> Vec<String> {
+    peers.iter().map(ToString::to_string).collect()
+}
+
+fn witnessed_initial_peers(witnessed: &WitnessedCloseGroup) -> Vec<String> {
+    witnessed
+        .initial_closest
+        .iter()
+        .map(|node| node.peer_id.to_string())
+        .collect()
+}
+
+fn witnessed_responder_views(witnessed: &WitnessedCloseGroup) -> Vec<String> {
+    witnessed
+        .responder_views
+        .iter()
+        .map(|view| format!("{}=>{:?}", view.responder, peer_list(&view.closest)))
+        .collect()
+}
+
+fn witnessed_vote_counts(witnessed: &WitnessedCloseGroup) -> Vec<String> {
+    witnessed
+        .vote_counts
+        .iter()
+        .map(|(peer_id, votes)| format!("{peer_id}:{votes}"))
+        .collect()
+}
+
+fn witnessed_consensus(witnessed: &WitnessedCloseGroup) -> Vec<String> {
+    witnessed
+        .consensus
+        .iter()
+        .map(|node| format!("{}:{}", node.node.peer_id, node.votes))
+        .collect()
+}
+
+fn witnessed_close_group_diagnostics(
+    address: &[u8; 32],
+    witnessed: &WitnessedCloseGroup,
+) -> String {
+    format!(
+        "target={}, initial={:?}, responder_views={:?}, vote_counts={:?}, quorum={}, final={:?}",
+        hex::encode(address),
+        witnessed_initial_peers(witnessed),
+        witnessed_responder_views(witnessed),
+        witnessed_vote_counts(witnessed),
+        witnessed.quorum,
+        witnessed_consensus(witnessed)
+    )
+}
+
+fn witnessed_quote_peers_or_error(
+    address: &[u8; 32],
+    witnessed: &WitnessedCloseGroup,
+    required: usize,
+) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
+    if witnessed.consensus.len() < required {
+        return Err(Error::InsufficientPeers(format!(
+            "Witnessed close group inconclusive before payment: got {}/{} quorum-recognised peers. {}",
+            witnessed.consensus.len(),
+            required,
+            witnessed_close_group_diagnostics(address, witnessed)
+        )));
+    }
+
+    Ok(witnessed
+        .consensus
+        .iter()
+        .take(required)
+        .map(|candidate| {
+            (
+                candidate.node.peer_id,
+                candidate.node.addresses_by_priority(),
+            )
+        })
+        .collect())
+}
+
+pub(crate) fn median_paid_quote_issuer(
+    quotes: &[(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)],
+) -> Option<(PeerId, Amount)> {
+    if quotes.len() <= MEDIAN_QUOTE_INDEX {
+        return None;
+    }
+
+    let mut by_price: Vec<(usize, PeerId, Amount)> = quotes
+        .iter()
+        .enumerate()
+        .map(|(index, (peer_id, _, _, price))| (index, *peer_id, *price))
+        .collect();
+    by_price.sort_by_key(|(index, _, price)| (*price, *index));
+    by_price
+        .get(MEDIAN_QUOTE_INDEX)
+        .map(|(_, peer_id, price)| (*peer_id, *price))
+}
+
 impl Client {
     /// Get storage quotes from the closest peers for a given address.
     ///
-    /// Queries exactly `CLOSE_GROUP_SIZE` peers from the DHT, requests quotes
-    /// from all of them concurrently, and returns those responders sorted by
-    /// XOR distance.
+    /// Builds a quorum-witnessed close group of exactly `CLOSE_GROUP_SIZE`
+    /// peers, requests quotes from all of them concurrently, and returns those
+    /// responders sorted by XOR distance.
     ///
     /// Returns `Error::AlreadyStored` early if `CLOSE_GROUP_MAJORITY` peers
     /// report the chunk is already stored.
@@ -172,13 +281,9 @@ impl Client {
         data_size: u64,
         data_type: u32,
     ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
-        self.get_store_quotes_from_peers(
-            address,
-            data_size,
-            data_type,
-            single_node_quote_query_count(),
-        )
-        .await
+        let remote_peers = self.select_witnessed_quote_peers(address).await?;
+        self.collect_store_quotes_from_remote_peers(address, data_size, data_type, remote_peers)
+            .await
     }
 
     /// Get storage quotes with the previous over-query behaviour.
@@ -193,24 +298,55 @@ impl Client {
         data_size: u64,
         data_type: u32,
     ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
-        self.get_store_quotes_from_peers(
-            address,
-            data_size,
-            data_type,
-            fault_tolerant_quote_query_count(),
-        )
-        .await
+        let peer_query_count = fault_tolerant_quote_query_count();
+        let remote_peers = self
+            .network()
+            .find_closest_peers(address, peer_query_count)
+            .await?;
+
+        self.collect_store_quotes_from_remote_peers(address, data_size, data_type, remote_peers)
+            .await
+    }
+
+    async fn select_witnessed_quote_peers(
+        &self,
+        address: &[u8; 32],
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
+        let required = single_node_quote_query_count();
+        let quorum = witnessed_close_group_quorum();
+        let witnessed = self
+            .network()
+            .find_witnessed_close_group(address, required, quorum)
+            .await
+            .map_err(|e| {
+                Error::InsufficientPeers(format!(
+                    "Witnessed close group lookup failed before payment for target {}: {e}",
+                    hex::encode(address)
+                ))
+            })?;
+
+        debug!(
+            target = %hex::encode(address),
+            quorum = witnessed.quorum,
+            initial = ?witnessed_initial_peers(&witnessed),
+            responder_views = ?witnessed_responder_views(&witnessed),
+            vote_counts = ?witnessed_vote_counts(&witnessed),
+            final_witnessed_set = ?witnessed_consensus(&witnessed),
+            "Witnessed close group selected for SNP quote collection"
+        );
+
+        witnessed_quote_peers_or_error(address, &witnessed, required)
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn get_store_quotes_from_peers(
+    async fn collect_store_quotes_from_remote_peers(
         &self,
         address: &[u8; 32],
         data_size: u64,
         data_type: u32,
-        peer_query_count: usize,
+        remote_peers: Vec<(PeerId, Vec<MultiAddr>)>,
     ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
-        debug_assert!(peer_query_count >= CLOSE_GROUP_SIZE);
+        let peer_query_count = remote_peers.len();
 
         let node = self.network().node();
 
@@ -219,17 +355,13 @@ impl Client {
             hex::encode(address)
         );
 
-        let remote_peers = self
-            .network()
-            .find_closest_peers(address, peer_query_count)
-            .await?;
-
         if remote_peers.len() < CLOSE_GROUP_SIZE {
             return Err(Error::InsufficientPeers(format!(
                 "Found {} peers, need {CLOSE_GROUP_SIZE}",
                 remote_peers.len()
             )));
         }
+        debug_assert!(peer_query_count >= CLOSE_GROUP_SIZE);
 
         let per_peer_timeout = Duration::from_secs(self.config().quote_timeout_secs);
         let overall_timeout = Duration::from_secs(QUOTE_COLLECTION_TIMEOUT_SECS);
@@ -443,7 +575,9 @@ mod tests {
     use super::*;
     use ant_protocol::evm::RewardsAddress;
     use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaPublicKey};
-    use ant_protocol::transport::MlDsa65;
+    use ant_protocol::transport::{
+        ConsensusNode, DHTNode, MlDsa65, ResponderView, WitnessedCloseGroup,
+    };
     use std::time::SystemTime;
     use xor_name::XorName;
 
@@ -497,6 +631,20 @@ mod tests {
             signature: Vec::new(),
         };
         (claimed.peer_id, Vec::new(), quote, Amount::ZERO)
+    }
+
+    fn witnessed_test_node(seed: u8) -> DHTNode {
+        DHTNode {
+            peer_id: PeerId::from_bytes([seed; 32]),
+            addresses: Vec::new(),
+            address_types: Vec::new(),
+            distance: None,
+            reliability: 1.0,
+        }
+    }
+
+    fn witnessed_test_nodes(seeds: &[u8]) -> Vec<DHTNode> {
+        seeds.iter().copied().map(witnessed_test_node).collect()
     }
 
     /// Independent re-implementation of the storer-side binding spec
@@ -583,11 +731,45 @@ mod tests {
     #[test]
     fn quote_query_counts_keep_single_node_close_group_only() {
         assert_eq!(single_node_quote_query_count(), CLOSE_GROUP_SIZE);
+        assert_eq!(witnessed_close_group_quorum(), 5);
         assert_eq!(
             fault_tolerant_quote_query_count(),
             CLOSE_GROUP_SIZE * FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER
         );
         assert!(fault_tolerant_quote_query_count() > single_node_quote_query_count());
+    }
+
+    #[test]
+    fn witnessed_quote_peers_error_is_typed_and_pre_payment_when_consensus_is_short() {
+        let address = [0u8; 32];
+        let consensus: Vec<ConsensusNode> = witnessed_test_nodes(&[1, 2, 3, 4, 5, 6])
+            .into_iter()
+            .map(|node| ConsensusNode { node, votes: 5 })
+            .collect();
+        let witnessed = WitnessedCloseGroup {
+            target: address,
+            k: CLOSE_GROUP_SIZE,
+            quorum: witnessed_close_group_quorum(),
+            initial_closest: witnessed_test_nodes(&[1, 2, 3, 4, 5, 6, 7]),
+            responder_views: vec![ResponderView {
+                responder: PeerId::from_bytes([1; 32]),
+                closest: vec![PeerId::from_bytes([1; 32])],
+            }],
+            vote_counts: vec![(PeerId::from_bytes([1; 32]), 5)],
+            consensus,
+        };
+
+        let err = witnessed_quote_peers_or_error(&address, &witnessed, CLOSE_GROUP_SIZE)
+            .expect_err("short witnessed consensus must fail before payment");
+
+        match err {
+            Error::InsufficientPeers(message) => {
+                assert!(message.contains("before payment"));
+                assert!(message.contains("vote_counts"));
+                assert!(message.contains("quorum"));
+            }
+            other => panic!("expected typed InsufficientPeers error, got {other:?}"),
+        }
     }
 
     #[test]
