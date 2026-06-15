@@ -48,7 +48,10 @@ impl Client {
         debug!("Collecting quotes for address {}", hex::encode(address));
 
         // 1. Collect quotes from network
-        let quotes_with_peers = self.get_store_quotes(address, data_size, data_type).await?;
+        let quote_plan = self
+            .get_store_quote_plan(address, data_size, data_type)
+            .await?;
+        let quotes_with_peers = quote_plan.quotes;
         let median_quote_issuer =
             median_paid_quote_issuer(&quotes_with_peers).ok_or_else(|| {
                 Error::Payment(
@@ -57,10 +60,7 @@ impl Client {
             })?;
 
         // Capture all quoted peers for replication by the caller.
-        let quoted_peers: Vec<(PeerId, Vec<MultiAddr>)> = quotes_with_peers
-            .iter()
-            .map(|(peer_id, addrs, _, _)| (*peer_id, addrs.clone()))
-            .collect();
+        let quoted_peers = quote_plan.put_peers;
 
         // 2. Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.
         // Use node-reported prices directly — no contract price fetch needed.
