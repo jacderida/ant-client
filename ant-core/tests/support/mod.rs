@@ -27,6 +27,7 @@ use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 // Wire / transport / EVM types: route through ant-protocol so the test
 // harness exercises the same surface the client does.
 use ant_protocol::evm::{testnet::Testnet, Network as EvmNetwork, RewardsAddress, Wallet};
+use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaSecretKey};
 use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
 };
@@ -197,6 +198,32 @@ impl MiniTestnet {
             sleep(Duration::from_millis(500)).await;
         }
 
+        // The in-process E2E harness builds clients from one of the storage
+        // nodes. Saorsa's witnessed client lookup filters that local peer out,
+        // while node-side payment verification uses a self-inclusive local
+        // close-group view. In tiny random testnets that can make an otherwise
+        // valid paid median issuer fall just outside a storer's local top-7.
+        // Keep the production live-DHT check in normal builds, but use
+        // ant-node's test-only override here so these client E2Es exercise
+        // payment/proof/storage behaviour without depending on that topology
+        // artifact.
+        let paid_quote_close_group_override: Vec<[u8; 32]> = nodes
+            .iter()
+            .filter_map(|test_node| {
+                test_node
+                    .p2p_node
+                    .as_ref()
+                    .map(|p2p_node| *p2p_node.peer_id().as_bytes())
+            })
+            .collect();
+        for test_node in &nodes {
+            if let Some(protocol) = &test_node.protocol {
+                protocol
+                    .payment_verifier_arc()
+                    .set_paid_quote_close_group_for_tests(paid_quote_close_group_override.clone());
+            }
+        }
+
         // Approve token spend for the unified payment vault contract
         let vault_address = evm_network.payment_vault_address();
         wallet
@@ -290,22 +317,15 @@ impl MiniTestnet {
             local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
-        // Wire the P2P node into the verifier so the merkle pay-yourself
-        // closeness check can do its DHT lookup. Without this, the
-        // verifier fail-closes on every merkle payment (PR #77 defense).
-        payment_verifier.attach_p2p_node(Arc::clone(&node));
         let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing so quotes are properly signed and verifiable
         let pub_key_bytes = identity.public_key().as_bytes().to_vec();
         let sk_bytes = identity.secret_key_bytes().to_vec();
-        let sk = {
-            use ant_protocol::pqc::ops::MlDsaSecretKey;
-            MlDsaSecretKey::from_bytes(&sk_bytes).expect("deserialize ML-DSA-65 secret key")
-        };
+        let sk =
+            { MlDsaSecretKey::from_bytes(&sk_bytes).expect("deserialize ML-DSA-65 secret key") };
         quote_generator.set_signer(pub_key_bytes, move |msg| {
-            use ant_protocol::pqc::ops::MlDsaOperations;
             let ml_dsa = MlDsa65::new();
             ml_dsa
                 .sign(&sk, msg)
@@ -318,6 +338,9 @@ impl MiniTestnet {
             payment_verifier,
             Arc::new(quote_generator),
         ));
+        // Wire the P2P node into the protocol so direct PUT storage-admission
+        // and payment closeness checks use the node's live DHT view.
+        protocol.attach_p2p_node(Arc::clone(&node));
 
         // Start message handler loop
         let handler_node = Arc::clone(&node);

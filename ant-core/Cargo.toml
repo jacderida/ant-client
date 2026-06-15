@@ -93,7 +93,7 @@ devnet = ["dep:ant-node"]
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { git = "https://github.com/WithAutonomi/ant-node", branch = "feat/witnessed-transcript-policy" }
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", branch = "feat/witnessed-transcript-policy", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }

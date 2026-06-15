@@ -243,23 +243,21 @@ impl Client {
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
 
-        let quotes_with_peers = match self
-            .get_store_quotes(&address, data_size, DATA_TYPE_CHUNK)
+        let quote_plan = match self
+            .get_store_quote_plan(&address, data_size, DATA_TYPE_CHUNK)
             .await
         {
-            Ok(quotes) => quotes,
+            Ok(plan) => plan,
             Err(Error::AlreadyStored) => {
                 debug!("Chunk {} already stored, skipping", hex::encode(address));
                 return Ok(None);
             }
             Err(e) => return Err(e),
         };
+        let quotes_with_peers = quote_plan.quotes;
 
         // Capture all quoted peers for close-group replication.
-        let quoted_peers: Vec<(PeerId, Vec<MultiAddr>)> = quotes_with_peers
-            .iter()
-            .map(|(peer_id, addrs, _, _)| (*peer_id, addrs.clone()))
-            .collect();
+        let quoted_peers = quote_plan.put_peers;
 
         // Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.
         // Use node-reported prices directly — no contract price fetch needed.

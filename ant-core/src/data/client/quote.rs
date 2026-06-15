@@ -167,13 +167,22 @@ fn witnessed_close_group_quorum() -> usize {
     (CLOSE_GROUP_SIZE * WITNESSED_QUORUM_NUMERATOR).div_ceil(WITNESSED_QUORUM_DENOMINATOR)
 }
 
+fn witnessed_median_voter_quorum() -> usize {
+    witnessed_close_group_quorum()
+}
+
 fn peer_list(peers: &[PeerId]) -> Vec<String> {
     peers.iter().map(ToString::to_string).collect()
 }
 
-type StoreQuote = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount);
+pub(crate) type StoreQuote = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount);
 type VotersByPeer = HashMap<PeerId, HashSet<PeerId>>;
 type WitnessedVoteData = (HashMap<PeerId, DHTNode>, VotersByPeer, Vec<(PeerId, usize)>);
+
+pub(crate) struct StoreQuotePlan {
+    pub(crate) quotes: Vec<StoreQuote>,
+    pub(crate) put_peers: Vec<(PeerId, Vec<MultiAddr>)>,
+}
 
 #[derive(Debug, Clone)]
 struct WitnessedQuoteCandidate {
@@ -469,8 +478,9 @@ fn select_witnessed_median_voter_quotes(
 
     sort_quotes_by_distance(&mut quotes, address);
 
-    let mut best_indices: Option<Vec<usize>> = None;
+    let mut best_indices: Option<(usize, Vec<usize>)> = None;
     let mut current_indices = Vec::with_capacity(CLOSE_GROUP_SIZE);
+    let required_support = witnessed_median_voter_quorum();
     visit_quote_subsets(
         quotes.len(),
         CLOSE_GROUP_SIZE,
@@ -481,22 +491,50 @@ fn select_witnessed_median_voter_quotes(
             else {
                 return;
             };
-            if support < CLOSE_GROUP_MAJORITY {
+            if support < required_support {
                 return;
             }
             match &best_indices {
-                Some(best) if best.as_slice() <= indices => {}
-                _ => best_indices = Some(indices.to_vec()),
+                Some((best_support, best)) if *best_support > support => {}
+                Some((best_support, best))
+                    if *best_support == support && best.as_slice() <= indices => {}
+                _ => best_indices = Some((support, indices.to_vec())),
             }
         },
     );
 
-    best_indices.map(|indices| {
+    best_indices.map(|(_, indices)| {
         indices
             .into_iter()
             .map(|index| quotes[index].clone())
             .collect()
     })
+}
+
+fn put_peers_with_median_voters_first(
+    quotes: &[StoreQuote],
+    voters_by_peer: &VotersByPeer,
+) -> Option<Vec<(PeerId, Vec<MultiAddr>)>> {
+    let (median_peer_id, _) = median_paid_quote_issuer(quotes)?;
+    let voters = voters_by_peer.get(&median_peer_id)?;
+
+    let mut supporting_peers = Vec::new();
+    let mut fallback_peers = Vec::new();
+    for (peer_id, addrs, _, _) in quotes {
+        let peer = (*peer_id, addrs.clone());
+        if voters.contains(peer_id) {
+            supporting_peers.push(peer);
+        } else {
+            fallback_peers.push(peer);
+        }
+    }
+
+    if supporting_peers.len() < witnessed_median_voter_quorum() {
+        return None;
+    }
+
+    supporting_peers.extend(fallback_peers);
+    Some(supporting_peers)
 }
 
 impl Client {
@@ -505,9 +543,9 @@ impl Client {
     /// Builds a quorum-witnessed candidate set with at least
     /// `CLOSE_GROUP_SIZE` peers, requests quotes from all of them concurrently,
     /// and returns the closest supported `CLOSE_GROUP_SIZE` successful
-    /// responders sorted by XOR distance. Farther quorum-recognised candidates
-    /// are used only as fallbacks when needed to make the paid median issuer
-    /// locally acceptable to a close-group majority.
+    /// responders. When multiple sets are possible, the client prefers the
+    /// one with the strongest paid-median voter support, then the closest
+    /// peers by XOR distance.
     ///
     /// Returns `Error::AlreadyStored` early if `CLOSE_GROUP_MAJORITY` peers
     /// report the chunk is already stored.
@@ -521,8 +559,26 @@ impl Client {
         data_size: u64,
         data_type: u32,
     ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
+        Ok(self
+            .get_store_quote_plan(address, data_size, data_type)
+            .await?
+            .quotes)
+    }
+
+    /// Get storage quotes plus PUT targets ordered for paid-median acceptance.
+    ///
+    /// Quote order is preserved for proof construction because tied quote
+    /// prices rely on stable median selection. PUT target order is separate:
+    /// peers that voted for the paid median issuer are placed first so the
+    /// initial write wave is locally acceptable to a storage majority.
+    pub(crate) async fn get_store_quote_plan(
+        &self,
+        address: &[u8; 32],
+        data_size: u64,
+        data_type: u32,
+    ) -> Result<StoreQuotePlan> {
         let witnessed_peers = self.select_witnessed_quote_peers(address).await?;
-        let voters_by_peer = witnessed_peers
+        let voters_by_peer: VotersByPeer = witnessed_peers
             .iter()
             .map(|peer| (peer.peer_id, peer.voters.clone()))
             .collect();
@@ -530,14 +586,29 @@ impl Client {
             .into_iter()
             .map(|peer| (peer.peer_id, peer.addrs))
             .collect();
-        self.collect_store_quotes_from_remote_peers(
-            address,
-            data_size,
-            data_type,
-            remote_peers,
-            QuoteSelectionPolicy::WitnessedMedianVoters { voters_by_peer },
-        )
-        .await
+        let quotes = self
+            .collect_store_quotes_from_remote_peers(
+                address,
+                data_size,
+                data_type,
+                remote_peers,
+                QuoteSelectionPolicy::WitnessedMedianVoters {
+                    voters_by_peer: voters_by_peer.clone(),
+                },
+            )
+            .await?;
+        let put_peers =
+            put_peers_with_median_voters_first(&quotes, &voters_by_peer).ok_or_else(|| {
+                Error::InsufficientPeers(format!(
+                    "Collected {} witnessed quotes, but fewer than {} \
+                     selected PUT peers voted for the paid median issuer for {}",
+                    quotes.len(),
+                    witnessed_median_voter_quorum(),
+                    hex::encode(address)
+                ))
+            })?;
+
+        Ok(StoreQuotePlan { quotes, put_peers })
     }
 
     /// Get storage quotes with the previous over-query behaviour.
@@ -799,11 +870,12 @@ impl Client {
                         .ok_or_else(|| {
                             Error::InsufficientPeers(format!(
                                 "Got {quote_count} quotes, need {CLOSE_GROUP_SIZE} whose paid \
-                                 median issuer is recognised by at least {CLOSE_GROUP_MAJORITY} \
+                                 median issuer is recognised by at least {} \
                                  selected witness peers ({total_responses} responses: \
                                  {already_stored_count} already_stored, {failure_count} failed \
                                  including {bad_quote_count} with mismatched peer bindings). \
                                  Failures: [{}]",
+                                witnessed_median_voter_quorum(),
                                 failures.join("; ")
                             ))
                         })?
@@ -948,6 +1020,13 @@ mod tests {
         quotes
             .iter()
             .map(|(peer_id, _, _, _)| peer_id.as_bytes()[0])
+            .collect()
+    }
+
+    fn put_peer_seeds(peers: &[(PeerId, Vec<MultiAddr>)]) -> Vec<u8> {
+        peers
+            .iter()
+            .map(|(peer_id, _)| peer_id.as_bytes()[0])
             .collect()
     }
 
@@ -1113,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn witnessed_quote_selection_keeps_closest_set_with_median_voter_majority() {
+    fn witnessed_quote_selection_keeps_closest_set_with_median_voter_quorum() {
         const MEDIAN_ISSUER_SEED: u8 = 7;
         const FAR_SUPPORTING_VOTER_SEED: u8 = 20;
         const UNSUCCESSFUL_SUPPORTING_VOTER_SEED: u8 = 21;
@@ -1136,6 +1215,7 @@ mod tests {
                 1,
                 2,
                 3,
+                MEDIAN_ISSUER_SEED,
                 FAR_SUPPORTING_VOTER_SEED,
                 UNSUCCESSFUL_SUPPORTING_VOTER_SEED,
             ]),
@@ -1155,11 +1235,11 @@ mod tests {
         let support = voters_by_peer[&median_peer_id]
             .intersection(&selected_peers)
             .count();
-        assert_eq!(support, CLOSE_GROUP_MAJORITY);
+        assert_eq!(support, witnessed_median_voter_quorum());
     }
 
     #[test]
-    fn witnessed_quote_selection_rejects_median_without_selected_voter_majority() {
+    fn witnessed_quote_selection_rejects_median_without_selected_voter_quorum() {
         const MEDIAN_ISSUER_SEED: u8 = 7;
 
         let address = [0u8; 32];
@@ -1183,9 +1263,38 @@ mod tests {
 
         assert!(
             selected.is_none(),
-            "the selector must not return a paid quote set when fewer than \
-             CLOSE_GROUP_MAJORITY supporting witness peers produced usable quotes"
+            "the selector must not return a paid quote set when fewer than the \
+             witnessed median voter quorum produced usable quotes"
         );
+    }
+
+    #[test]
+    fn put_peers_prioritise_median_voters_without_reordering_quotes() {
+        const MEDIAN_ISSUER_SEED: u8 = 7;
+
+        let quotes = vec![
+            synthetic_quote(1, 10),
+            synthetic_quote(2, 20),
+            synthetic_quote(3, 30),
+            synthetic_quote(4, 50),
+            synthetic_quote(5, 60),
+            synthetic_quote(6, 70),
+            synthetic_quote(MEDIAN_ISSUER_SEED, 40),
+        ];
+        let mut voters_by_peer = HashMap::new();
+        voters_by_peer.insert(
+            synthetic_peer(MEDIAN_ISSUER_SEED),
+            synthetic_voters(&[3, 4, 5, 6, MEDIAN_ISSUER_SEED]),
+        );
+
+        let put_peers = put_peers_with_median_voters_first(&quotes, &voters_by_peer)
+            .expect("median voters should produce an ordered PUT set");
+
+        assert_eq!(quote_peer_seeds(&quotes), vec![1, 2, 3, 4, 5, 6, 7]);
+        let (median_peer_id, _) =
+            median_paid_quote_issuer(&quotes).expect("selected quotes have a median");
+        assert_eq!(median_peer_id, synthetic_peer(MEDIAN_ISSUER_SEED));
+        assert_eq!(put_peer_seeds(&put_peers), vec![3, 4, 5, 6, 7, 1, 2]);
     }
 
     #[test]
