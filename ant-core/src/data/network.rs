@@ -131,26 +131,24 @@ impl Network {
             .collect())
     }
 
-    /// Find a quorum-witnessed close group for a target address.
+    /// Find a witnessed close-group transcript for a target address.
     ///
     /// The underlying DHT method returns the initial client K, each responder's
-    /// self-inclusive closest-K view, vote counts, and the final
-    /// quorum-recognised set ordered by pure XOR distance.
+    /// self-inclusive closest-K node view, and enough trusted node records for
+    /// callers to apply their own quorum and fallback policy.
     ///
     /// # Errors
     ///
-    /// Returns an error if the DHT lookup itself fails. The returned witnessed
-    /// group may still be inconclusive; callers should check
-    /// `WitnessedCloseGroup::is_complete`.
+    /// Returns an error if the DHT lookup itself fails. The returned transcript
+    /// may still be inconclusive; callers should evaluate it before payment.
     pub async fn find_witnessed_close_group(
         &self,
         target: &[u8; 32],
         count: usize,
-        quorum: usize,
     ) -> Result<WitnessedCloseGroup> {
         self.node
             .dht()
-            .find_witnessed_close_group(target, count, quorum)
+            .find_witnessed_close_group(target, count)
             .await
             .map_err(|e| Error::Network(format!("DHT witnessed close-group lookup failed: {e}")))
     }

@@ -7,12 +7,13 @@ use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{Amount, PaymentQuote};
-use ant_protocol::transport::{MultiAddr, PeerId, WitnessedCloseGroup};
+use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, WitnessedCloseGroup};
 use ant_protocol::{
     compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
     ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -170,6 +171,12 @@ fn peer_list(peers: &[PeerId]) -> Vec<String> {
     peers.iter().map(ToString::to_string).collect()
 }
 
+#[derive(Debug, Clone)]
+struct WitnessedQuoteCandidate {
+    node: DHTNode,
+    votes: usize,
+}
+
 fn witnessed_initial_peers(witnessed: &WitnessedCloseGroup) -> Vec<String> {
     witnessed
         .initial_closest
@@ -182,38 +189,128 @@ fn witnessed_responder_views(witnessed: &WitnessedCloseGroup) -> Vec<String> {
     witnessed
         .responder_views
         .iter()
-        .map(|view| format!("{}=>{:?}", view.responder, peer_list(&view.closest)))
+        .map(|view| {
+            let peers = view
+                .closest
+                .iter()
+                .map(|node| node.peer_id)
+                .collect::<Vec<_>>();
+            format!("{}=>{:?}", view.responder, peer_list(&peers))
+        })
         .collect()
 }
 
-fn witnessed_vote_counts(witnessed: &WitnessedCloseGroup) -> Vec<String> {
-    witnessed
-        .vote_counts
+fn merge_witnessed_node(nodes: &mut HashMap<PeerId, DHTNode>, node: DHTNode) {
+    match nodes.entry(node.peer_id) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.get_mut().merge_from(node);
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(node);
+        }
+    }
+}
+
+fn sort_vote_counts_by_distance(vote_counts: &mut [(PeerId, usize)], address: &[u8; 32]) {
+    vote_counts.sort_by(|left, right| {
+        peer_xor_distance(&left.0, address)
+            .cmp(&peer_xor_distance(&right.0, address))
+            .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+    });
+}
+
+fn witnessed_vote_counts_and_nodes(
+    witnessed: &WitnessedCloseGroup,
+    address: &[u8; 32],
+) -> (HashMap<PeerId, DHTNode>, Vec<(PeerId, usize)>) {
+    let mut known_nodes = HashMap::new();
+    for node in &witnessed.initial_closest {
+        merge_witnessed_node(&mut known_nodes, node.clone());
+    }
+
+    let mut vote_counts_by_peer = HashMap::new();
+    for view in &witnessed.responder_views {
+        let mut voted = HashSet::new();
+        for node in &view.closest {
+            merge_witnessed_node(&mut known_nodes, node.clone());
+            if voted.insert(node.peer_id) {
+                *vote_counts_by_peer.entry(node.peer_id).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut vote_counts: Vec<(PeerId, usize)> = vote_counts_by_peer.into_iter().collect();
+    sort_vote_counts_by_distance(&mut vote_counts, address);
+    (known_nodes, vote_counts)
+}
+
+fn witnessed_consensus_candidates(
+    witnessed: &WitnessedCloseGroup,
+    address: &[u8; 32],
+    quorum: usize,
+) -> Vec<WitnessedQuoteCandidate> {
+    let (known_nodes, vote_counts) = witnessed_vote_counts_and_nodes(witnessed, address);
+    let mut candidates = vote_counts
+        .iter()
+        .filter_map(|(peer_id, votes)| {
+            if *votes < quorum {
+                return None;
+            }
+            known_nodes
+                .get(peer_id)
+                .cloned()
+                .map(|node| WitnessedQuoteCandidate {
+                    node,
+                    votes: *votes,
+                })
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        peer_xor_distance(&left.node.peer_id, address)
+            .cmp(&peer_xor_distance(&right.node.peer_id, address))
+            .then_with(|| {
+                left.node
+                    .peer_id
+                    .as_bytes()
+                    .cmp(right.node.peer_id.as_bytes())
+            })
+    });
+    candidates
+}
+
+fn witnessed_vote_counts(witnessed: &WitnessedCloseGroup, address: &[u8; 32]) -> Vec<String> {
+    let (_, vote_counts) = witnessed_vote_counts_and_nodes(witnessed, address);
+    vote_counts
         .iter()
         .map(|(peer_id, votes)| format!("{peer_id}:{votes}"))
         .collect()
 }
 
-fn witnessed_consensus(witnessed: &WitnessedCloseGroup) -> Vec<String> {
-    witnessed
-        .consensus
+fn witnessed_consensus(
+    witnessed: &WitnessedCloseGroup,
+    address: &[u8; 32],
+    quorum: usize,
+) -> Vec<String> {
+    witnessed_consensus_candidates(witnessed, address, quorum)
         .iter()
-        .map(|node| format!("{}:{}", node.node.peer_id, node.votes))
+        .map(|candidate| format!("{}:{}", candidate.node.peer_id, candidate.votes))
         .collect()
 }
 
 fn witnessed_close_group_diagnostics(
     address: &[u8; 32],
     witnessed: &WitnessedCloseGroup,
+    quorum: usize,
 ) -> String {
     format!(
         "target={}, initial={:?}, responder_views={:?}, vote_counts={:?}, quorum={}, final={:?}",
         hex::encode(address),
         witnessed_initial_peers(witnessed),
         witnessed_responder_views(witnessed),
-        witnessed_vote_counts(witnessed),
-        witnessed.quorum,
-        witnessed_consensus(witnessed)
+        witnessed_vote_counts(witnessed, address),
+        quorum,
+        witnessed_consensus(witnessed, address, quorum)
     )
 }
 
@@ -221,20 +318,20 @@ fn witnessed_quote_peers_or_error(
     address: &[u8; 32],
     witnessed: &WitnessedCloseGroup,
     required: usize,
+    quorum: usize,
 ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
-    if witnessed.consensus.len() < required {
+    let candidates = witnessed_consensus_candidates(witnessed, address, quorum);
+    if candidates.len() < required {
         return Err(Error::InsufficientPeers(format!(
             "Witnessed close group inconclusive before payment: got {}/{} quorum-recognised peers. {}",
-            witnessed.consensus.len(),
+            candidates.len(),
             required,
-            witnessed_close_group_diagnostics(address, witnessed)
+            witnessed_close_group_diagnostics(address, witnessed, quorum)
         )));
     }
 
-    Ok(witnessed
-        .consensus
-        .iter()
-        .take(required)
+    Ok(candidates
+        .into_iter()
         .map(|candidate| {
             (
                 candidate.node.peer_id,
@@ -265,9 +362,11 @@ pub(crate) fn median_paid_quote_issuer(
 impl Client {
     /// Get storage quotes from the closest peers for a given address.
     ///
-    /// Builds a quorum-witnessed close group of exactly `CLOSE_GROUP_SIZE`
-    /// peers, requests quotes from all of them concurrently, and returns those
-    /// responders sorted by XOR distance.
+    /// Builds a quorum-witnessed candidate set with at least
+    /// `CLOSE_GROUP_SIZE` peers, requests quotes from all of them concurrently,
+    /// and returns the closest `CLOSE_GROUP_SIZE` successful responders sorted
+    /// by XOR distance. Farther quorum-recognised candidates are used only as
+    /// fallbacks when closer candidates do not return usable quotes.
     ///
     /// Returns `Error::AlreadyStored` early if `CLOSE_GROUP_MAJORITY` peers
     /// report the chunk is already stored.
@@ -316,7 +415,7 @@ impl Client {
         let quorum = witnessed_close_group_quorum();
         let witnessed = self
             .network()
-            .find_witnessed_close_group(address, required, quorum)
+            .find_witnessed_close_group(address, required)
             .await
             .map_err(|e| {
                 Error::InsufficientPeers(format!(
@@ -327,15 +426,15 @@ impl Client {
 
         debug!(
             target = %hex::encode(address),
-            quorum = witnessed.quorum,
+            quorum = quorum,
             initial = ?witnessed_initial_peers(&witnessed),
             responder_views = ?witnessed_responder_views(&witnessed),
-            vote_counts = ?witnessed_vote_counts(&witnessed),
-            final_witnessed_set = ?witnessed_consensus(&witnessed),
+            vote_counts = ?witnessed_vote_counts(&witnessed, address),
+            final_witnessed_set = ?witnessed_consensus(&witnessed, address, quorum),
             "Witnessed close group selected for SNP quote collection"
         );
 
-        witnessed_quote_peers_or_error(address, &witnessed, required)
+        witnessed_quote_peers_or_error(address, &witnessed, required, quorum)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -575,9 +674,7 @@ mod tests {
     use super::*;
     use ant_protocol::evm::RewardsAddress;
     use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaPublicKey};
-    use ant_protocol::transport::{
-        ConsensusNode, DHTNode, MlDsa65, ResponderView, WitnessedCloseGroup,
-    };
+    use ant_protocol::transport::{DHTNode, MlDsa65, ResponderView, WitnessedCloseGroup};
     use std::time::SystemTime;
     use xor_name::XorName;
 
@@ -645,6 +742,13 @@ mod tests {
 
     fn witnessed_test_nodes(seeds: &[u8]) -> Vec<DHTNode> {
         seeds.iter().copied().map(witnessed_test_node).collect()
+    }
+
+    fn witnessed_test_view(responder: u8, closest: &[u8]) -> ResponderView {
+        ResponderView {
+            responder: PeerId::from_bytes([responder; 32]),
+            closest: witnessed_test_nodes(closest),
+        }
     }
 
     /// Independent re-implementation of the storer-side binding spec
@@ -742,25 +846,23 @@ mod tests {
     #[test]
     fn witnessed_quote_peers_error_is_typed_and_pre_payment_when_consensus_is_short() {
         let address = [0u8; 32];
-        let consensus: Vec<ConsensusNode> = witnessed_test_nodes(&[1, 2, 3, 4, 5, 6])
-            .into_iter()
-            .map(|node| ConsensusNode { node, votes: 5 })
+        let responder_views = (1..=7)
+            .map(|responder| witnessed_test_view(responder, &[1, 2, 3, 4]))
             .collect();
         let witnessed = WitnessedCloseGroup {
             target: address,
             k: CLOSE_GROUP_SIZE,
-            quorum: witnessed_close_group_quorum(),
             initial_closest: witnessed_test_nodes(&[1, 2, 3, 4, 5, 6, 7]),
-            responder_views: vec![ResponderView {
-                responder: PeerId::from_bytes([1; 32]),
-                closest: vec![PeerId::from_bytes([1; 32])],
-            }],
-            vote_counts: vec![(PeerId::from_bytes([1; 32]), 5)],
-            consensus,
+            responder_views,
         };
 
-        let err = witnessed_quote_peers_or_error(&address, &witnessed, CLOSE_GROUP_SIZE)
-            .expect_err("short witnessed consensus must fail before payment");
+        let err = witnessed_quote_peers_or_error(
+            &address,
+            &witnessed,
+            CLOSE_GROUP_SIZE,
+            witnessed_close_group_quorum(),
+        )
+        .expect_err("short witnessed consensus must fail before payment");
 
         match err {
             Error::InsufficientPeers(message) => {
@@ -770,6 +872,44 @@ mod tests {
             }
             other => panic!("expected typed InsufficientPeers error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn witnessed_quote_peers_include_quorum_fallback_candidates() {
+        const EXTRA_QUORUM_CANDIDATES: usize = 1;
+
+        let address = [0u8; 32];
+        let witnessed = WitnessedCloseGroup {
+            target: address,
+            k: CLOSE_GROUP_SIZE,
+            initial_closest: witnessed_test_nodes(&[1, 2, 3, 4, 5, 6, 7]),
+            responder_views: vec![
+                witnessed_test_view(1, &[1, 2, 3, 4, 5, 6, 7]),
+                witnessed_test_view(2, &[1, 2, 3, 4, 5, 6, 8]),
+                witnessed_test_view(3, &[1, 2, 3, 4, 5, 7, 8]),
+                witnessed_test_view(4, &[1, 2, 3, 4, 6, 7, 8]),
+                witnessed_test_view(5, &[1, 2, 3, 5, 6, 7, 8]),
+                witnessed_test_view(6, &[1, 2, 4, 5, 6, 7, 8]),
+                witnessed_test_view(7, &[1, 3, 4, 5, 6, 7, 8]),
+            ],
+        };
+
+        let peers = witnessed_quote_peers_or_error(
+            &address,
+            &witnessed,
+            CLOSE_GROUP_SIZE,
+            witnessed_close_group_quorum(),
+        )
+        .expect("fallback candidates should be retained for quote collection");
+
+        assert_eq!(peers.len(), CLOSE_GROUP_SIZE + EXTRA_QUORUM_CANDIDATES);
+        assert_eq!(
+            peers
+                .iter()
+                .map(|(peer_id, _)| peer_id.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
     }
 
     #[test]
