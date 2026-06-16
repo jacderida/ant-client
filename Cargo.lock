@@ -893,7 +893,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.12.1-rc.7"
-source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.6.2#dfaa086324e2fc0cccc08378ba046b5e61949523"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.6.2#8f8842a2e7c3243a29d394ab8dbf0ff42a7989b2"
 dependencies = [
  "ant-protocol",
  "blake3",
@@ -3259,7 +3259,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
