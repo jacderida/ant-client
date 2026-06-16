@@ -209,8 +209,12 @@ async fn handle_file_upload(
     );
 
     let upload_outcome = if json_output {
-        // No progress bars in JSON mode
-        client.file_upload_with_mode(path, mode).await
+        // No progress bars in JSON mode.
+        if public {
+            client.file_upload_public_with_mode(path, mode).await
+        } else {
+            client.file_upload_with_mode(path, mode).await
+        }
     } else {
         // Set up progress channel and drive progress bars
         let (tx, rx) = mpsc::channel(64);
@@ -220,7 +224,13 @@ async fn handle_file_upload(
             file_size,
         ));
 
-        let upload_result = client.file_upload_with_progress(path, mode, Some(tx)).await;
+        let upload_result = if public {
+            client
+                .file_upload_public_with_progress(path, mode, Some(tx))
+                .await
+        } else {
+            client.file_upload_with_progress(path, mode, Some(tx)).await
+        };
 
         // Wait for progress display to finish (sender dropped → receiver exits)
         let _ = pb_handle.await;
@@ -264,43 +274,13 @@ async fn handle_file_upload(
     let elapsed = start.elapsed();
 
     if public {
-        let spinner = if !json_output {
-            Some(progress::new_spinner("Storing public data map..."))
-        } else {
-            None
-        };
-        let dm_result = client.data_map_store(&result.data_map).await;
-        if let Some(s) = &spinner {
-            s.finish_and_clear();
-        }
-        let dm_address = match dm_result {
-            Ok(addr) => addr,
-            Err(e) => {
-                // The file body is fully stored and paid for at this point —
-                // only the public DataMap chunk failed. In JSON mode emit a
-                // parseable failure record (like the PartialUpload arm above)
-                // so callers don't report 0/0 chunks for an upload that is one
-                // chunk away from being retrievable.
-                if json_output {
-                    let reason = format!("failed to store public DataMap: {e}");
-                    let out = UploadFailureJson {
-                        error: "datamap_store_failed",
-                        total_chunks: result.chunks_stored + 1,
-                        chunks_stored: result.chunks_stored,
-                        chunks_failed: 1,
-                        storage_cost_atto: result.storage_cost_atto.clone(),
-                        gas_cost_wei: result.gas_cost_wei.to_string(),
-                        reason: &reason,
-                    };
-                    println!("{}", serde_json::to_string(&out)?);
-                }
-                anyhow::bail!("Failed to store public DataMap: {e}");
-            }
-        };
-
+        let dm_address = result
+            .data_map_address
+            .ok_or_else(|| anyhow::anyhow!("Public upload completed without a DataMap address"))?;
         let hex_addr = hex::encode(dm_address);
         let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
-        let total_chunks = result.chunks_stored + 1; // +1 for the public data map chunk
+        let total_chunks = result.total_chunks;
+        let data_chunks = total_chunks.saturating_sub(1);
 
         if json_output {
             let out = UploadJsonResult {
@@ -309,8 +289,8 @@ async fn handle_file_upload(
                 mode: "public".into(),
                 chunks: total_chunks,
                 total_chunks,
-                chunks_stored: total_chunks,
-                chunks_failed: 0,
+                chunks_stored: result.chunks_stored,
+                chunks_failed: result.chunks_failed,
                 size: file_size,
                 storage_cost_atto: result.storage_cost_atto.clone(),
                 gas_cost_wei: result.gas_cost_wei.to_string(),
@@ -324,10 +304,7 @@ async fn handle_file_upload(
             println!();
             println!("Upload complete!");
             println!("  Address: {hex_addr}");
-            println!(
-                "  Chunks:  {total_chunks} ({} + 1 data map)",
-                result.chunks_stored
-            );
+            println!("  Chunks:  {total_chunks} ({} + 1 data map)", data_chunks);
             println!("  Size:    {}", format_size(file_size));
             println!("  Cost:    {cost_display}");
             println!("  Time:    {:.1}s", elapsed.as_secs_f64());
@@ -338,7 +315,7 @@ async fn handle_file_upload(
 
         info!(
             "Public upload complete: address={hex_addr}, chunks={}",
-            result.chunks_stored
+            result.total_chunks
         );
     } else {
         let parent = path
