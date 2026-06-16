@@ -1737,6 +1737,21 @@ impl Client {
         self.file_upload_with_progress(path, mode, None).await
     }
 
+    /// Upload a file publicly, storing the serialized [`DataMap`] as part of
+    /// the same upload payment batch.
+    ///
+    /// The returned [`FileUploadResult::data_map_address`] can be shared for
+    /// public downloads via [`Client::data_map_fetch`].
+    #[allow(clippy::too_many_lines)]
+    pub async fn file_upload_public_with_mode(
+        &self,
+        path: &Path,
+        mode: PaymentMode,
+    ) -> Result<FileUploadResult> {
+        self.file_upload_with_visibility_and_progress(path, mode, Visibility::Public, None)
+            .await
+    }
+
     /// Upload a file with progress events sent to the given channel.
     ///
     /// Same as [`Client::file_upload_with_mode`] but sends [`UploadEvent`]s to the
@@ -1748,8 +1763,35 @@ impl Client {
         mode: PaymentMode,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
+        self.file_upload_with_visibility_and_progress(path, mode, Visibility::Private, progress)
+            .await
+    }
+
+    /// Public file upload with progress events.
+    ///
+    /// Same as [`Client::file_upload_public_with_mode`] but sends
+    /// [`UploadEvent`]s to the provided channel for UI progress feedback.
+    #[allow(clippy::too_many_lines)]
+    pub async fn file_upload_public_with_progress(
+        &self,
+        path: &Path,
+        mode: PaymentMode,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
+        self.file_upload_with_visibility_and_progress(path, mode, Visibility::Public, progress)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn file_upload_with_visibility_and_progress(
+        &self,
+        path: &Path,
+        mode: PaymentMode,
+        visibility: Visibility,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
         debug!(
-            "Streaming file upload with mode {mode:?}: {}",
+            "Streaming file upload with mode {mode:?}, visibility {visibility:?}: {}",
             path.display()
         );
 
@@ -1759,7 +1801,24 @@ impl Client {
 
         // Phase 1: Encrypt file and spill chunks to temp directory.
         // Only 32-byte addresses stay in memory — chunk data lives on disk.
-        let (spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
+        let (mut spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
+
+        let data_map_address = match visibility {
+            Visibility::Private => None,
+            Visibility::Public => {
+                let serialized = rmp_serde::to_vec(&data_map).map_err(|e| {
+                    Error::Serialization(format!("Failed to serialize DataMap: {e}"))
+                })?;
+                let address = compute_address(&serialized);
+                info!(
+                    "Public upload: adding DataMap chunk ({} bytes) at address {} to payment batch",
+                    serialized.len(),
+                    hex::encode(address)
+                );
+                spill.push(&serialized)?;
+                Some(address)
+            }
+        };
 
         let chunk_count = spill.len();
         info!(
@@ -1830,7 +1889,7 @@ impl Client {
                             payment_mode_used: PaymentMode::Merkle,
                             storage_cost_atto: sc,
                             gas_cost_wei: gc,
-                            data_map_address: None,
+                            data_map_address,
                             chunk_attempts_total: stats.chunk_attempts_total,
                             store_durations_ms: stats.store_durations_ms,
                             retries_histogram: stats.retries_histogram,
@@ -1858,7 +1917,7 @@ impl Client {
                                 payment_mode_used: PaymentMode::Single,
                                 storage_cost_atto: sc,
                                 gas_cost_wei: gc,
-                                data_map_address: None,
+                                data_map_address,
                                 chunk_attempts_total: fb_stats.chunk_attempts_total,
                                 store_durations_ms: fb_stats.store_durations_ms,
                                 retries_histogram: fb_stats.retries_histogram,
@@ -1996,7 +2055,7 @@ impl Client {
                             payment_mode_used: PaymentMode::Single,
                             storage_cost_atto: sc,
                             gas_cost_wei: gc,
-                            data_map_address: None,
+                            data_map_address,
                             chunk_attempts_total: fb_stats.chunk_attempts_total,
                             store_durations_ms: fb_stats.store_durations_ms,
                             retries_histogram: fb_stats.retries_histogram,
@@ -2041,7 +2100,7 @@ impl Client {
             payment_mode_used: actual_mode,
             storage_cost_atto,
             gas_cost_wei,
-            data_map_address: None,
+            data_map_address,
             chunk_attempts_total: stats.chunk_attempts_total,
             store_durations_ms: stats.store_durations_ms,
             retries_histogram: stats.retries_histogram,
