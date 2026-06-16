@@ -3259,7 +3259,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5249,7 +5249,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.26.0-rc.1"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.2#68862e790f981e73b6d8b4bc30d1c76b6c807a51"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.2#79f5ad679a6ac6895cffd19731f90fb1cf02837e"
 dependencies = [
  "anyhow",
  "async-trait",

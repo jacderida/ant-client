@@ -29,6 +29,9 @@ const FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER: usize = 2;
 const WITNESSED_QUORUM_NUMERATOR: usize = 2;
 const WITNESSED_QUORUM_DENOMINATOR: usize = 3;
 
+/// Number of closest nodes each initial witnessed responder contributes.
+const SINGLE_NODE_WITNESSED_VIEW_COUNT: usize = 20;
+
 /// Index of the paid median quote after sorting by quoted price.
 const MEDIAN_QUOTE_INDEX: usize = CLOSE_GROUP_SIZE / 2;
 
@@ -303,8 +306,13 @@ fn witnessed_consensus_candidates(
         .collect::<Vec<_>>();
 
     candidates.sort_by(|left, right| {
-        peer_xor_distance(&left.node.peer_id, address)
-            .cmp(&peer_xor_distance(&right.node.peer_id, address))
+        right
+            .votes
+            .cmp(&left.votes)
+            .then_with(|| {
+                peer_xor_distance(&left.node.peer_id, address)
+                    .cmp(&peer_xor_distance(&right.node.peer_id, address))
+            })
             .then_with(|| {
                 left.node
                     .peer_id
@@ -647,7 +655,11 @@ impl Client {
         let quorum = witnessed_close_group_quorum();
         let witnessed = self
             .network()
-            .find_witnessed_close_group(address, required)
+            .find_witnessed_close_group_with_view_count(
+                address,
+                required,
+                SINGLE_NODE_WITNESSED_VIEW_COUNT,
+            )
             .await
             .map_err(|e| {
                 Error::InsufficientPeers(format!(
@@ -659,6 +671,7 @@ impl Client {
         debug!(
             target = %hex::encode(address),
             quorum = quorum,
+            view_count = SINGLE_NODE_WITNESSED_VIEW_COUNT,
             initial = ?witnessed_initial_peers(&witnessed),
             responder_views = ?witnessed_responder_views(&witnessed),
             vote_counts = ?witnessed_vote_counts(&witnessed, address),
@@ -1114,12 +1127,45 @@ mod tests {
     #[test]
     fn quote_query_counts_keep_single_node_close_group_only() {
         assert_eq!(single_node_quote_query_count(), CLOSE_GROUP_SIZE);
+        assert_eq!(SINGLE_NODE_WITNESSED_VIEW_COUNT, 20);
+        assert!(SINGLE_NODE_WITNESSED_VIEW_COUNT > single_node_quote_query_count());
         assert_eq!(witnessed_close_group_quorum(), 5);
         assert_eq!(
             fault_tolerant_quote_query_count(),
             CLOSE_GROUP_SIZE * FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER
         );
         assert!(fault_tolerant_quote_query_count() > single_node_quote_query_count());
+    }
+
+    #[test]
+    fn witnessed_candidates_sort_by_votes_then_xor_distance() {
+        let address = [0u8; 32];
+        let witnessed = WitnessedCloseGroup {
+            target: address,
+            k: CLOSE_GROUP_SIZE,
+            initial_closest: witnessed_test_nodes(&[1, 2, 3, 4, 5, 6, 7]),
+            responder_views: vec![
+                witnessed_test_view(1, &[1, 9]),
+                witnessed_test_view(2, &[1, 9]),
+                witnessed_test_view(3, &[1, 9]),
+                witnessed_test_view(4, &[1, 9]),
+                witnessed_test_view(5, &[1, 9]),
+                witnessed_test_view(6, &[9]),
+                witnessed_test_view(7, &[9]),
+            ],
+        };
+
+        let candidates =
+            witnessed_consensus_candidates(&witnessed, &address, witnessed_close_group_quorum());
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.node.peer_id.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            vec![9, 1],
+            "higher vote count must sort ahead of a closer XOR peer"
+        );
     }
 
     #[test]

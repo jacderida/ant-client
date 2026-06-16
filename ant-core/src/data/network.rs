@@ -146,9 +146,28 @@ impl Network {
         target: &[u8; 32],
         count: usize,
     ) -> Result<WitnessedCloseGroup> {
+        self.find_witnessed_close_group_with_view_count(target, count, count)
+            .await
+    }
+
+    /// Find a witnessed close-group transcript with wider responder views.
+    ///
+    /// `count` is the initial responder set size. `view_count` is the number
+    /// of closest nodes each responder view may contribute.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DHT lookup itself fails. The returned transcript
+    /// may still be inconclusive; callers should evaluate it before payment.
+    pub async fn find_witnessed_close_group_with_view_count(
+        &self,
+        target: &[u8; 32],
+        count: usize,
+        view_count: usize,
+    ) -> Result<WitnessedCloseGroup> {
         self.node
             .dht()
-            .find_witnessed_close_group(target, count)
+            .find_witnessed_close_group_with_view_count(target, count, view_count)
             .await
             .map_err(|e| Error::Network(format!("DHT witnessed close-group lookup failed: {e}")))
     }
