@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.2.8-rc.6"
+version = "0.2.8-rc.7"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.2.8-rc.6"
+version = "0.2.8-rc.7"
 dependencies = [
  "alloy",
  "ant-node",
@@ -892,8 +892,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.12.1-rc.8"
-source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.6.2#5067809fed31bba01f2ea894cb0f282130173f58"
+version = "0.12.1-rc.9"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.6.2#1898de868d6ee9ee7bbeb4008109ac3c2bfcfdfc"
 dependencies = [
  "ant-protocol",
  "blake3",
@@ -3259,7 +3259,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
