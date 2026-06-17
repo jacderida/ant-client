@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.2.8-rc.4"
+version = "0.2.8-rc.5"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.2.8-rc.4"
+version = "0.2.8-rc.5"
 dependencies = [
  "alloy",
  "ant-node",
@@ -892,8 +892,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.12.1-rc.7"
-source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.6.2#8f8842a2e7c3243a29d394ab8dbf0ff42a7989b2"
+version = "0.12.1-rc.8"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.6.2#5067809fed31bba01f2ea894cb0f282130173f58"
 dependencies = [
  "ant-protocol",
  "blake3",
@@ -941,8 +941,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.2.0-rc.1"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.6.2#72f1f53dcaf17beb5b1bc476513390570325c949"
+version = "2.2.0-rc.2"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.6.2#e454c81d9cb3b19a82456f90292e3bbe69bbc646"
 dependencies = [
  "blake3",
  "bytes",
@@ -3259,7 +3259,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5248,8 +5248,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.26.0-rc.1"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.2#79f5ad679a6ac6895cffd19731f90fb1cf02837e"
+version = "0.26.0-rc.2"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.2#d9b1600c64da59308d665957fb90fcb3fddcd80e"
 dependencies = [
  "anyhow",
  "async-trait",
