@@ -7,13 +7,14 @@ use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{Amount, PaymentQuote};
-use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, WitnessedCloseGroup};
+use ant_protocol::transport::{DHTNode, MultiAddr, P2PNode, PeerId, WitnessedCloseGroup};
 use ant_protocol::{
     compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
     ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -158,6 +159,105 @@ fn drop_quotes_with_bad_bindings(
     before - quotes.len()
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn request_store_quote_from_peer(
+    node: Arc<P2PNode>,
+    peer_id: PeerId,
+    peer_addrs: Vec<MultiAddr>,
+    request_id: u64,
+    address: [u8; 32],
+    data_size: u64,
+    data_type: u32,
+    per_peer_timeout: Duration,
+) -> StoreQuoteRequestResult {
+    let request = ChunkQuoteRequest {
+        address,
+        data_size,
+        data_type,
+    };
+    let message = ChunkMessage {
+        request_id,
+        body: ChunkMessageBody::QuoteRequest(request),
+    };
+
+    let message_bytes = match message.encode() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                peer_id,
+                peer_addrs,
+                Err(Error::Protocol(format!(
+                    "Failed to encode quote request for {peer_id}: {e}"
+                ))),
+            );
+        }
+    };
+
+    let result = send_and_await_chunk_response(
+        &node,
+        &peer_id,
+        message_bytes,
+        request_id,
+        per_peer_timeout,
+        &peer_addrs,
+        |body| match body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                quote,
+                already_stored,
+            }) => Some(classify_quote_response(&peer_id, &quote, already_stored)),
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
+                Error::Protocol(format!("Quote error from {peer_id}: {e}")),
+            )),
+            _ => None,
+        },
+        |e| Error::Network(format!("Failed to send quote request to {peer_id}: {e}")),
+        || Error::Timeout(format!("Timeout waiting for quote from {peer_id}")),
+    )
+    .await;
+
+    (peer_id, peer_addrs, result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_store_quote_result(
+    peer_id: PeerId,
+    addrs: Vec<MultiAddr>,
+    quote_result: Result<(PaymentQuote, Amount)>,
+    address: &[u8; 32],
+    quotes: &mut Vec<StoreQuote>,
+    already_stored_peers: &mut Vec<(PeerId, [u8; 32])>,
+    failures: &mut Vec<String>,
+    bad_quote_count: &mut usize,
+) {
+    match quote_result {
+        Ok((quote, price)) => {
+            quotes.push((peer_id, addrs, quote, price));
+        }
+        Err(Error::AlreadyStored) => {
+            info!("Peer {peer_id} reports chunk already stored");
+            let dist = peer_xor_distance(&peer_id, address);
+            already_stored_peers.push((peer_id, dist));
+        }
+        Err(e) => {
+            if matches!(&e, Error::BadQuoteBinding { .. }) {
+                *bad_quote_count += 1;
+            }
+            warn!("Failed to get quote from {peer_id}: {e}");
+            failures.push(format!("{peer_id}: {e}"));
+        }
+    }
+}
+
+fn witnessed_quote_launch_budget(
+    successful_quotes: usize,
+    in_flight: usize,
+    remaining_peers: usize,
+) -> usize {
+    CLOSE_GROUP_SIZE
+        .saturating_sub(successful_quotes.saturating_add(in_flight))
+        .min(remaining_peers)
+}
+
 fn single_node_quote_query_count() -> usize {
     CLOSE_GROUP_SIZE
 }
@@ -192,6 +292,7 @@ fn peer_list(peers: &[PeerId]) -> Vec<String> {
 }
 
 pub(crate) type StoreQuote = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount);
+type StoreQuoteRequestResult = (PeerId, Vec<MultiAddr>, Result<(PaymentQuote, Amount)>);
 type VotersByPeer = HashMap<PeerId, HashSet<PeerId>>;
 type WitnessedVoteData = (HashMap<PeerId, DHTNode>, VotersByPeer, Vec<(PeerId, usize)>);
 
@@ -793,93 +894,64 @@ impl Client {
         );
 
         if staged_witnessed_collection {
-            let collect_result: std::result::Result<(), Error> =
+            let mut quote_futures = FuturesUnordered::new();
+            let mut next_peer_index = 0usize;
+            let collect_result: std::result::Result<std::result::Result<(), Error>, _> =
                 tokio::time::timeout(overall_timeout, async {
-                    for (peer_id, peer_addrs) in &remote_peers {
-                        if quotes.len() >= CLOSE_GROUP_SIZE {
+                    loop {
+                        let launch_count = witnessed_quote_launch_budget(
+                            quotes.len(),
+                            quote_futures.len(),
+                            remote_peers.len().saturating_sub(next_peer_index),
+                        );
+                        for _ in 0..launch_count {
+                            let (peer_id, peer_addrs) = &remote_peers[next_peer_index];
+                            next_peer_index += 1;
+                            quote_futures.push(request_store_quote_from_peer(
+                                node.clone(),
+                                *peer_id,
+                                peer_addrs.clone(),
+                                self.next_request_id(),
+                                *address,
+                                data_size,
+                                data_type,
+                                per_peer_timeout,
+                            ));
+                        }
+
+                        if quotes.len() >= CLOSE_GROUP_SIZE || quote_futures.is_empty() {
                             break;
                         }
 
-                        let request_id = self.next_request_id();
-                        let request = ChunkQuoteRequest {
-                            address: *address,
-                            data_size,
-                            data_type,
+                        let Some((peer_id, addrs, quote_result)) = quote_futures.next().await
+                        else {
+                            break;
                         };
-                        let message = ChunkMessage {
-                            request_id,
-                            body: ChunkMessageBody::QuoteRequest(request),
-                        };
-
-                        let message_bytes = match message.encode() {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                warn!("Failed to encode quote request for {peer_id}: {e}");
-                                failures.push(format!("{peer_id}: encode failed: {e}"));
-                                continue;
-                            }
-                        };
-
-                        let quote_result = send_and_await_chunk_response(
-                            node,
+                        record_store_quote_result(
                             peer_id,
-                            message_bytes,
-                            request_id,
-                            per_peer_timeout,
-                            peer_addrs,
-                            |body| match body {
-                                ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
-                                    quote,
-                                    already_stored,
-                                }) => {
-                                    Some(classify_quote_response(peer_id, &quote, already_stored))
-                                }
-                                ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => {
-                                    Some(Err(Error::Protocol(format!(
-                                        "Quote error from {peer_id}: {e}"
-                                    ))))
-                                }
-                                _ => None,
-                            },
-                            |e| {
-                                Error::Network(format!(
-                                    "Failed to send quote request to {peer_id}: {e}"
-                                ))
-                            },
-                            || Error::Timeout(format!("Timeout waiting for quote from {peer_id}")),
-                        )
-                        .await;
-
-                        match quote_result {
-                            Ok((quote, price)) => {
-                                quotes.push((*peer_id, peer_addrs.clone(), quote, price));
-                            }
-                            Err(Error::AlreadyStored) => {
-                                info!("Peer {peer_id} reports chunk already stored");
-                                let dist = peer_xor_distance(peer_id, address);
-                                already_stored_peers.push((*peer_id, dist));
-                            }
-                            Err(e) => {
-                                if matches!(&e, Error::BadQuoteBinding { .. }) {
-                                    bad_quote_count += 1;
-                                }
-                                warn!("Failed to get quote from {peer_id}: {e}");
-                                failures.push(format!("{peer_id}: {e}"));
-                            }
-                        }
+                            addrs,
+                            quote_result,
+                            address,
+                            &mut quotes,
+                            &mut already_stored_peers,
+                            &mut failures,
+                            &mut bad_quote_count,
+                        );
                     }
                     Ok(())
                 })
-                .await
-                .unwrap_or_else(|_elapsed| {
+                .await;
+
+            match collect_result {
+                Err(_elapsed) => {
                     warn!(
                         "Quote collection timed out after {overall_timeout:?} for address {}",
                         hex::encode(address)
                     );
-                    Ok(())
-                });
-
-            collect_result?;
+                }
+                Ok(Err(e)) => return Err(e),
+                Ok(Ok(())) => {}
+            }
         } else {
             // Merkle preflight keeps the previous behaviour: query the full
             // over-query set concurrently because those quote responses are
@@ -887,92 +959,31 @@ impl Client {
             let mut quote_futures = FuturesUnordered::new();
 
             for (peer_id, peer_addrs) in &remote_peers {
-                let request_id = self.next_request_id();
-                let request = ChunkQuoteRequest {
-                    address: *address,
+                quote_futures.push(request_store_quote_from_peer(
+                    node.clone(),
+                    *peer_id,
+                    peer_addrs.clone(),
+                    self.next_request_id(),
+                    *address,
                     data_size,
                     data_type,
-                };
-                let message = ChunkMessage {
-                    request_id,
-                    body: ChunkMessageBody::QuoteRequest(request),
-                };
-
-                let message_bytes = match message.encode() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        warn!("Failed to encode quote request for {peer_id}: {e}");
-                        continue;
-                    }
-                };
-
-                let peer_id_clone = *peer_id;
-                let addrs_clone = peer_addrs.clone();
-                let node_clone = node.clone();
-
-                let quote_future = async move {
-                    let result = send_and_await_chunk_response(
-                        &node_clone,
-                        &peer_id_clone,
-                        message_bytes,
-                        request_id,
-                        per_peer_timeout,
-                        &addrs_clone,
-                        |body| match body {
-                            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
-                                quote,
-                                already_stored,
-                            }) => Some(classify_quote_response(
-                                &peer_id_clone,
-                                &quote,
-                                already_stored,
-                            )),
-                            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => {
-                                Some(Err(Error::Protocol(format!(
-                                    "Quote error from {peer_id_clone}: {e}"
-                                ))))
-                            }
-                            _ => None,
-                        },
-                        |e| {
-                            Error::Network(format!(
-                                "Failed to send quote request to {peer_id_clone}: {e}"
-                            ))
-                        },
-                        || {
-                            Error::Timeout(format!(
-                                "Timeout waiting for quote from {peer_id_clone}"
-                            ))
-                        },
-                    )
-                    .await;
-
-                    (peer_id_clone, addrs_clone, result)
-                };
-
-                quote_futures.push(quote_future);
+                    per_peer_timeout,
+                ));
             }
 
             let collect_result: std::result::Result<std::result::Result<(), Error>, _> =
                 tokio::time::timeout(overall_timeout, async {
                     while let Some((peer_id, addrs, quote_result)) = quote_futures.next().await {
-                        match quote_result {
-                            Ok((quote, price)) => {
-                                quotes.push((peer_id, addrs, quote, price));
-                            }
-                            Err(Error::AlreadyStored) => {
-                                info!("Peer {peer_id} reports chunk already stored");
-                                let dist = peer_xor_distance(&peer_id, address);
-                                already_stored_peers.push((peer_id, dist));
-                            }
-                            Err(e) => {
-                                if matches!(&e, Error::BadQuoteBinding { .. }) {
-                                    bad_quote_count += 1;
-                                }
-                                warn!("Failed to get quote from {peer_id}: {e}");
-                                failures.push(format!("{peer_id}: {e}"));
-                            }
-                        }
+                        record_store_quote_result(
+                            peer_id,
+                            addrs,
+                            quote_result,
+                            address,
+                            &mut quotes,
+                            &mut already_stored_peers,
+                            &mut failures,
+                            &mut bad_quote_count,
+                        );
                     }
                     Ok(())
                 })
@@ -1312,6 +1323,35 @@ mod tests {
             CLOSE_GROUP_SIZE * FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER
         );
         assert!(fault_tolerant_quote_query_count() > single_node_quote_query_count());
+    }
+
+    #[test]
+    fn witnessed_quote_launch_budget_keeps_exact_quote_window() {
+        assert_eq!(
+            witnessed_quote_launch_budget(0, 0, CLOSE_GROUP_SIZE * 2),
+            CLOSE_GROUP_SIZE,
+            "initial SNP quote fetch should launch the closest seven peers"
+        );
+        assert_eq!(
+            witnessed_quote_launch_budget(1, CLOSE_GROUP_SIZE - 1, CLOSE_GROUP_SIZE),
+            0,
+            "a successful quote should not launch an extra fallback"
+        );
+        assert_eq!(
+            witnessed_quote_launch_budget(0, CLOSE_GROUP_SIZE - 1, CLOSE_GROUP_SIZE),
+            1,
+            "a failed in-flight quote should launch the next closest fallback"
+        );
+        assert_eq!(
+            witnessed_quote_launch_budget(CLOSE_GROUP_SIZE - 1, 0, 3),
+            1,
+            "only one more peer is needed for the seventh quote"
+        );
+        assert_eq!(
+            witnessed_quote_launch_budget(0, 0, CLOSE_GROUP_SIZE - 1),
+            CLOSE_GROUP_SIZE - 1,
+            "launch budget is capped by remaining candidates"
+        );
     }
 
     #[test]
