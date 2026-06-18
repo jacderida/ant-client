@@ -16,12 +16,12 @@ use crate::data::client::batch::{
 };
 use crate::data::client::classify_error;
 use crate::data::client::merkle::{
-    chunk_contents_for_upload_addresses, finalize_merkle_batch, merkle_store_with_retry,
-    should_use_merkle, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
-    MERKLE_RETRY_BACKOFF, MERKLE_STORE_MAX_ATTEMPTS,
+    chunk_contents_for_upload_addresses, finalize_merkle_batch, merkle_deferred_retry,
+    merkle_store_with_retry, should_use_merkle, MerkleBatchPaymentResult, PaymentMode,
+    PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
 };
 use crate::data::client::Client;
-use crate::data::error::{Error, Result};
+use crate::data::error::{Error, PartialUploadSpend, Result};
 use ant_protocol::evm::{Amount, PaymentQuote, QuoteHash, TxHash, MAX_LEAVES};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{compute_address, DATA_TYPE_CHUNK};
@@ -34,6 +34,7 @@ use self_encryption::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
@@ -109,6 +110,33 @@ const DOWNLOAD_STREAM_BATCH_BYTES_PER_CHUNK_MULTIPLIER: u64 = 3;
 /// `AlreadyStored` retry path, which only matters when many leading chunks
 /// of a file already live on the network.
 const ESTIMATE_SAMPLE_CAP: usize = 5;
+
+/// Pick up to `cap` chunk indices spread evenly across `[0, total)`, always
+/// including the first and last chunk.
+///
+/// Sampling the *first* N chunks biases the probe: a file sharing a leading
+/// prefix with a prior upload (compressed archives, similar headers) reports
+/// those chunks as `AlreadyStored` even when the tail is new, so a positional
+/// sample looks in the worst possible place. Spreading the sample means a
+/// single new chunk anywhere in the file yields a real price.
+///
+/// Returns `[0]` for a single chunk and every index when `total <= cap`, so
+/// [`Client::estimate_upload_cost`] can still detect the "whole file sampled"
+/// case. Indices are strictly increasing.
+fn distributed_sample_indices(total: usize, cap: usize) -> Vec<usize> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let sample_limit = total.min(cap);
+    if sample_limit <= 1 {
+        return vec![0];
+    }
+    let mut indices: Vec<usize> = (0..sample_limit)
+        .map(|i| i * (total - 1) / (sample_limit - 1))
+        .collect();
+    indices.dedup(); // defensive: already strictly increasing for cap >= 2
+    indices
+}
 
 /// Gas used by one `pay_for_quotes` transaction that packs up to
 /// `UPLOAD_WAVE_SIZE` (quote_hash, rewards_address, amount) entries.
@@ -444,6 +472,107 @@ fn partition_addresses_by_proof(
         .partition(|addr| proofs.contains_key(addr))
 }
 
+/// Build a `PartialUpload` after a fatal merkle store error, with accurate
+/// counts.
+///
+/// A fatal abort can leave chunks in three states: confirmed stored (in
+/// `stored_addresses`), known-failed (in `known_failed` — missing proofs, the
+/// quorum shortfalls and the fatal chunk seen so far), and "in flight when the
+/// abort hit" (neither). Rather than trust the helpers to enumerate the last
+/// group, this derives the failed set authoritatively as *every* `addresses`
+/// entry not in `stored_addresses`, preferring a known per-chunk message and
+/// falling back to the fatal `reason`. That guarantees
+/// `stored_count + failed_count` accounts for the whole file — fixing the
+/// under-reporting where a fatal wave could surface `failed_count = 0` and omit
+/// same-pass successes.
+fn partial_upload_after_fatal(
+    addresses: &[[u8; 32]],
+    stored_addresses: Vec<[u8; 32]>,
+    stored_count: usize,
+    total_chunks: usize,
+    known_failed: Vec<([u8; 32], String)>,
+    spend: PartialUploadSpend,
+    reason: String,
+) -> Error {
+    let stored_set: HashSet<[u8; 32]> = stored_addresses.iter().copied().collect();
+    let mut failed_map: HashMap<[u8; 32], String> = HashMap::new();
+    for (addr, msg) in known_failed {
+        if !stored_set.contains(&addr) {
+            failed_map.entry(addr).or_insert(msg);
+        }
+    }
+    for addr in addresses {
+        if !stored_set.contains(addr) {
+            failed_map.entry(*addr).or_insert_with(|| reason.clone());
+        }
+    }
+    let failed: Vec<([u8; 32], String)> = failed_map.into_iter().collect();
+    let failed_count = failed.len();
+    Error::PartialUpload {
+        stored: stored_addresses,
+        stored_count,
+        failed,
+        failed_count,
+        total_chunks,
+        spend: Box::new(spend),
+        reason,
+    }
+}
+
+/// One wave's contribution to a single-node upload, distilled from its
+/// `batch_upload_chunks_with_events` result.
+#[derive(Debug)]
+struct SingleWaveOutcome {
+    /// Addresses confirmed stored in this wave.
+    stored: Vec<[u8; 32]>,
+    /// Chunks that failed after retries in this wave.
+    failed: Vec<([u8; 32], String)>,
+    /// Storage cost paid on-chain for this wave, in atto-tokens.
+    storage_atto: Amount,
+    /// Gas paid on-chain for this wave, in wei.
+    gas_wei: u128,
+    /// Per-wave store/retry statistics. Empty for a quorum-short wave, whose
+    /// `PartialUpload` carries no stats.
+    stats: WaveAggregateStats,
+}
+
+/// Fold one wave's batch-upload result for the single-node path.
+///
+/// A `PartialUpload` (chunks short of quorum after retries) is **recoverable**:
+/// its stored/failed chunks and on-chain spend are returned so the caller
+/// records them and continues to the next wave, making the file make maximum
+/// progress exactly like `upload_waves_merkle`. Every other error is **fatal**
+/// (wallet/payment-infrastructure failures, missing proofs, spill reads) and is
+/// returned via `Err` to abort the file. Because `UPLOAD_WAVE_SIZE ==
+/// PAYMENT_WAVE_SIZE`, each batch call is exactly one payment wave, so folding a
+/// `PartialUpload` leaves nothing un-attempted within the wave.
+fn fold_single_wave(
+    result: Result<(Vec<[u8; 32]>, String, u128, WaveAggregateStats)>,
+) -> Result<SingleWaveOutcome> {
+    match result {
+        Ok((stored, storage, gas, stats)) => Ok(SingleWaveOutcome {
+            stored,
+            failed: Vec::new(),
+            storage_atto: storage.parse().unwrap_or(Amount::ZERO),
+            gas_wei: gas,
+            stats,
+        }),
+        Err(Error::PartialUpload {
+            stored,
+            failed,
+            spend,
+            ..
+        }) => Ok(SingleWaveOutcome {
+            stored,
+            failed,
+            storage_atto: spend.storage_cost_atto.parse().unwrap_or(Amount::ZERO),
+            gas_wei: spend.gas_cost_wei,
+            stats: WaveAggregateStats::default(),
+        }),
+        Err(e) => Err(e),
+    }
+}
+
 /// Check that the spill directory has enough free space for the spilled chunks.
 ///
 /// `file_size` is the source file's byte count. We require
@@ -570,9 +699,38 @@ pub enum Visibility {
     Public,
 }
 
+/// Confidence attached to an [`UploadCostEstimate`]'s `storage_cost_atto`.
+///
+/// `estimate_upload_cost` prices a file by sampling a few of its chunk
+/// addresses and extrapolating. When every sampled chunk is already stored
+/// there is no live price to extrapolate from, so a `"0"` cost can mean either
+/// "provably free" (the whole file was sampled) or only "probably free" (the
+/// tail was unsampled). This lets callers tell those apart instead of treating
+/// every `"0"` as unconditionally free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostEstimateConfidence {
+    /// At least one sampled chunk returned a live quote; `storage_cost_atto`
+    /// is extrapolated from a real per-chunk price. The normal case.
+    #[default]
+    PricedSample,
+    /// Every chunk in the file was sampled and every one was already stored.
+    /// `storage_cost_atto` is exactly `"0"` — the upload is genuinely free.
+    VerifiedAllAlreadyStored,
+    /// Every *sampled* chunk was already stored, but not all chunks were
+    /// sampled. `storage_cost_atto` is `"0"` as a best-effort guess; the real
+    /// upload reconciles the true cost at payment time. Render this as "likely
+    /// already stored", not a guaranteed-free price.
+    AllSamplesAlreadyStoredIncomplete,
+}
+
 /// Estimated cost of uploading a file, returned by
 /// [`Client::estimate_upload_cost`].
+///
+/// Marked `#[non_exhaustive]` so adding a field later is not a breaking change
+/// for downstream consumers that construct or pattern-match on this struct.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct UploadCostEstimate {
     /// Original file size in bytes.
     pub file_size: u64,
@@ -586,6 +744,9 @@ pub struct UploadCostEstimate {
     pub estimated_gas_cost_wei: String,
     /// Payment mode that would be used.
     pub payment_mode: PaymentMode,
+    /// How much to trust `storage_cost_atto`. See [`CostEstimateConfidence`].
+    #[serde(default)]
+    pub confidence: CostEstimateConfidence,
 }
 
 /// Result of a file upload: the `DataMap` needed to retrieve the file.
@@ -778,6 +939,55 @@ fn spawn_file_encryption(path: PathBuf) -> Result<EncryptionChannels> {
     Ok((chunk_rx, datamap_rx, handle))
 }
 
+/// RAII guard for the staging temp file used during a disk download.
+///
+/// Removes the file on drop — including a panic unwind out of the
+/// `block_in_place` decrypt loop — unless [`commit`](Self::commit) has
+/// promoted it to its final path. Centralizes the cleanup the explicit error
+/// arms used to repeat.
+struct TempDownload {
+    /// `Some` while the staging file may need cleanup; `None` once committed.
+    path: Option<PathBuf>,
+}
+
+impl TempDownload {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// Path of the staging file (valid until `commit`).
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("TempDownload::path called after commit")
+    }
+
+    /// Rename the staged file to `dest`. On success the guard is defused so
+    /// `Drop` is a no-op; on failure the guard stays armed and `Drop` removes
+    /// the orphaned temp file.
+    fn commit(mut self, dest: &Path) -> std::io::Result<()> {
+        std::fs::rename(self.path(), dest)?; // err → guard armed → Drop cleans up
+        self.path = None; // success → nothing left to clean
+        Ok(())
+    }
+}
+
+impl Drop for TempDownload {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                // Absent file is fine (never created / already gone).
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "Failed to remove temp download file {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl Client {
     /// Upload a file to the network using streaming self-encryption.
     ///
@@ -807,19 +1017,22 @@ impl Client {
     /// `GAS_PER_MERKLE_TX`) priced at `ARBITRUM_GAS_PRICE_WEI`. Real gas
     /// varies with network conditions.
     ///
-    /// If the first sampled chunk is already stored on the network, the
-    /// function retries with subsequent chunk addresses (up to
-    /// `ESTIMATE_SAMPLE_CAP`). If every sampled address reports stored,
-    /// a [`Error::CostEstimationInconclusive`] is returned so callers can
-    /// decide how to react rather than trust a bogus "free" estimate. Only
-    /// when every address in the file is stored do we return a zero-cost
-    /// estimate.
+    /// Sampled chunk addresses are spread across the whole file (not the first
+    /// N) so a shared leading prefix doesn't bias the sample. When a sample
+    /// returns a live quote the per-chunk price is extrapolated and the result
+    /// is tagged [`CostEstimateConfidence::PricedSample`].
+    ///
+    /// When every sampled chunk is already stored the result is still `Ok`
+    /// with `storage_cost_atto: "0"`, tagged either
+    /// [`CostEstimateConfidence::VerifiedAllAlreadyStored`] when the whole file
+    /// was sampled (exactly free) or
+    /// [`CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete`] when the
+    /// tail was unsampled (a best-effort guess that payment reconciles).
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read, encryption fails,
-    /// the network cannot provide a quote, or every sampled chunk is
-    /// already stored ([`Error::CostEstimationInconclusive`]).
+    /// Returns an error if the file cannot be read, encryption fails, or the
+    /// network cannot provide a quote.
     pub async fn estimate_upload_cost(
         &self,
         path: &Path,
@@ -853,26 +1066,33 @@ impl Client {
         }
 
         info!("Encrypted into {chunk_count} chunks, requesting quote");
+        let uses_merkle = should_use_merkle(chunk_count, mode);
 
-        // Sample up to ESTIMATE_SAMPLE_CAP distinct chunk addresses. A single
-        // AlreadyStored result says nothing about the rest of the file — the
-        // first chunk is often a DataMap-adjacent chunk that collides with
-        // prior uploads even when 99% of the file is new. Only treat the
-        // whole file as "fully stored" when every sample comes back stored.
-        let sample_limit = spill.addresses.len().min(ESTIMATE_SAMPLE_CAP);
+        // Sample chunk addresses spread evenly across the file (see
+        // `distributed_sample_indices`) rather than the first N. A single
+        // AlreadyStored result says nothing about the rest of the file, and a
+        // positional sample lands on a shared leading prefix in the worst case,
+        // so we spread the probe and only treat the whole file as "fully
+        // stored" when every sample comes back stored.
+        let sample_indices = distributed_sample_indices(spill.addresses.len(), ESTIMATE_SAMPLE_CAP);
         let mut sampled = 0usize;
         let mut all_already_stored = true;
         let mut quotes_opt: Option<Vec<QuoteEntry>> = None;
 
-        for addr in spill.addresses.iter().take(sample_limit) {
+        for &idx in &sample_indices {
+            let addr = &spill.addresses[idx];
             sampled += 1;
             let chunk_bytes = spill.read_chunk(addr)?;
             let data_size = u64::try_from(chunk_bytes.len())
                 .map_err(|e| Error::InvalidData(format!("chunk size too large: {e}")))?;
-            match self
-                .get_store_quotes(addr, data_size, DATA_TYPE_CHUNK)
-                .await
-            {
+            let result = if uses_merkle {
+                self.get_store_quotes_with_fault_tolerance(addr, data_size, DATA_TYPE_CHUNK)
+                    .await
+            } else {
+                self.get_store_quotes(addr, data_size, DATA_TYPE_CHUNK)
+                    .await
+            };
+            match result {
                 Ok(q) => {
                     quotes_opt = Some(q);
                     all_already_stored = false;
@@ -880,8 +1100,9 @@ impl Client {
                 }
                 Err(Error::AlreadyStored) => {
                     debug!(
-                        "Sample chunk {} already stored; trying next address ({sampled}/{sample_limit})",
-                        hex::encode(addr)
+                        "Sample chunk {} already stored; trying next address ({sampled}/{})",
+                        hex::encode(addr),
+                        sample_indices.len()
                     );
                     continue;
                 }
@@ -889,14 +1110,11 @@ impl Client {
             }
         }
 
-        let uses_merkle = should_use_merkle(chunk_count, mode);
-
         let quotes = match quotes_opt {
             Some(q) => q,
             None if all_already_stored && sampled == chunk_count => {
                 // Every address in the file was sampled and every one is
-                // already on the network — returning a zero-cost estimate is
-                // accurate in this case.
+                // already on the network — a zero-cost estimate is exact here.
                 info!("All {chunk_count} chunks already stored; returning zero-cost estimate");
                 return Ok(UploadCostEstimate {
                     file_size,
@@ -908,14 +1126,31 @@ impl Client {
                     } else {
                         PaymentMode::Single
                     },
+                    confidence: CostEstimateConfidence::VerifiedAllAlreadyStored,
                 });
             }
             None => {
-                return Err(Error::CostEstimationInconclusive(format!(
-                    "sampled {sampled} chunk addresses out of {chunk_count} and every \
-                     one reported AlreadyStored; cannot infer a representative price \
-                     for the remaining chunks"
-                )));
+                // Every sampled chunk was already stored but the tail was not
+                // sampled, so there is no live price to extrapolate. The
+                // estimate is display-only and payment reconciles the true
+                // cost, so return an optimistic zero flagged as incomplete
+                // rather than erroring — callers still get a value to show.
+                info!(
+                    "All {sampled}/{chunk_count} sampled chunks already stored; \
+                     returning incomplete zero-cost estimate"
+                );
+                return Ok(UploadCostEstimate {
+                    file_size,
+                    chunk_count,
+                    storage_cost_atto: "0".into(),
+                    estimated_gas_cost_wei: "0".into(),
+                    payment_mode: if uses_merkle {
+                        PaymentMode::Merkle
+                    } else {
+                        PaymentMode::Single
+                    },
+                    confidence: CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete,
+                });
             }
         };
 
@@ -973,6 +1208,7 @@ impl Client {
             } else {
                 PaymentMode::Single
             },
+            confidence: CostEstimateConfidence::PricedSample,
         })
     }
 
@@ -1334,7 +1570,7 @@ impl Client {
         match prepared.payment_info {
             ExternalPaymentInfo::WaveBatch {
                 prepared_chunks,
-                payment_intent: _,
+                payment_intent,
             } => {
                 let paid_chunks = finalize_batch_payment(prepared_chunks, tx_hash_map)?;
                 let wave_result = self
@@ -1356,6 +1592,13 @@ impl Client {
                         failed: wave_result.failed,
                         failed_count,
                         total_chunks,
+                        // Report the storage spend known from the payment intent
+                        // the external signer was handed. Gas is paid by the
+                        // signer out-of-band, so it stays unknown (0).
+                        spend: Box::new(PartialUploadSpend {
+                            storage_cost_atto: payment_intent.total_amount.to_string(),
+                            gas_cost_wei: 0,
+                        }),
                         reason: "finalize_upload: chunk storage failed after retries".into(),
                     });
                 }
@@ -1372,7 +1615,9 @@ impl Client {
                     chunks_failed: 0,
                     total_chunks,
                     payment_mode_used: PaymentMode::Single,
-                    storage_cost_atto: "0".into(),
+                    // Storage spend is known from the payment intent; gas is
+                    // paid by the external signer out-of-band (unknown here).
+                    storage_cost_atto: payment_intent.total_amount.to_string(),
                     gas_cost_wei: 0,
                     data_map_address,
                     chunk_attempts_total: stats.chunk_attempts_total,
@@ -1492,6 +1737,21 @@ impl Client {
         self.file_upload_with_progress(path, mode, None).await
     }
 
+    /// Upload a file publicly, storing the serialized [`DataMap`] as part of
+    /// the same upload payment batch.
+    ///
+    /// The returned [`FileUploadResult::data_map_address`] can be shared for
+    /// public downloads via [`Client::data_map_fetch`].
+    #[allow(clippy::too_many_lines)]
+    pub async fn file_upload_public_with_mode(
+        &self,
+        path: &Path,
+        mode: PaymentMode,
+    ) -> Result<FileUploadResult> {
+        self.file_upload_with_visibility_and_progress(path, mode, Visibility::Public, None)
+            .await
+    }
+
     /// Upload a file with progress events sent to the given channel.
     ///
     /// Same as [`Client::file_upload_with_mode`] but sends [`UploadEvent`]s to the
@@ -1503,8 +1763,35 @@ impl Client {
         mode: PaymentMode,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
+        self.file_upload_with_visibility_and_progress(path, mode, Visibility::Private, progress)
+            .await
+    }
+
+    /// Public file upload with progress events.
+    ///
+    /// Same as [`Client::file_upload_public_with_mode`] but sends
+    /// [`UploadEvent`]s to the provided channel for UI progress feedback.
+    #[allow(clippy::too_many_lines)]
+    pub async fn file_upload_public_with_progress(
+        &self,
+        path: &Path,
+        mode: PaymentMode,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
+        self.file_upload_with_visibility_and_progress(path, mode, Visibility::Public, progress)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn file_upload_with_visibility_and_progress(
+        &self,
+        path: &Path,
+        mode: PaymentMode,
+        visibility: Visibility,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
         debug!(
-            "Streaming file upload with mode {mode:?}: {}",
+            "Streaming file upload with mode {mode:?}, visibility {visibility:?}: {}",
             path.display()
         );
 
@@ -1514,7 +1801,24 @@ impl Client {
 
         // Phase 1: Encrypt file and spill chunks to temp directory.
         // Only 32-byte addresses stay in memory — chunk data lives on disk.
-        let (spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
+        let (mut spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
+
+        let data_map_address = match visibility {
+            Visibility::Private => None,
+            Visibility::Public => {
+                let serialized = rmp_serde::to_vec(&data_map).map_err(|e| {
+                    Error::Serialization(format!("Failed to serialize DataMap: {e}"))
+                })?;
+                let address = compute_address(&serialized);
+                info!(
+                    "Public upload: adding DataMap chunk ({} bytes) at address {} to payment batch",
+                    serialized.len(),
+                    hex::encode(address)
+                );
+                spill.push(&serialized)?;
+                Some(address)
+            }
+        };
 
         let chunk_count = spill.len();
         info!(
@@ -1585,7 +1889,7 @@ impl Client {
                             payment_mode_used: PaymentMode::Merkle,
                             storage_cost_atto: sc,
                             gas_cost_wei: gc,
-                            data_map_address: None,
+                            data_map_address,
                             chunk_attempts_total: stats.chunk_attempts_total,
                             store_durations_ms: stats.store_durations_ms,
                             retries_histogram: stats.retries_histogram,
@@ -1613,7 +1917,7 @@ impl Client {
                                 payment_mode_used: PaymentMode::Single,
                                 storage_cost_atto: sc,
                                 gas_cost_wei: gc,
-                                data_map_address: None,
+                                data_map_address,
                                 chunk_attempts_total: fb_stats.chunk_attempts_total,
                                 store_durations_ms: fb_stats.store_durations_ms,
                                 retries_histogram: fb_stats.retries_histogram,
@@ -1675,7 +1979,7 @@ impl Client {
                             &spill,
                             &merkle_plan.to_upload,
                             progress.as_ref(),
-                            merkle_plan.already_stored.len(),
+                            &merkle_plan.already_stored,
                             chunk_count,
                             Some(&file_path_key),
                         )
@@ -1737,7 +2041,7 @@ impl Client {
                                 &spill,
                                 &merkle_plan.to_upload,
                                 progress.as_ref(),
-                                merkle_plan.already_stored.len(),
+                                &merkle_plan.already_stored,
                                 chunk_count,
                                 Some(&file_path_key),
                             )
@@ -1751,7 +2055,7 @@ impl Client {
                             payment_mode_used: PaymentMode::Single,
                             storage_cost_atto: sc,
                             gas_cost_wei: gc,
-                            data_map_address: None,
+                            data_map_address,
                             chunk_attempts_total: fb_stats.chunk_attempts_total,
                             store_durations_ms: fb_stats.store_durations_ms,
                             retries_histogram: fb_stats.retries_histogram,
@@ -1796,7 +2100,7 @@ impl Client {
             payment_mode_used: actual_mode,
             storage_cost_atto,
             gas_cost_wei,
-            data_map_address: None,
+            data_map_address,
             chunk_attempts_total: stats.chunk_attempts_total,
             store_durations_ms: stats.store_durations_ms,
             retries_histogram: stats.retries_histogram,
@@ -1863,7 +2167,7 @@ impl Client {
             spill,
             &spill.addresses,
             progress,
-            0,
+            &[],
             spill.len(),
             resume_key,
         )
@@ -1875,16 +2179,37 @@ impl Client {
         spill: &ChunkSpill,
         addresses: &[[u8; 32]],
         progress: Option<&mpsc::Sender<UploadEvent>>,
-        stored_offset: usize,
+        already_stored_addresses: &[[u8; 32]],
         total_chunks: usize,
         resume_key: Option<&str>,
     ) -> Result<(usize, String, u128, WaveAggregateStats)> {
-        let mut total_stored = stored_offset;
+        let mut total_stored = already_stored_addresses.len();
         let mut total_storage = Amount::ZERO;
         let mut total_gas: u128 = 0;
         let mut agg_stats = WaveAggregateStats::default();
+        // A wave whose chunks fall short of quorum after retries must not abort
+        // the file: its failures are accumulated here and surfaced as a single
+        // `PartialUpload` only after every wave has been attempted, mirroring
+        // `upload_waves_merkle`. Aborting on the first failed wave (the old `?`)
+        // discarded all later waves' progress — already self-encrypted, spilled,
+        // and in some cases already paid for — converting high per-chunk success
+        // into 0% per-file success.
+        // Seed with the addresses a preflight already confirmed stored (e.g.
+        // the merkle-fallback path passes `merkle_plan.already_stored`), so a
+        // returned `PartialUpload.stored` lists every stored chunk and
+        // `stored_count == stored.len()` holds for programmatic callers.
+        let mut stored_addresses: Vec<[u8; 32]> = already_stored_addresses.to_vec();
+        let mut failed: Vec<([u8; 32], String)> = Vec::new();
         let waves: Vec<&[[u8; 32]]> = addresses.chunks(UPLOAD_WAVE_SIZE).collect();
         let wave_count = waves.len();
+
+        // Unconditional breadcrumb: lets a clean run confirm the continue-on-
+        // partial single-node path is in effect (the old path aborted the file
+        // on the first failed wave instead of continuing across all waves).
+        info!(
+            "single-node upload: {} chunk(s) in {wave_count} wave(s) (continue-on-partial)",
+            addresses.len()
+        );
 
         for (wave_idx, wave_addrs) in waves.into_iter().enumerate() {
             let wave_num = wave_idx + 1;
@@ -1906,35 +2231,50 @@ impl Client {
                     })
                     .await;
             }
-            let (addresses, wave_storage, wave_gas, wave_stats) = self
-                .batch_upload_chunks_with_events(
+            // Fold this wave's result. A quorum shortfall (`PartialUpload`) is
+            // recoverable and its parts are returned to be recorded here;
+            // genuinely fatal errors propagate via `?` and abort the file, as in
+            // `upload_waves_merkle`.
+            let outcome = fold_single_wave(
+                self.batch_upload_chunks_with_events(
                     wave_data,
                     progress,
                     total_stored,
                     total_chunks,
                     resume_key,
                 )
-                .await?;
-            total_stored += addresses.len();
-            if let Ok(cost) = wave_storage.parse::<Amount>() {
-                total_storage += cost;
+                .await,
+            )?;
+
+            if !outcome.failed.is_empty() {
+                warn!(
+                    "Wave {wave_num}/{wave_count}: {} chunk(s) failed to store after retries; \
+                     continuing with remaining waves",
+                    outcome.failed.len()
+                );
             }
-            total_gas = total_gas.saturating_add(wave_gas);
-            // Merge per-call stats (each call already aggregates across the
-            // waves it ran internally, so a simple sum/extend is correct).
+
+            total_stored += outcome.stored.len();
+            stored_addresses.extend(outcome.stored);
+            failed.extend(outcome.failed);
+            total_storage += outcome.storage_atto;
+            total_gas = total_gas.saturating_add(outcome.gas_wei);
+            // Merge per-wave stats (a quorum-short wave contributes none, since
+            // `PartialUpload` carries no stats).
             agg_stats.chunk_attempts_total = agg_stats
                 .chunk_attempts_total
-                .saturating_add(wave_stats.chunk_attempts_total);
+                .saturating_add(outcome.stats.chunk_attempts_total);
             agg_stats
                 .store_durations_ms
-                .extend(wave_stats.store_durations_ms);
+                .extend(outcome.stats.store_durations_ms);
             for (slot, count) in agg_stats
                 .retries_histogram
                 .iter_mut()
-                .zip(wave_stats.retries_histogram.iter())
+                .zip(outcome.stats.retries_histogram.iter())
             {
                 *slot = slot.saturating_add(*count);
             }
+
             if let Some(tx) = progress {
                 let _ = tx
                     .send(UploadEvent::WaveComplete {
@@ -1945,6 +2285,28 @@ impl Client {
                     })
                     .await;
             }
+        }
+
+        // Any chunk still failed after every wave was attempted means the file
+        // is not fully stored — surface it as `PartialUpload` (never silently
+        // succeed with missing chunks), carrying the real on-chain spend.
+        if !failed.is_empty() {
+            let failed_count = failed.len();
+            warn!(
+                "single-node upload incomplete: {failed_count}/{total_chunks} chunks failed after retries"
+            );
+            return Err(Error::PartialUpload {
+                stored: stored_addresses,
+                stored_count: total_stored,
+                failed,
+                failed_count,
+                total_chunks,
+                spend: Box::new(PartialUploadSpend {
+                    storage_cost_atto: total_storage.to_string(),
+                    gas_cost_wei: total_gas,
+                }),
+                reason: format!("{failed_count} chunk(s) failed to store after retries"),
+            });
         }
 
         Ok((
@@ -1961,12 +2323,16 @@ impl Client {
     /// and uploads concurrently. Peak memory: ~`UPLOAD_WAVE_SIZE × MAX_CHUNK_SIZE`.
     ///
     /// A chunk that is transiently short of quorum (`InsufficientPeers`) does
-    /// **not** abort the file: each wave is driven through
-    /// [`merkle_store_with_retry`], which collects such chunks and retries them
-    /// — re-collecting their close group and reusing the same proof — for up to
-    /// [`MERKLE_STORE_MAX_ATTEMPTS`] rounds with a [`MERKLE_RETRY_BACKOFF`] wait
-    /// between rounds. Retry is per-wave to preserve the streaming memory bound.
-    /// Non-quorum errors (e.g. a missing proof) stay fatal and abort immediately.
+    /// **not** abort the file, nor does it block the pipeline: each wave is
+    /// stored in a **single pass** (no in-wave backoff barrier), and chunks
+    /// short of quorum are collected into a file-level deferred set rather than
+    /// retried in place. After the last wave, [`merkle_deferred_retry`] retries
+    /// the whole deferred set in concurrent rounds ([`DEFERRED_ROUND_DELAYS_SECS`]
+    /// delays), re-reading each chunk's body from the spill and reusing its
+    /// proof. This keeps every wave running at full fan-out instead of parking
+    /// idle slots behind one slow chunk's backoff, while peak memory stays
+    /// bounded (bodies are re-read from disk, never pinned). Non-quorum errors
+    /// (e.g. a missing proof) stay fatal and abort immediately.
     ///
     /// Returns `(chunks_stored, storage_cost_atto, gas_cost_wei)` on success.
     /// Costs come from the `batch_result` which was populated during payment.
@@ -1988,6 +2354,10 @@ impl Client {
         let total_chunks = total_stored + addresses.len();
         let mut stored_addresses: Vec<[u8; 32]> = already_stored_addresses.to_vec();
         let mut failed: Vec<([u8; 32], String)> = Vec::new();
+        // Chunks short of quorum on their single wave pass are collected here and
+        // retried after the last wave (see `merkle_deferred_retry`), so a slow
+        // chunk never holds its wave's other slots idle behind a backoff.
+        let mut deferred: Vec<([u8; 32], String)> = Vec::new();
         let mut agg_stats = WaveAggregateStats::default();
 
         // Chunks without a merkle proof were never paid for: a partial
@@ -2061,57 +2431,30 @@ impl Client {
                 .map(|(content, addr)| (addr, content))
                 .collect();
 
-            // Retry quorum-short chunks instead of aborting on the first miss.
-            // `stored_offset` is the running cumulative count so the progress
-            // events the driver emits stay correctly numbered across waves.
-            let outcome = match merkle_store_with_retry(
+            // Store the wave in a SINGLE pass (`max_attempts = 1`, no backoff):
+            // quorum-short chunks are collected and deferred to a post-wave
+            // concurrent retry rather than parking this wave's other slots
+            // behind a backoff. `stored_offset` is the running cumulative count
+            // so the progress events the driver emits stay correctly numbered
+            // across waves.
+            let outcome = merkle_store_with_retry(
                 chunks,
                 store_concurrency,
-                MERKLE_STORE_MAX_ATTEMPTS,
-                MERKLE_RETRY_BACKOFF,
+                1,
+                std::time::Duration::ZERO,
                 progress,
                 total_stored,
                 total_chunks,
                 &store_one,
             )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    // A non-quorum store error is fatal for the retry helper
-                    // (missing proofs were filtered out above, so this is a
-                    // genuine network/store failure, e.g. a DHT lookup error).
-                    // Surface it at the file boundary as `PartialUpload` so the
-                    // chunks already stored in earlier waves — and any
-                    // missing-proof chunks already recorded — are preserved for
-                    // resume, rather than discarded with a generic error.
-                    warn!("merkle wave {wave_num}/{wave_count} aborted: {e}");
-                    let failed_count = failed.len();
-                    return Err(Error::PartialUpload {
-                        stored: stored_addresses,
-                        stored_count: total_stored,
-                        failed,
-                        failed_count,
-                        total_chunks,
-                        reason: format!("merkle chunk store aborted: {e}"),
-                    });
-                }
-            };
+            .await?;
 
-            // Record which of this wave's chunks landed and which exhausted
-            // their retries, so a permanently-failed chunk can surface as
-            // `PartialUpload` once the whole file has been attempted.
-            let wave_failed: HashSet<[u8; 32]> = outcome
-                .failed_addresses
-                .iter()
-                .map(|(addr, _)| *addr)
-                .collect();
-            for addr in wave_addrs {
-                if !wave_failed.contains(addr) {
-                    stored_addresses.push(*addr);
-                }
-            }
-            failed.extend(outcome.failed_addresses);
+            // Record this wave's confirmed stores from the explicit set the
+            // store helper reports. Using that set (rather than inferring
+            // "wave chunks minus failed") keeps `stored_addresses` correct even
+            // when a fatal abort leaves some of the wave neither stored nor
+            // reported short of quorum.
+            stored_addresses.extend(&outcome.stored_addresses);
             total_stored = outcome.stored;
 
             // Merge per-wave stats (durations, attempts, per-round histogram).
@@ -2129,6 +2472,38 @@ impl Client {
                 *slot = slot.saturating_add(*count);
             }
 
+            if let Some(e) = outcome.fatal {
+                // A non-quorum store error is fatal (missing proofs were
+                // filtered out above, so this is a genuine network/store
+                // failure). Preserve every chunk stored so far — including this
+                // wave's same-pass successes — and report every not-stored chunk
+                // as failed, so the `PartialUpload` counts are accurate rather
+                // than omitting same-wave stores and under-counting failures.
+                warn!("merkle wave {wave_num}/{wave_count} aborted: {e}");
+                // Best per-chunk messages we already have: missing-proof, this
+                // wave's shortfalls, and earlier waves' deferred shortfalls.
+                let mut known_failed = failed;
+                known_failed.extend(outcome.failed_addresses);
+                known_failed.extend(std::mem::take(&mut deferred));
+                return Err(partial_upload_after_fatal(
+                    addresses,
+                    stored_addresses,
+                    total_stored,
+                    total_chunks,
+                    known_failed,
+                    PartialUploadSpend {
+                        storage_cost_atto: batch_result.storage_cost_atto.clone(),
+                        gas_cost_wei: batch_result.gas_cost_wei,
+                    },
+                    format!("merkle chunk store aborted: {e}"),
+                ));
+            }
+
+            // Non-fatal: this wave's quorum-short chunks are deferred (not failed
+            // yet) for the post-wave concurrent retry. A deferred chunk joins
+            // `stored_addresses` only if/when a later round stores it.
+            deferred.extend(outcome.failed_addresses);
+
             if let Some(tx) = progress {
                 let _ = tx
                     .send(UploadEvent::WaveComplete {
@@ -2141,11 +2516,87 @@ impl Client {
             }
         }
 
+        // The wave passes never blocked on backoff; now retry the whole
+        // file-level deferred set in concurrent rounds. Bodies are re-read from
+        // the spill at retry time (peak RAM unchanged) and proofs are re-attached
+        // by `store_one`. Chunks still short after the final round become
+        // `failed`; a non-quorum error aborts as `PartialUpload`.
+        if !deferred.is_empty() {
+            info!(
+                "Deferring {} merkle chunk(s) short of quorum for concurrent retry after final wave",
+                deferred.len()
+            );
+            let dr = merkle_deferred_retry(
+                deferred,
+                &DEFERRED_ROUND_DELAYS_SECS,
+                // Read and store at most one wave's worth of bodies at a time so
+                // the deferred path keeps the wave path's ~256 MB peak-memory
+                // bound regardless of how many chunks were deferred file-wide.
+                UPLOAD_WAVE_SIZE,
+                |addrs: &[[u8; 32]]| {
+                    spill.read_wave(addrs).map(|wave| {
+                        wave.into_iter()
+                            .map(|(content, addr)| (addr, content))
+                            .collect()
+                    })
+                },
+                |n: usize| store_limiter.current().min(n.max(1)),
+                progress,
+                total_stored,
+                total_chunks,
+                &store_one,
+            )
+            .await?;
+
+            stored_addresses.extend(dr.stored_addresses);
+            total_stored = dr.stored;
+
+            // Merge the deferred pass's stats — its histogram is already mapped
+            // to the right per-round slots — into the file aggregate.
+            agg_stats.chunk_attempts_total = agg_stats
+                .chunk_attempts_total
+                .saturating_add(dr.stats.chunk_attempts_total);
+            agg_stats
+                .store_durations_ms
+                .extend(dr.stats.store_durations_ms);
+            for (slot, count) in agg_stats
+                .retries_histogram
+                .iter_mut()
+                .zip(dr.stats.retries_histogram.iter())
+            {
+                *slot = slot.saturating_add(*count);
+            }
+
+            if let Some(reason) = dr.fatal {
+                // A non-quorum store error during a deferred round is fatal, the
+                // same as in the wave path: preserve everything stored so far and
+                // report every not-stored chunk as failed.
+                warn!("merkle deferred retry aborted: {reason}");
+                let mut known_failed = failed;
+                known_failed.extend(dr.failed_addresses);
+                return Err(partial_upload_after_fatal(
+                    addresses,
+                    stored_addresses,
+                    total_stored,
+                    total_chunks,
+                    known_failed,
+                    PartialUploadSpend {
+                        storage_cost_atto: batch_result.storage_cost_atto.clone(),
+                        gas_cost_wei: batch_result.gas_cost_wei,
+                    },
+                    format!("merkle chunk store aborted: {reason}"),
+                ));
+            }
+            failed.extend(dr.failed_addresses);
+        }
+
         // A file with any permanently-failed chunk is not fully stored — surface
-        // it as `PartialUpload`, but only after retries across all waves are
-        // exhausted (never silently succeed with missing chunks).
+        // it as `PartialUpload`, but only after the single wave pass and every
+        // deferred retry round are exhausted (never silently succeed with
+        // missing chunks).
         if !failed.is_empty() {
             let failed_count = failed.len();
+            let total_attempts = 1 + DEFERRED_ROUND_DELAYS_SECS.len();
             warn!(
                 "merkle upload incomplete: {failed_count}/{total_chunks} chunks short of quorum after retries"
             );
@@ -2155,8 +2606,12 @@ impl Client {
                 failed,
                 failed_count,
                 total_chunks,
+                spend: Box::new(PartialUploadSpend {
+                    storage_cost_atto: batch_result.storage_cost_atto.clone(),
+                    gas_cost_wei: batch_result.gas_cost_wei,
+                }),
                 reason: format!(
-                    "{failed_count} chunk(s) short of quorum after {MERKLE_STORE_MAX_ATTEMPTS} attempts"
+                    "{failed_count} chunk(s) short of quorum after {total_attempts} attempts"
                 ),
             });
         }
@@ -2189,30 +2644,83 @@ impl Client {
     ///
     /// Returns an error if any chunk cannot be retrieved, decryption fails,
     /// or the file cannot be written.
-    #[allow(clippy::unused_async)]
     pub async fn file_download(&self, data_map: &DataMap, output: &Path) -> Result<u64> {
         self.file_download_with_progress(data_map, output, None)
             .await
     }
 
-    /// Download and decrypt a file with progress events.
+    /// Download and decrypt a file, trying the requested number of
+    /// closest peers for every chunk fetch.
     ///
-    /// Same as [`Client::file_download`] but sends [`DownloadEvent`]s for UI feedback.
+    /// Returns the number of bytes written.
     ///
-    /// Progress reporting:
-    /// 1. Resolves hierarchical DataMaps to the root level first (reports as
-    ///    `ChunksFetched` with `total: 0` during resolution)
-    /// 2. Once the root DataMap is known, sends `total_chunks` with accurate count
-    /// 3. Fetches data chunks with accurate `fetched/total` progress
-    #[allow(clippy::unused_async)]
-    pub async fn file_download_with_progress(
+    /// # Errors
+    ///
+    /// Returns an error if any chunk cannot be retrieved, decryption fails,
+    /// or the file cannot be written.
+    pub async fn file_download_from_closest_peers(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        peer_count: NonZeroUsize,
+    ) -> Result<u64> {
+        self.file_download_with_progress_using_peer_count(data_map, output, None, peer_count.get())
+            .await
+    }
+
+    /// Download and decrypt a file with progress events, trying the
+    /// requested number of closest peers for every chunk fetch.
+    ///
+    /// Same as [`Client::file_download_from_closest_peers`] but sends
+    /// [`DownloadEvent`]s for UI feedback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any chunk cannot be retrieved, decryption fails,
+    /// or the file cannot be written.
+    pub async fn file_download_with_progress_from_closest_peers(
         &self,
         data_map: &DataMap,
         output: &Path,
         progress: Option<mpsc::Sender<DownloadEvent>>,
+        peer_count: NonZeroUsize,
     ) -> Result<u64> {
-        debug!("Downloading file to {}", output.display());
+        self.file_download_with_progress_using_peer_count(
+            data_map,
+            output,
+            progress,
+            peer_count.get(),
+        )
+        .await
+    }
 
+    /// Shared download core: resolve the DataMap, then fetch + streaming-decrypt
+    /// the file one batch at a time, handing each decrypted plaintext segment
+    /// (in order) to `on_chunk`. Constant memory — only one decrypt batch is
+    /// resident at a time. Returns the total plaintext bytes produced.
+    ///
+    /// `on_chunk` is async so a sink can apply backpressure (e.g. a bounded
+    /// channel). Driving the decrypt iterator runs the batched chunk fetch via
+    /// `block_in_place`, so this requires a multi-threaded Tokio runtime.
+    ///
+    /// Every chunk fetch tries `peer_count` closest peers.
+    ///
+    /// Progress reporting (via `progress`):
+    /// 1. Resolves hierarchical DataMaps to the root level first (reports as
+    ///    `ChunksFetched` with `total: 0` during resolution)
+    /// 2. Once the root DataMap is known, sends `total_chunks` with accurate count
+    /// 3. Fetches data chunks with accurate `fetched/total` progress
+    async fn download_decrypted_chunks<F, Fut>(
+        &self,
+        data_map: &DataMap,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+        peer_count: usize,
+        mut on_chunk: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(Bytes) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         let handle = Handle::current();
 
         // Phase 1: Resolve hierarchical DataMap to root level.
@@ -2260,7 +2768,7 @@ impl Client {
                                     // load-shedding signal for
                                     // sustained close-group exhaustion).
                                     let chunk = self
-                                        .chunk_get_observed(&addr)
+                                        .chunk_get_observed_from_closest_peers(&addr, peer_count)
                                         .await
                                         .map_err(|e| {
                                             self_encryption::Error::Generic(format!(
@@ -2372,7 +2880,10 @@ impl Client {
                                 async move {
                                     let addr = hash.0;
                                     let addr_hex = hex::encode(addr);
-                                    match self.chunk_get_observed(&addr).await {
+                                    match self
+                                        .chunk_get_observed_from_closest_peers(&addr, peer_count)
+                                        .await
+                                    {
                                         Ok(Some(chunk)) => {
                                             let fetched = fetched_ref.fetch_add(
                                                 1,
@@ -2484,7 +2995,12 @@ impl Client {
                                             // next round rather than
                                             // aborting; only the final
                                             // round's leftovers are fatal.
-                                            match self.chunk_get_observed(&addr).await {
+                                            match self
+                                                .chunk_get_observed_from_closest_peers(
+                                                    &addr, peer_count,
+                                                )
+                                                .await
+                                            {
                                                 Ok(Some(chunk)) => {
                                                     let fetched = fetched_ref.fetch_add(
                                                         1,
@@ -2550,53 +3066,118 @@ impl Client {
         )
         .map_err(|e| Error::Encryption(format!("streaming decrypt failed: {e}")))?;
 
-        // Write decrypted chunks to a temp file, then rename atomically.
+        // Drive the iterator (each `next()` runs the batched fetch via
+        // block_in_place) and hand each decrypted segment to the sink in
+        // order. Awaiting the sink between items yields back to the runtime so
+        // a bounded sink can apply backpressure.
+        let mut bytes_total = 0u64;
+        for chunk_result in stream {
+            let chunk: Bytes =
+                chunk_result.map_err(|e| Error::Encryption(format!("decryption failed: {e}")))?;
+            bytes_total += chunk.len() as u64;
+            on_chunk(chunk).await?;
+        }
+        Ok(bytes_total)
+    }
+
+    /// Download and decrypt a file to disk, with optional progress events.
+    ///
+    /// Same as [`Client::file_download`] but sends [`DownloadEvent`]s for UI
+    /// feedback. Streams to a temp file (one decrypt batch resident at a time)
+    /// and renames atomically on success. A `TempDownload` guard removes the
+    /// staging file on any error path, including a panic.
+    pub async fn file_download_with_progress(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+    ) -> Result<u64> {
+        self.file_download_with_progress_using_peer_count(
+            data_map,
+            output,
+            progress,
+            self.config().close_group_size,
+        )
+        .await
+    }
+
+    /// Download and decrypt a file to disk with progress events, trying
+    /// `peer_count` closest peers for every chunk fetch.
+    ///
+    /// Streams to a temp file (one decrypt batch resident at a time) and
+    /// renames atomically on success.
+    async fn file_download_with_progress_using_peer_count(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+        peer_count: usize,
+    ) -> Result<u64> {
+        debug!("Downloading file to {}", output.display());
+
         let parent = output.parent().unwrap_or_else(|| Path::new("."));
         let unique: u64 = rand::random();
         let tmp_path = parent.join(format!(".ant_download_{}_{unique}.tmp", std::process::id()));
 
-        let write_result = (|| -> Result<u64> {
-            let mut file = std::fs::File::create(&tmp_path)?;
-            let mut bytes_written = 0u64;
-            for chunk_result in stream {
-                let chunk_bytes = chunk_result
-                    .map_err(|e| Error::Encryption(format!("decryption failed: {e}")))?;
-                file.write_all(&chunk_bytes)?;
-                bytes_written += chunk_bytes.len() as u64;
-            }
-            file.flush()?;
-            Ok(bytes_written)
-        })();
+        // Guard removes the staging file on any early return OR a panic unwind
+        // out of the `block_in_place` decrypt loop; defused only by a
+        // successful commit(). Centralizes what used to be three duplicated
+        // cleanup arms.
+        let tmp = TempDownload::new(tmp_path);
+        let mut file = std::fs::File::create(tmp.path())?;
 
-        match write_result {
-            Ok(bytes_written) => match std::fs::rename(&tmp_path, output) {
-                Ok(()) => {
-                    info!(
-                        "File downloaded: {bytes_written} bytes written to {}",
-                        output.display()
-                    );
-                    Ok(bytes_written)
-                }
-                Err(rename_err) => {
-                    if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
-                        warn!(
-                            "Failed to remove temp download file {}: {cleanup_err}",
-                            tmp_path.display()
-                        );
-                    }
-                    Err(rename_err.into())
-                }
-            },
-            Err(e) => {
-                if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
-                    warn!(
-                        "Failed to remove temp download file {}: {cleanup_err}",
-                        tmp_path.display()
-                    );
-                }
-                Err(e)
+        let bytes_written = self
+            .download_decrypted_chunks(data_map, progress, peer_count, |bytes| {
+                let r = file.write_all(&bytes).map_err(Error::from);
+                std::future::ready(r)
+            })
+            .await?;
+        file.flush()?;
+        drop(file); // close the handle before rename (Windows won't rename an open file)
+
+        tmp.commit(output)?;
+        info!(
+            "File downloaded: {bytes_written} bytes written to {}",
+            output.display()
+        );
+        Ok(bytes_written)
+    }
+
+    /// Download and decrypt a file, streaming the plaintext to `sink` instead
+    /// of writing to disk.
+    ///
+    /// Constant memory (one decrypt batch resident at a time); the caller
+    /// receives bytes progressively as each batch decrypts, suitable for
+    /// forwarding to an HTTP chunked body or a gRPC response stream. The
+    /// bounded `sink` applies backpressure. If the receiver is dropped (e.g.
+    /// the client disconnected) the download stops early and returns
+    /// [`Error::Cancelled`].
+    ///
+    /// The channel item type is `Result<Bytes, Error>`, so the caller sets up:
+    ///
+    /// ```ignore
+    /// let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Error>>(8);
+    /// ```
+    ///
+    /// Typically the caller `tokio::spawn`s this and converts the matching
+    /// `Receiver` into its response stream. Requires a multi-threaded Tokio
+    /// runtime (the decrypt iterator uses `block_in_place`).
+    pub async fn file_download_to_sender(
+        &self,
+        data_map: &DataMap,
+        sink: mpsc::Sender<std::result::Result<Bytes, Error>>,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+    ) -> Result<u64> {
+        let peer_count = self.config().close_group_size;
+        self.download_decrypted_chunks(data_map, progress, peer_count, |bytes| {
+            let sink = sink.clone();
+            async move {
+                sink.send(Ok(bytes))
+                    .await
+                    .map_err(|_| Error::Cancelled("download stream receiver dropped".into()))
             }
-        }
+        })
+        .await
     }
 }
 
@@ -2604,6 +3185,33 @@ impl Client {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distributed_sample_indices_spreads_across_large_file() {
+        // cap 5 over 100 chunks: first and last included, evenly spread.
+        assert_eq!(distributed_sample_indices(100, 5), vec![0, 24, 49, 74, 99]);
+    }
+
+    #[test]
+    fn distributed_sample_indices_covers_whole_small_file() {
+        // total <= cap returns every index, preserving the exact
+        // "whole file sampled" detection in estimate_upload_cost.
+        assert_eq!(distributed_sample_indices(3, 5), vec![0, 1, 2]);
+        assert_eq!(distributed_sample_indices(5, 5), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn distributed_sample_indices_is_in_range_and_increasing() {
+        assert!(distributed_sample_indices(0, 5).is_empty());
+        assert_eq!(distributed_sample_indices(1, 5), vec![0]);
+        for total in 1..200usize {
+            let idx = distributed_sample_indices(total, 5);
+            assert_eq!(*idx.first().unwrap(), 0);
+            assert_eq!(*idx.last().unwrap(), total - 1);
+            assert!(idx.iter().all(|&i| i < total));
+            assert!(idx.windows(2).all(|w| w[0] < w[1]));
+        }
+    }
 
     #[test]
     fn disk_space_check_passes_for_small_file() {
@@ -2710,6 +3318,68 @@ mod tests {
 
         assert_eq!(to_store, vec![paid_a, paid_c]);
         assert_eq!(missing, vec![unpaid_b, unpaid_d]);
+    }
+
+    /// A wave that returns `Ok` contributes its stored chunks, parsed cost, and
+    /// stats; nothing is recorded as failed.
+    #[test]
+    fn fold_single_wave_keeps_ok_wave() {
+        let stored = vec![[1u8; 32], [2u8; 32]];
+        let stats = WaveAggregateStats {
+            chunk_attempts_total: 7,
+            ..Default::default()
+        };
+
+        let outcome = fold_single_wave(Ok((stored.clone(), "100".to_string(), 9, stats))).unwrap();
+
+        assert_eq!(outcome.stored, stored);
+        assert!(outcome.failed.is_empty());
+        assert_eq!(outcome.storage_atto.to_string(), "100");
+        assert_eq!(outcome.gas_wei, 9);
+        assert_eq!(outcome.stats.chunk_attempts_total, 7);
+    }
+
+    /// The core V2-461 semantic: a wave short of quorum (`PartialUpload`) is
+    /// recoverable — its stored chunks, failed chunks, and on-chain spend are
+    /// folded so the caller can continue to the next wave rather than aborting
+    /// the whole file.
+    #[test]
+    fn fold_single_wave_folds_partial_upload() {
+        let stored = vec![[3u8; 32]];
+        let failed = vec![([4u8; 32], "short of quorum".to_string())];
+        let err = Error::PartialUpload {
+            stored: stored.clone(),
+            stored_count: 1,
+            failed: failed.clone(),
+            failed_count: 1,
+            total_chunks: 2,
+            spend: Box::new(PartialUploadSpend {
+                storage_cost_atto: "250".to_string(),
+                gas_cost_wei: 11,
+            }),
+            reason: "wave store failed after retries".to_string(),
+        };
+
+        let outcome = fold_single_wave(Err(err)).unwrap();
+
+        assert_eq!(outcome.stored, stored);
+        assert_eq!(outcome.failed, failed);
+        assert_eq!(outcome.storage_atto.to_string(), "250");
+        assert_eq!(outcome.gas_wei, 11);
+        // `PartialUpload` carries no stats, so the failed wave contributes none.
+        assert_eq!(outcome.stats.chunk_attempts_total, 0);
+    }
+
+    /// A non-`PartialUpload` error (wallet/payment-infrastructure failure) is
+    /// fatal and must abort the file, not be folded into the failed set.
+    #[test]
+    fn fold_single_wave_propagates_fatal_error() {
+        let result = fold_single_wave(Err(Error::Payment("wallet unavailable".to_string())));
+
+        assert!(
+            matches!(result, Err(Error::Payment(_))),
+            "fatal payment error must propagate, got: {result:?}"
+        );
     }
 
     #[test]

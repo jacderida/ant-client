@@ -9,7 +9,7 @@ use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
 use crate::data::client::payment::peer_id_to_encoded;
 use crate::data::client::Client;
-use crate::data::error::{Error, Result};
+use crate::data::error::{Error, PartialUploadSpend, Result};
 use ant_protocol::evm::{
     Amount, EncodedPeerId, PayForQuotesError, PaymentQuote, ProofOfPayment, QuoteHash,
     RewardsAddress, TxHash,
@@ -28,6 +28,13 @@ use tracing::{debug, info, warn};
 
 /// Number of chunks per payment wave.
 const PAYMENT_WAVE_SIZE: usize = 64;
+
+/// Soft ceiling on the combined body size of chunks stored concurrently in a
+/// single wave. Caps store concurrency for large chunks so the send path's
+/// per-peer body buffers can't pin multiple GB at once (see V2-461). At ~4 MB
+/// chunks this permits ~16 concurrent stores; small chunks hit the chunk-count
+/// / adaptive limits instead and are unaffected.
+const STORE_INFLIGHT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
 /// Chunk quoted but not yet paid. Produced by [`Client::prepare_chunk_payment`].
 #[derive(Debug)]
@@ -236,23 +243,21 @@ impl Client {
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
 
-        let quotes_with_peers = match self
-            .get_store_quotes(&address, data_size, DATA_TYPE_CHUNK)
+        let quote_plan = match self
+            .get_store_quote_plan(&address, data_size, DATA_TYPE_CHUNK)
             .await
         {
-            Ok(quotes) => quotes,
+            Ok(plan) => plan,
             Err(Error::AlreadyStored) => {
                 debug!("Chunk {} already stored, skipping", hex::encode(address));
                 return Ok(None);
             }
             Err(e) => return Err(e),
         };
+        let quotes_with_peers = quote_plan.quotes;
 
         // Capture all quoted peers for close-group replication.
-        let quoted_peers: Vec<(PeerId, Vec<MultiAddr>)> = quotes_with_peers
-            .iter()
-            .map(|(peer_id, addrs, _, _)| (*peer_id, addrs.clone()))
-            .collect();
+        let quoted_peers = quote_plan.put_peers;
 
         // Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.
         // Use node-reported prices directly — no contract price fetch needed.
@@ -413,35 +418,28 @@ impl Client {
         // is decision-pure: we never hand a doomed proof to a storer,
         // and the cache is updated under our own lock with no remote
         // text involved.
-        // `cached_cost` carries the cumulative cost from waves paid in
-        // a previous run so the returned tally reflects total spend on
-        // this file, not just freshly-paid chunks. Without this the
-        // user's "this upload cost X" message under-reports by the
-        // resumed waves' cost.
-        let (cached_proofs, cached_storage, cached_gas): (HashMap<XorName, Vec<u8>>, Amount, u128) =
-            match resume_key {
-                Some(key) => match crate::data::client::cached_single::try_load_for_file(key) {
-                    Some((_, receipt)) => {
-                        let prior_storage = receipt
-                            .storage_cost_atto
-                            .parse::<Amount>()
-                            .unwrap_or(Amount::ZERO);
-                        let prior_gas = receipt.gas_cost_wei;
-                        let kept = prune_locally_expired_proofs(key, receipt.proofs);
-                        (kept, prior_storage, prior_gas)
-                    }
-                    None => (HashMap::new(), Amount::ZERO, 0u128),
-                },
-                None => (HashMap::new(), Amount::ZERO, 0u128),
-            };
+        // Load only the cached PROOFS (for reuse). The cost this function
+        // returns is a per-call DELTA — what was freshly paid in THIS call —
+        // not the cache's cumulative. The single-node wave driver
+        // (`upload_spill_addresses_single`) calls this once per wave and SUMS
+        // the per-call costs, so seeding the return with the cumulative cache
+        // (which grows as each wave appends to it) double-counts:
+        // A + (A+B) + (A+B+C) instead of A+B+C.
+        let cached_proofs: HashMap<XorName, Vec<u8>> = match resume_key {
+            Some(key) => match crate::data::client::cached_single::try_load_for_file(key) {
+                Some((_, receipt)) => prune_locally_expired_proofs(key, receipt.proofs),
+                None => HashMap::new(),
+            },
+            None => HashMap::new(),
+        };
 
         let mut all_addresses = Vec::with_capacity(total_chunks);
         let mut seen_addresses: HashSet<XorName> = HashSet::new();
 
-        // Accumulate costs across waves, seeded with cumulative from
-        // any cached receipt loaded above.
-        let mut total_storage = cached_storage;
-        let mut total_gas: u128 = cached_gas;
+        // Accumulate only THIS call's freshly-paid cost (per-call delta; see
+        // the proof-load comment above for why this must not include the cache).
+        let mut total_storage = Amount::ZERO;
+        let mut total_gas: u128 = 0;
         let mut agg_stats = WaveAggregateStats::default();
 
         // Deduplicate chunks by content address.
@@ -520,6 +518,10 @@ impl Client {
                         failed: wave_result.failed,
                         failed_count,
                         total_chunks: file_total,
+                        spend: Box::new(PartialUploadSpend {
+                            storage_cost_atto: total_storage.to_string(),
+                            gas_cost_wei: total_gas,
+                        }),
                         reason: "wave store failed after retries".into(),
                     });
                 }
@@ -618,6 +620,10 @@ impl Client {
                     failed: wave_result.failed,
                     failed_count,
                     total_chunks: file_total,
+                    spend: Box::new(PartialUploadSpend {
+                        storage_cost_atto: total_storage.to_string(),
+                        gas_cost_wei: total_gas,
+                    }),
                     reason: "final wave store failed after retries".into(),
                 });
             }
@@ -735,6 +741,22 @@ impl Client {
             first_seen.entry(chunk.address).or_insert_with(Instant::now);
         }
 
+        // Bound concurrency by IN-FLIGHT BYTES, not just chunk count. Each
+        // concurrently-stored chunk is held in memory while it is sent to its
+        // close group, and the send path re-serializes the body once per peer,
+        // so a wave of large (~4 MB) chunks at full store concurrency can pin
+        // multiple GB and OOM a small host. Cap how many chunks store at once
+        // so their combined body size stays under the budget; small chunks are
+        // unaffected (the byte bound exceeds the chunk-count bound). The budget
+        // is deliberately conservative for the current per-peer send
+        // amplification and can be raised once that is reduced upstream.
+        let max_chunk_bytes = to_retry.iter().map(|c| c.content.len()).max().unwrap_or(0);
+        // `checked_div` yields `None` only when `max_chunk_bytes == 0` (an
+        // empty/zero-length wave), in which case there is no byte limit.
+        let byte_bound = STORE_INFLIGHT_BYTE_BUDGET
+            .checked_div(max_chunk_bytes)
+            .map_or(usize::MAX, |n| n.max(1));
+
         let mut chunk_attempts_total: usize = 0;
         let mut store_durations_ms: Vec<u64> = Vec::new();
         let mut retries_per_chunk: Vec<u32> = Vec::new();
@@ -753,7 +775,10 @@ impl Client {
             chunk_attempts_total = chunk_attempts_total.saturating_add(to_retry.len());
 
             let store_limiter = self.controller().store.clone();
-            let store_concurrency = store_limiter.current().min(to_retry.len().max(1));
+            let store_concurrency = store_limiter
+                .current()
+                .min(to_retry.len().max(1))
+                .min(byte_bound);
             let mut upload_stream = stream::iter(to_retry)
                 .map(|chunk| {
                     let chunk_clone = chunk.clone();

@@ -3,6 +3,7 @@
 //! Connects quote collection, on-chain EVM payment, and proof serialization.
 //! Every PUT to the network requires a valid payment proof.
 
+use crate::data::client::quote::median_paid_quote_issuer;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{EncodedPeerId, ProofOfPayment, Wallet};
@@ -22,7 +23,7 @@ impl Client {
     /// Pay for storage and return the serialized payment proof bytes.
     ///
     /// This orchestrates the full payment flow:
-    /// 1. Collect `CLOSE_GROUP_SIZE` quotes from closest peers
+    /// 1. Collect `CLOSE_GROUP_SIZE` quotes from the witnessed close group
     /// 2. Build `SingleNodePayment` using node-reported prices (median 3x, others 0)
     /// 3. Pay on-chain via the wallet
     /// 4. Serialize `PaymentProof` with transaction hashes
@@ -47,13 +48,19 @@ impl Client {
         debug!("Collecting quotes for address {}", hex::encode(address));
 
         // 1. Collect quotes from network
-        let quotes_with_peers = self.get_store_quotes(address, data_size, data_type).await?;
+        let quote_plan = self
+            .get_store_quote_plan(address, data_size, data_type)
+            .await?;
+        let quotes_with_peers = quote_plan.quotes;
+        let median_quote_issuer =
+            median_paid_quote_issuer(&quotes_with_peers).ok_or_else(|| {
+                Error::Payment(
+                    "Failed to select median quote issuer from witnessed quotes".to_string(),
+                )
+            })?;
 
         // Capture all quoted peers for replication by the caller.
-        let quoted_peers: Vec<(PeerId, Vec<MultiAddr>)> = quotes_with_peers
-            .iter()
-            .map(|(peer_id, addrs, _, _)| (*peer_id, addrs.clone()))
-            .collect();
+        let quoted_peers = quote_plan.put_peers;
 
         // 2. Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.
         // Use node-reported prices directly — no contract price fetch needed.
@@ -70,6 +77,12 @@ impl Client {
         let payment = SingleNodePayment::from_quotes(quotes_for_payment)
             .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
 
+        info!(
+            "Selected SNP median paid quote issuer {} for address {} (median price: {})",
+            median_quote_issuer.0,
+            hex::encode(address),
+            median_quote_issuer.1
+        );
         info!("Payment total: {} atto", payment.total_amount());
 
         // 4. Pay on-chain

@@ -13,13 +13,13 @@ pub mod data;
 pub mod file;
 pub mod merkle;
 pub mod payment;
-pub(crate) mod peer_cache;
 pub mod quote;
 
 use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelStart, Outcome};
 use crate::data::client::cache::ChunkCache;
 use crate::data::error::{Error, Result};
 use crate::data::network::Network;
+use crate::data::peer_cache;
 use ant_protocol::evm::Wallet;
 use ant_protocol::transport::{MultiAddr, P2PNode, PeerId};
 use ant_protocol::{XorName, CLOSE_GROUP_SIZE};
@@ -47,8 +47,13 @@ use tracing::debug;
 ///   chunks could not be stored)
 /// - `AlreadyStored`, `Encryption`, `Crypto`, `Payment`,
 ///   `Serialization`, `InvalidData`, `SignatureVerification`,
-///   `Config`, `InsufficientDiskSpace`, `CostEstimationInconclusive`
-///   -> `ApplicationError` (would happen on a perfectly healthy link)
+///   `Config`, `InsufficientDiskSpace`, `CostEstimationInconclusive`,
+///   `Cancelled` -> `ApplicationError` (would happen on a perfectly
+///   healthy link; `Cancelled` is caller-initiated and must not be retried
+///   as a transport failure)
+/// - `RemotePut` -> `ApplicationError` (the remote node responded with a
+///   structured rejection — the transport succeeded, so the node declined
+///   at the application layer; not a local capacity signal)
 pub(crate) fn classify_error(err: &Error) -> Outcome {
     match err {
         Error::Timeout(_) => Outcome::Timeout,
@@ -68,7 +73,13 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         | Error::Config(_)
         | Error::InsufficientDiskSpace(_)
         | Error::CostEstimationInconclusive(_)
-        | Error::BadQuoteBinding { .. } => Outcome::ApplicationError,
+        | Error::Cancelled(_)
+        | Error::BadQuoteBinding { .. }
+        // A remote node responded with a structured rejection — the
+        // transport round-trip succeeded, so the node declined at the
+        // application layer (payment/disk/quote/pool). Not a local
+        // capacity signal; recorded but must not push the limiter down.
+        | Error::RemotePut { .. } => Outcome::ApplicationError,
     }
 }
 
@@ -325,12 +336,25 @@ pub struct Client {
     /// Path the controller persists its snapshot to. `None` disables
     /// persistence (useful for tests / non-disk environments).
     persist_path: Option<PathBuf>,
+    /// Path for the persistent client peer cache. `None` disables the cache.
+    peer_cache_path: Option<PathBuf>,
 }
 
 impl Client {
     /// Create a client connected to the given P2P node.
     #[must_use]
     pub fn from_node(node: Arc<P2PNode>, config: ClientConfig) -> Self {
+        Self::from_node_with_peer_cache(node, config, None)
+    }
+
+    /// Create a client connected to the given P2P node and attach an optional
+    /// persistent peer cache path.
+    #[must_use]
+    pub fn from_node_with_peer_cache(
+        node: Arc<P2PNode>,
+        config: ClientConfig,
+        peer_cache_path: Option<PathBuf>,
+    ) -> Self {
         let network = Network::from_node(node);
         let (controller, persist_path) = build_controller(&config);
         Self {
@@ -342,6 +366,7 @@ impl Client {
             next_request_id: AtomicU64::new(1),
             controller,
             persist_path,
+            peer_cache_path,
         }
     }
 
@@ -376,6 +401,7 @@ impl Client {
             next_request_id: AtomicU64::new(1),
             controller,
             persist_path,
+            peer_cache_path: None,
         })
     }
 
@@ -463,6 +489,17 @@ impl Client {
     pub fn save_adaptive_snapshot(&self) {
         if let Some(ref path) = self.persist_path {
             adaptive::save_snapshot(path, self.controller.snapshot());
+        }
+    }
+
+    /// Persist currently connected peers that have Direct-tagged addresses in
+    /// the DHT. Best effort; failures are logged and do not affect the client
+    /// operation that just completed.
+    pub async fn save_peer_cache(&self) {
+        if let Some(ref path) = self.peer_cache_path {
+            let node = self.network().node();
+            peer_cache::promote_connected_direct_peers(node.as_ref(), path, node.dht().k_value())
+                .await;
         }
     }
 
@@ -597,9 +634,30 @@ mod tests {
                     failed: vec![],
                     failed_count: 0,
                     total_chunks: 0,
+                    spend: Box::new(crate::data::error::PartialUploadSpend {
+                        storage_cost_atto: "0".to_string(),
+                        gas_cost_wei: 0,
+                    }),
                     reason: "r".to_string(),
                 },
                 Outcome::NetworkError,
+            ),
+            (
+                Error::BadQuoteBinding {
+                    peer_id: "peer".to_string(),
+                    detail: "mismatch".to_string(),
+                },
+                Outcome::ApplicationError,
+            ),
+            // A remote application rejection: the node responded with a
+            // structured `ProtocolError`, so the transport succeeded and
+            // this must NOT register as a capacity signal (V2-468).
+            (
+                Error::RemotePut {
+                    address: "abcd".to_string(),
+                    source: ant_protocol::ProtocolError::PaymentFailed("stale quote".to_string()),
+                },
+                Outcome::ApplicationError,
             ),
         ];
         for (err, expected) in &cases {
@@ -679,8 +737,10 @@ mod tests {
             | Error::AlreadyStored
             | Error::InsufficientDiskSpace(_)
             | Error::CostEstimationInconclusive(_)
+            | Error::Cancelled(_)
             | Error::PartialUpload { .. }
-            | Error::BadQuoteBinding { .. } => (),
+            | Error::BadQuoteBinding { .. }
+            | Error::RemotePut { .. } => (),
         };
     }
 }

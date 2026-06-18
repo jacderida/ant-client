@@ -1,6 +1,6 @@
 [package]
 name = "ant-core"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 description = "Headless Rust library for the Autonomi network: data storage and retrieval with self-encryption and EVM payments, plus node lifecycle management."
 license = "MIT OR Apache-2.0"
@@ -37,7 +37,7 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = "2.1.2"
+ant-protocol = "2.2.0"
 xor_name = "5"
 self_encryption = "0.36"
 futures = "0.3"
@@ -61,9 +61,11 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # Must track the same `saorsa-core` / `ant-protocol` line as the
 # `ant-protocol` pin above — a version skew pulls a second copy of
 # `saorsa-core` into the graph and makes `ant_node`'s and `ant_protocol`'s
-# `MultiAddr` mutually incompatible in `node/devnet.rs`. ant-node 0.11.6
-# tracks saorsa-core 0.24.5 / ant-protocol 2.1.2, matching the pins here.
-ant-node = { version = "0.11.6", optional = true }
+# `MultiAddr` mutually incompatible in `node/devnet.rs`. While the runtime
+# `ant-protocol` pin above points at a git branch, this ant-node must point at
+# the matching ant-node branch carrying the same saorsa-core / ant-protocol
+# lineage rather than a released version.
+ant-node = { version = "0.13.0", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -91,19 +93,12 @@ devnet = ["dep:ant-node"]
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = "0.11.6"
+ant-node = { version = "0.13.0", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
 tokio-test = "0.4"
 rmp-serde = "1"
-# Direct access to BootstrapManager used by the cold-start-from-disk test,
-# which populates a cache via `add_peer_trusted` (bypasses Sybil rate limits)
-# and then verifies reload after save. Test-only — no runtime version-pin
-# concern. Tracks ant-node's transitive saorsa-core dep, so it must match
-# the version ant-node 0.11.6 pins to avoid a duplicate saorsa-core in
-# the graph.
-saorsa-core = "0.24.5"
 
 [[example]]
 name = "start-local-devnet"

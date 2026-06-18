@@ -11,7 +11,7 @@
 mod support;
 
 use ant_core::data::client::merkle::PaymentMode;
-use ant_core::data::{Client, ClientConfig};
+use ant_core::data::{Client, ClientConfig, CostEstimateConfidence};
 use serial_test::serial;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -256,4 +256,88 @@ async fn test_estimate_rejects_tiny_files() {
         .estimate_upload_cost(&tiny_path, PaymentMode::Auto, None)
         .await;
     assert!(result.is_err(), "Estimate should fail for files < 3 bytes");
+}
+
+/// Regression for the partial-sample case (issue #114): re-estimating a
+/// fully-stored file with more chunks than the sample cap must return `Ok`
+/// flagged `AllSamplesAlreadyStoredIncomplete`, not `CostEstimationInconclusive`.
+///
+/// Every sampled chunk is already stored, but the sample cannot cover the whole
+/// file, so the old code errored and left consumers (the GUI) with no estimate.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_estimate_all_stored_partial_sample_is_incomplete() {
+    let testnet = MiniTestnet::start(10).await;
+    let node = testnet.node(3).expect("Node 3 should exist");
+    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+        .with_wallet(testnet.wallet().clone());
+
+    let work_dir = TempDir::new().expect("create work dir");
+    // ~30 MB -> ~8 chunks at MAX_CHUNK_SIZE (4,190,208 B), comfortably above the
+    // 5-address sample cap so the sample cannot cover every chunk.
+    let path = create_test_file(
+        work_dir.path(),
+        30 * 1024 * 1024,
+        "partial.bin",
+        0xCAFE_0001,
+    );
+
+    // Upload so every chunk is stored on the network.
+    client
+        .file_upload_with_mode(&path, PaymentMode::Auto)
+        .await
+        .expect("upload should succeed");
+
+    // Re-estimate the same file: every sampled chunk is now AlreadyStored.
+    let estimate = client
+        .estimate_upload_cost(&path, PaymentMode::Auto, None)
+        .await
+        .expect("estimate must return Ok for a partially-sampled all-stored file");
+
+    assert!(
+        estimate.chunk_count > 5,
+        "test file must exceed the sample cap to exercise the partial-sample path, got {} chunks",
+        estimate.chunk_count
+    );
+    assert_eq!(estimate.storage_cost_atto, "0");
+    assert_eq!(
+        estimate.confidence,
+        CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete
+    );
+}
+
+/// A fully-stored file small enough to be sampled in full returns the exact
+/// zero-cost estimate tagged `VerifiedAllAlreadyStored` (the provably-free case).
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_estimate_all_stored_full_sample_is_verified() {
+    let testnet = MiniTestnet::start(10).await;
+    let node = testnet.node(3).expect("Node 3 should exist");
+    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+        .with_wallet(testnet.wallet().clone());
+
+    let work_dir = TempDir::new().expect("create work dir");
+    // ~4 KB -> 3 chunks, within the sample cap so every chunk is sampled.
+    let path = create_test_file(work_dir.path(), 4096, "fully_stored.bin", 0xCAFE_0002);
+
+    client
+        .file_upload_with_mode(&path, PaymentMode::Auto)
+        .await
+        .expect("upload should succeed");
+
+    let estimate = client
+        .estimate_upload_cost(&path, PaymentMode::Auto, None)
+        .await
+        .expect("estimate should succeed");
+
+    assert!(
+        estimate.chunk_count <= 5,
+        "small file should be within the sample cap, got {} chunks",
+        estimate.chunk_count
+    );
+    assert_eq!(estimate.storage_cost_atto, "0");
+    assert_eq!(
+        estimate.confidence,
+        CostEstimateConfidence::VerifiedAllAlreadyStored
+    );
 }

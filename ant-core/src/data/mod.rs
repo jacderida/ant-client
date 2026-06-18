@@ -6,6 +6,7 @@
 pub mod client;
 pub mod error;
 pub mod network;
+pub mod peer_cache;
 
 pub use client::cache::ChunkCache;
 pub use client::{Client, ClientConfig};
@@ -24,8 +25,8 @@ pub use ant_protocol::{compute_address, DataChunk, XorName};
 pub use client::batch::{finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk};
 pub use client::data::DataUploadResult;
 pub use client::file::{
-    DownloadEvent, ExternalPaymentInfo, FileUploadResult, PreparedUpload, UploadCostEstimate,
-    UploadEvent, Visibility,
+    CostEstimateConfidence, DownloadEvent, ExternalPaymentInfo, FileUploadResult, PreparedUpload,
+    UploadCostEstimate, UploadEvent, Visibility,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,

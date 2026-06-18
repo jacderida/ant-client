@@ -17,6 +17,7 @@ use ant_protocol::{compute_address, DATA_TYPE_CHUNK};
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use self_encryption::{decrypt, encrypt, DataMap, EncryptedChunk};
+use std::num::NonZeroUsize;
 use tracing::{debug, info};
 
 /// Result of an in-memory data upload: the `DataMap` needed to retrieve the data.
@@ -401,8 +402,31 @@ impl Client {
             ))
         })?;
 
-        rmp_serde::from_slice(&chunk.content)
-            .map_err(|e| Error::Serialization(format!("Failed to deserialize DataMap: {e}")))
+        decode_data_map_chunk(&chunk.content)
+    }
+
+    /// Fetch a `DataMap` from the network by trying the requested number
+    /// of closest peers for the DataMap chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the chunk is not found or deserialization fails.
+    pub async fn data_map_fetch_from_closest_peers(
+        &self,
+        address: &[u8; 32],
+        peer_count: NonZeroUsize,
+    ) -> Result<DataMap> {
+        let chunk = self
+            .chunk_get_from_closest_peers(address, peer_count.get())
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "DataMap chunk not found at {}",
+                    hex::encode(address)
+                ))
+            })?;
+
+        decode_data_map_chunk(&chunk.content)
     }
 
     /// Download and decrypt data from the network using its `DataMap`.
@@ -467,6 +491,11 @@ impl Client {
 
         Ok(content)
     }
+}
+
+fn decode_data_map_chunk(content: &[u8]) -> Result<DataMap> {
+    rmp_serde::from_slice(content)
+        .map_err(|e| Error::Serialization(format!("Failed to deserialize DataMap: {e}")))
 }
 
 /// Compile-time assertions that Client method futures are Send.

@@ -24,6 +24,25 @@ pub enum Error {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    /// A remote node rejected a chunk PUT at the application layer.
+    ///
+    /// The node responded with a structured `ProtocolError`, so the
+    /// transport round-trip succeeded — this is an application-level
+    /// rejection (payment-failed, storage/disk-full, quote-stale,
+    /// merkle-pool-rejected), NOT evidence the client is sending too
+    /// fast. It therefore classifies as `Outcome::ApplicationError`
+    /// (see `classify_error`) and does not push the adaptive store
+    /// limiter down. The structured `source` is preserved (rather than
+    /// flattened into `Protocol`) so the controller — and a future
+    /// full-node skip-list (V2-469) — can key on the reason.
+    #[error("remote PUT rejected for {address}: {source}")]
+    RemotePut {
+        /// Hex-encoded chunk address the rejection was for.
+        address: String,
+        /// The structured remote rejection reason.
+        source: ant_protocol::ProtocolError,
+    },
+
     /// Invalid data received.
     #[error("invalid data: {0}")]
     InvalidData(String),
@@ -59,6 +78,14 @@ pub enum Error {
     /// Self-encryption operation failed.
     #[error("encryption error: {0}")]
     Encryption(String),
+
+    /// The operation was cancelled by the caller rather than failing.
+    ///
+    /// Returned, for example, by streaming downloads when the consumer drops
+    /// its receiver (a client disconnect) — distinct from a transport
+    /// [`Error::Network`] failure, since nothing went wrong on the wire.
+    #[error("operation cancelled: {0}")]
+    Cancelled(String),
 
     /// Data already exists on the network — no payment needed.
     #[error("already stored on network")]
@@ -105,9 +132,27 @@ pub enum Error {
         failed_count: usize,
         /// Total number of chunks the upload was attempting to store.
         total_chunks: usize,
+        /// On-chain spend incurred so far. Boxed to keep the `Error` enum small
+        /// (the variant is returned in `Result` across the crate; without the
+        /// box the two cost fields would trip `clippy::result_large_err`).
+        spend: Box<PartialUploadSpend>,
         /// Root cause description.
         reason: String,
     },
+}
+
+/// On-chain spend recorded on a [`Error::PartialUpload`].
+///
+/// A partial upload still spends money for the chunks it paid for. In the
+/// single-node path payment precedes store, so this includes a failed wave's
+/// chunks; surfacing it lets the caller report real spend rather than silently
+/// dropping it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialUploadSpend {
+    /// Storage cost paid on-chain so far, in atto-tokens.
+    pub storage_cost_atto: String,
+    /// Gas cost paid on-chain so far, in wei.
+    pub gas_cost_wei: u128,
 }
 
 // ant-node is only linked when the `devnet` feature is on, so the
@@ -205,6 +250,15 @@ mod tests {
     fn test_display_encryption() {
         let err = Error::Encryption("decrypt failed".to_string());
         assert_eq!(err.to_string(), "encryption error: decrypt failed");
+    }
+
+    #[test]
+    fn test_display_cancelled() {
+        let err = Error::Cancelled("download stream receiver dropped".to_string());
+        assert_eq!(
+            err.to_string(),
+            "operation cancelled: download stream receiver dropped"
+        );
     }
 
     #[test]

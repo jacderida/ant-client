@@ -4,7 +4,7 @@
 
 mod support;
 
-use ant_core::data::{compute_address, Client, ExternalPaymentInfo, Visibility};
+use ant_core::data::{compute_address, Client, ExternalPaymentInfo, PaymentMode, Visibility};
 use ant_protocol::evm::{QuoteHash, TxHash};
 use serial_test::serial;
 use std::collections::HashMap;
@@ -61,6 +61,65 @@ async fn test_file_upload_download_round_trip() {
     );
 
     drop(client);
+    testnet.teardown().await;
+}
+
+/// Streaming download: `file_download_to_sender` must yield exactly the bytes,
+/// in order, that the file contained — without buffering the whole file. Uses
+/// a multi-batch payload so the streaming-decrypt path runs more than one
+/// batch, then reassembles the stream and asserts equality with the source.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_file_download_to_sender_multibatch_round_trip() {
+    use tokio::sync::mpsc;
+
+    let (client, testnet) = setup().await;
+
+    let mut input_file = NamedTempFile::new().expect("create temp file");
+    // ~1 MiB of varied bytes → many self-encryption chunks (multiple batches).
+    let data: Vec<u8> = (0..1_048_576u32).map(|i| (i % 251) as u8).collect();
+    input_file.write_all(&data).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    let result = client
+        .file_upload(input_file.path())
+        .await
+        .expect("file_upload should succeed");
+
+    // Channel item type is inferred from `file_download_to_sender`'s signature.
+    let (tx, mut rx) = mpsc::channel(8);
+    let data_map = result.data_map.clone();
+    let dl = tokio::spawn(async move { client.file_download_to_sender(&data_map, tx, None).await });
+
+    let mut streamed: Vec<u8> = Vec::with_capacity(data.len());
+    let mut chunk_count = 0usize;
+    while let Some(item) = rx.recv().await {
+        let chunk = item.expect("stream chunk should be Ok");
+        // A buggy "send one empty/sentinel then drop" producer would still
+        // close the channel; assert each delivered chunk carries real bytes.
+        assert!(!chunk.is_empty(), "streamed chunk should be non-empty");
+        chunk_count += 1;
+        streamed.extend_from_slice(&chunk);
+    }
+
+    let bytes_streamed = dl
+        .await
+        .expect("download task should join")
+        .expect("file_download_to_sender should succeed");
+
+    // The whole point of the streaming path: a multi-batch payload must arrive
+    // as more than one segment, not buffered and emitted in one shot.
+    assert!(
+        chunk_count >= 2,
+        "multi-batch payload should stream as ≥2 segments, got {chunk_count}"
+    );
+    assert_eq!(streamed, data, "streamed content should match original");
+    assert_eq!(
+        bytes_streamed,
+        data.len() as u64,
+        "bytes_streamed should match original size"
+    );
+
     testnet.teardown().await;
 }
 
@@ -296,6 +355,61 @@ async fn test_public_upload_round_trip_wave_batch() {
         downloaded, original,
         "downloaded bytes must equal the original file"
     );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// Full wallet-backed public upload round-trip (direct CLI-style path).
+///
+/// This covers the non-external-signer path used by `ant file upload --public`:
+/// the serialized DataMap must be appended to the upload chunk set before
+/// payment, so the returned address is immediately retrievable without a
+/// second `data_map_store` payment.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_public_file_upload_direct_batches_datamap() {
+    let (client, testnet) = setup().await;
+
+    let original = vec![0x6bu8; 4096];
+    let mut input_file = NamedTempFile::new().expect("create temp file");
+    input_file.write_all(&original).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    let result = client
+        .file_upload_public_with_mode(input_file.path(), PaymentMode::Single)
+        .await
+        .expect("public upload should succeed");
+
+    let data_map_address = result
+        .data_map_address
+        .expect("public upload must return a DataMap address");
+    let expected_bytes = rmp_serde::to_vec(&result.data_map).expect("serialize DataMap");
+    assert_eq!(
+        data_map_address,
+        compute_address(&expected_bytes),
+        "data_map_address must point to the serialized DataMap chunk"
+    );
+    assert_eq!(
+        result.chunks_stored, result.total_chunks,
+        "public upload should store every chunk, including the DataMap"
+    );
+
+    let fetched_data_map = client
+        .data_map_fetch(&data_map_address)
+        .await
+        .expect("public DataMap should be retrievable by returned address");
+
+    let output_dir = TempDir::new().expect("create output temp dir");
+    let output_path = output_dir.path().join("direct_public_out.bin");
+    let bytes_written = client
+        .file_download(&fetched_data_map, &output_path)
+        .await
+        .expect("file_download should succeed");
+
+    assert_eq!(bytes_written, original.len() as u64);
+    let downloaded = std::fs::read(&output_path).expect("read downloaded file");
+    assert_eq!(downloaded, original);
 
     drop(client);
     testnet.teardown().await;

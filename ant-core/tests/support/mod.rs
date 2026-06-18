@@ -27,6 +27,7 @@ use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 // Wire / transport / EVM types: route through ant-protocol so the test
 // harness exercises the same surface the client does.
 use ant_protocol::evm::{testnet::Testnet, Network as EvmNetwork, RewardsAddress, Wallet};
+use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaSecretKey};
 use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
 };
@@ -46,19 +47,19 @@ const STABILIZATION_TIMEOUT_SECS: u64 = 180;
 /// Default node count for standard E2E tests.
 ///
 /// `CLOSE_GROUP_SIZE` (7) is the quorum the client needs for a quote to
-/// succeed, so spawning exactly that many — or `+ 1` — leaves zero slack:
-/// a single slow peer drops the count to 6 and fails the whole test with
-/// `InsufficientPeers("Got 6 quotes, need 7. ...")`.
+/// succeed. Spawning only that many nodes leaves the DHT and direct
+/// connection set too thin during startup, especially while every test node is
+/// still stabilising.
 ///
 /// This is systematic on macOS CI runners, which are heavily virtualised
 /// (nested virt) and roughly half the CPU throughput of Linux runners.
-/// The 8-node QUIC handshake burst saturates the CPU and at least one
-/// peer consistently can't complete its handshake within the 10 s default
-/// per-peer timeout. Linux runners finish all 8 handshakes comfortably.
+/// The QUIC handshake burst saturates the CPU and can leave too few peers
+/// ready for a `CLOSE_GROUP_SIZE` quote attempt. Linux runners finish those
+/// handshakes more comfortably.
 ///
-/// Spawning `CLOSE_GROUP_SIZE * 2` gives us one full group of slack — if
-/// up to 7 peers are slow, quote collection still reaches quorum. Each
-/// extra node is cheap (~200 ms spawn delay) compared to a flaky suite.
+/// Spawning `CLOSE_GROUP_SIZE * 2` gives the lookup layer enough nearby peers
+/// to return a full close group reliably. Each extra node is cheap (~200 ms
+/// spawn delay) compared to a flaky suite.
 pub const DEFAULT_NODE_COUNT: usize = CLOSE_GROUP_SIZE * 2;
 
 /// Index of the median quote in a `SingleNodePayment` quotes array.
@@ -77,7 +78,7 @@ const TEST_MAX_RECORDS: usize = 1280;
 /// DHT lookups, and payment round-trips compete for the same cores. On
 /// heavily-virtualised runners (macOS GitHub Actions in particular), the
 /// 10 s per-peer timeout fires before the slowest peer can finish its
-/// handshake, which surfaces as `InsufficientPeers("Got 6 quotes, need 7")`.
+/// handshake, which can surface as `InsufficientPeers`.
 ///
 /// 60 s is deliberately conservative: in the happy path everything completes
 /// in well under a second, so the larger budget only shows up on flakes.
@@ -197,6 +198,32 @@ impl MiniTestnet {
             sleep(Duration::from_millis(500)).await;
         }
 
+        // The in-process E2E harness builds clients from one of the storage
+        // nodes. Saorsa's witnessed client lookup filters that local peer out,
+        // while node-side payment verification uses a self-inclusive local
+        // close-group view. In tiny random testnets that can make an otherwise
+        // valid paid median issuer fall just outside a storer's local top-7.
+        // Keep the production live-DHT check in normal builds, but use
+        // ant-node's test-only override here so these client E2Es exercise
+        // payment/proof/storage behaviour without depending on that topology
+        // artifact.
+        let paid_quote_close_group_override: Vec<[u8; 32]> = nodes
+            .iter()
+            .filter_map(|test_node| {
+                test_node
+                    .p2p_node
+                    .as_ref()
+                    .map(|p2p_node| *p2p_node.peer_id().as_bytes())
+            })
+            .collect();
+        for test_node in &nodes {
+            if let Some(protocol) = &test_node.protocol {
+                protocol
+                    .payment_verifier_arc()
+                    .set_paid_quote_close_group_for_tests(paid_quote_close_group_override.clone());
+            }
+        }
+
         // Approve token spend for the unified payment vault contract
         let vault_address = evm_network.payment_vault_address();
         wallet
@@ -286,25 +313,19 @@ impl MiniTestnet {
                 network: evm_network.clone(),
             },
             cache_capacity: 1000,
+            close_group_size: CLOSE_GROUP_SIZE,
             local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
-        // Wire the P2P node into the verifier so the merkle pay-yourself
-        // closeness check can do its DHT lookup. Without this, the
-        // verifier fail-closes on every merkle payment (PR #77 defense).
-        payment_verifier.attach_p2p_node(Arc::clone(&node));
         let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing so quotes are properly signed and verifiable
         let pub_key_bytes = identity.public_key().as_bytes().to_vec();
         let sk_bytes = identity.secret_key_bytes().to_vec();
-        let sk = {
-            use ant_protocol::pqc::ops::MlDsaSecretKey;
-            MlDsaSecretKey::from_bytes(&sk_bytes).expect("deserialize ML-DSA-65 secret key")
-        };
+        let sk =
+            { MlDsaSecretKey::from_bytes(&sk_bytes).expect("deserialize ML-DSA-65 secret key") };
         quote_generator.set_signer(pub_key_bytes, move |msg| {
-            use ant_protocol::pqc::ops::MlDsaOperations;
             let ml_dsa = MlDsa65::new();
             ml_dsa
                 .sign(&sk, msg)
@@ -317,6 +338,9 @@ impl MiniTestnet {
             payment_verifier,
             Arc::new(quote_generator),
         ));
+        // Wire the P2P node into the protocol so direct PUT storage-admission
+        // and payment closeness checks use the node's live DHT view.
+        protocol.attach_p2p_node(Arc::clone(&node));
 
         // Start message handler loop
         let handler_node = Arc::clone(&node);

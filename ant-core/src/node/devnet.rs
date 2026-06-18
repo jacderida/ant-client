@@ -6,6 +6,7 @@
 use crate::data::client::ClientConfig;
 use crate::data::error::{Error, Result};
 use crate::data::Client;
+use ant_node::core::MultiAddr as NodeMultiAddr;
 use ant_node::devnet::{Devnet, DevnetConfig};
 use ant_protocol::evm::testnet::Testnet;
 use ant_protocol::evm::{Network as EvmNetwork, Wallet};
@@ -63,7 +64,7 @@ impl LocalDevnet {
             .await
             .map_err(|e| Error::Network(format!("devnet start failed: {e}")))?;
 
-        let bootstrap = devnet.bootstrap_addrs();
+        let bootstrap = convert_bootstrap_addrs(devnet.bootstrap_addrs())?;
 
         let evm_info = DevnetEvmInfo {
             rpc_url,
@@ -206,6 +207,20 @@ fn extract_custom_network_info(network: &EvmNetwork) -> Result<(String, String, 
             "Anvil testnet returned non-Custom network".to_string(),
         )),
     }
+}
+
+fn convert_bootstrap_addrs(addrs: Vec<NodeMultiAddr>) -> Result<Vec<MultiAddr>> {
+    addrs
+        .into_iter()
+        .map(|addr| {
+            let addr_text = addr.to_string();
+            addr_text.parse::<MultiAddr>().map_err(|e| {
+                Error::Config(format!(
+                    "failed to convert devnet bootstrap address {addr_text}: {e}"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Get a simple ISO-8601 timestamp string.

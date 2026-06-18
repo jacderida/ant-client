@@ -3,19 +3,43 @@
 //! Handles requesting storage quotes from network nodes and
 //! managing payment for data storage.
 
-use crate::data::client::peer_cache::record_peer_outcome;
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{Amount, PaymentQuote};
-use ant_protocol::transport::{MultiAddr, PeerId};
+use ant_protocol::transport::{DHTNode, MultiAddr, P2PNode, PeerId, WitnessedCloseGroup};
 use ant_protocol::{
     compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
     ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Fault-tolerant quote collection asks one extra close group of peers and
+/// keeps the closest successful `CLOSE_GROUP_SIZE` responders. This remains
+/// useful for merkle preflight probes, but single-node payments deliberately
+/// ask only the actual close group.
+const FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER: usize = 2;
+
+/// Witnessed close-group quorum as a fraction of the initial close group.
+/// For today's `CLOSE_GROUP_SIZE = 7`, this yields the requested 5-of-7
+/// quorum.
+const WITNESSED_QUORUM_NUMERATOR: usize = 2;
+const WITNESSED_QUORUM_DENOMINATOR: usize = 3;
+
+/// Number of closest nodes each initial witnessed responder contributes.
+const SINGLE_NODE_WITNESSED_VIEW_COUNT: usize = 20;
+
+/// Index of the paid median quote after sorting by quoted price.
+const MEDIAN_QUOTE_INDEX: usize = CLOSE_GROUP_SIZE / 2;
+
+/// Overall timeout for collecting quote responses. Must accommodate
+/// connect_with_fallback cascade (direct 5s + hole-punch 15s×3 + relay 30s ≈
+/// 80s) plus the per-peer quote timeout.
+const QUOTE_COLLECTION_TIMEOUT_SECS: u64 = 120;
 
 /// ML-DSA-65 public key length in bytes. Mirrors the same value defined as
 /// `pub const ML_DSA_65_PUBLIC_KEY_SIZE` in `saorsa-pqc::pqc::types`, which
@@ -39,9 +63,9 @@ const ML_DSA_PUB_KEY_LEN: usize = 1952;
 ///
 /// We mirror the cheap structural check here. The storer also runs
 /// `verify_quote_content` and `verify_quote_signature`; those are ML-DSA
-/// verifications (~1 ms × 14 quotes × every chunk) and are deliberately NOT
-/// mirrored on the client to keep upload latency unchanged. They are tracked
-/// as a follow-up if a real attack surfaces them.
+/// verifications (~1 ms per requested quote) and are deliberately NOT mirrored
+/// on the client to keep upload latency unchanged. They are tracked as a
+/// follow-up if a real attack surfaces them.
 fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
     if quote.pub_key.len() != ML_DSA_PUB_KEY_LEN {
         return false;
@@ -72,9 +96,8 @@ fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
 /// - `Err(Error::AlreadyStored)` — the peer claims the chunk is already
 ///   present AND the quote it provided binds to its peer ID. Vote counts.
 /// - `Err(Error::BadQuoteBinding { .. })` — bad binding (mirrors the
-///   storer-side rejection); the peer is treated as a failure so the
-///   AIMD cache learns to deprioritize it. Outer collector counts these
-///   via the typed variant (no string matching).
+///   storer-side rejection). Outer collector counts these via the typed
+///   variant (no string matching).
 /// - `Err(Error::Serialization(...))` — the quote bytes did not deserialize.
 fn classify_quote_response(
     peer_id: &PeerId,
@@ -115,20 +138,6 @@ fn classify_quote_response(
     Ok((payment_quote, price))
 }
 
-/// Map a per-peer quote-collection outcome to the AIMD-cache success flag.
-///
-/// `Ok(_)` and `AlreadyStored` are both *benign* outcomes — the peer is
-/// reachable and well-behaved — so we record them as successes (recording
-/// a smooth RTT). Every other variant (network/timeout/protocol/
-/// serialization, plus `BadQuoteBinding`) records as a failure so the
-/// local AIMD bootstrap cache learns to deprioritize peers that don't
-/// help us upload.
-///
-/// Pulled out of the per-peer closure for unit-testing.
-fn quote_outcome_is_success(result: &std::result::Result<(PaymentQuote, Amount), Error>) -> bool {
-    matches!(result, Ok(_) | Err(Error::AlreadyStored))
-}
-
 /// Drop quotes whose `pub_key` does not BLAKE3-hash to the peer that supplied
 /// them. Logs each dropped quote at WARN.
 fn drop_quotes_with_bad_bindings(
@@ -150,12 +159,541 @@ fn drop_quotes_with_bad_bindings(
     before - quotes.len()
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn request_store_quote_from_peer(
+    node: Arc<P2PNode>,
+    peer_id: PeerId,
+    peer_addrs: Vec<MultiAddr>,
+    request_id: u64,
+    address: [u8; 32],
+    data_size: u64,
+    data_type: u32,
+    per_peer_timeout: Duration,
+) -> StoreQuoteRequestResult {
+    let request = ChunkQuoteRequest {
+        address,
+        data_size,
+        data_type,
+    };
+    let message = ChunkMessage {
+        request_id,
+        body: ChunkMessageBody::QuoteRequest(request),
+    };
+
+    let message_bytes = match message.encode() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                peer_id,
+                peer_addrs,
+                Err(Error::Protocol(format!(
+                    "Failed to encode quote request for {peer_id}: {e}"
+                ))),
+            );
+        }
+    };
+
+    let result = send_and_await_chunk_response(
+        &node,
+        &peer_id,
+        message_bytes,
+        request_id,
+        per_peer_timeout,
+        &peer_addrs,
+        |body| match body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                quote,
+                already_stored,
+            }) => Some(classify_quote_response(&peer_id, &quote, already_stored)),
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
+                Error::Protocol(format!("Quote error from {peer_id}: {e}")),
+            )),
+            _ => None,
+        },
+        |e| Error::Network(format!("Failed to send quote request to {peer_id}: {e}")),
+        || Error::Timeout(format!("Timeout waiting for quote from {peer_id}")),
+    )
+    .await;
+
+    (peer_id, peer_addrs, result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_store_quote_result(
+    peer_id: PeerId,
+    addrs: Vec<MultiAddr>,
+    quote_result: Result<(PaymentQuote, Amount)>,
+    address: &[u8; 32],
+    quotes: &mut Vec<StoreQuote>,
+    already_stored_peers: &mut Vec<(PeerId, [u8; 32])>,
+    failures: &mut Vec<String>,
+    bad_quote_count: &mut usize,
+) {
+    match quote_result {
+        Ok((quote, price)) => {
+            quotes.push((peer_id, addrs, quote, price));
+        }
+        Err(Error::AlreadyStored) => {
+            info!("Peer {peer_id} reports chunk already stored");
+            let dist = peer_xor_distance(&peer_id, address);
+            already_stored_peers.push((peer_id, dist));
+        }
+        Err(e) => {
+            if matches!(&e, Error::BadQuoteBinding { .. }) {
+                *bad_quote_count += 1;
+            }
+            warn!("Failed to get quote from {peer_id}: {e}");
+            failures.push(format!("{peer_id}: {e}"));
+        }
+    }
+}
+
+fn witnessed_quote_launch_budget(
+    successful_quotes: usize,
+    in_flight: usize,
+    remaining_peers: usize,
+) -> usize {
+    CLOSE_GROUP_SIZE
+        .saturating_sub(successful_quotes.saturating_add(in_flight))
+        .min(remaining_peers)
+}
+
+fn single_node_quote_query_count() -> usize {
+    CLOSE_GROUP_SIZE
+}
+
+fn fault_tolerant_quote_query_count() -> usize {
+    CLOSE_GROUP_SIZE * FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER
+}
+
+fn witnessed_close_group_quorum() -> usize {
+    (CLOSE_GROUP_SIZE * WITNESSED_QUORUM_NUMERATOR).div_ceil(WITNESSED_QUORUM_DENOMINATOR)
+}
+
+fn witnessed_close_group_quorum_for_missing_views(missing_views: usize) -> usize {
+    witnessed_close_group_quorum()
+        .saturating_sub(missing_views)
+        .max(1)
+}
+
+fn missing_witnessed_responder_views(witnessed: &WitnessedCloseGroup) -> usize {
+    witnessed
+        .initial_closest
+        .len()
+        .saturating_sub(witnessed.responder_views.len())
+}
+
+fn witnessed_close_group_quorum_for_transcript(witnessed: &WitnessedCloseGroup) -> usize {
+    witnessed_close_group_quorum_for_missing_views(missing_witnessed_responder_views(witnessed))
+}
+
+fn peer_list(peers: &[PeerId]) -> Vec<String> {
+    peers.iter().map(ToString::to_string).collect()
+}
+
+pub(crate) type StoreQuote = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount);
+type StoreQuoteRequestResult = (PeerId, Vec<MultiAddr>, Result<(PaymentQuote, Amount)>);
+type VotersByPeer = HashMap<PeerId, HashSet<PeerId>>;
+type WitnessedVoteData = (HashMap<PeerId, DHTNode>, VotersByPeer, Vec<(PeerId, usize)>);
+
+pub(crate) struct StoreQuotePlan {
+    pub(crate) quotes: Vec<StoreQuote>,
+    pub(crate) put_peers: Vec<(PeerId, Vec<MultiAddr>)>,
+}
+
+#[derive(Debug, Clone)]
+struct WitnessedQuoteCandidate {
+    node: DHTNode,
+    votes: usize,
+    voters: HashSet<PeerId>,
+}
+
+#[derive(Debug, Clone)]
+struct WitnessedQuotePeer {
+    peer_id: PeerId,
+    addrs: Vec<MultiAddr>,
+    voters: HashSet<PeerId>,
+}
+
+#[derive(Debug, Clone)]
+struct WitnessedQuoteSelection {
+    quote_peers: Vec<WitnessedQuotePeer>,
+    initial_put_peers: Vec<(PeerId, Vec<MultiAddr>)>,
+    quorum: usize,
+}
+
+enum QuoteSelectionPolicy {
+    ClosestByDistance,
+    WitnessedMedianVoters {
+        voters_by_peer: VotersByPeer,
+        quorum: usize,
+    },
+}
+
+fn witnessed_initial_peers(witnessed: &WitnessedCloseGroup) -> Vec<String> {
+    witnessed
+        .initial_closest
+        .iter()
+        .map(|node| node.peer_id.to_string())
+        .collect()
+}
+
+fn witnessed_responder_views(witnessed: &WitnessedCloseGroup) -> Vec<String> {
+    witnessed
+        .responder_views
+        .iter()
+        .map(|view| {
+            let peers = view
+                .closest
+                .iter()
+                .map(|node| node.peer_id)
+                .collect::<Vec<_>>();
+            format!("{}=>{:?}", view.responder, peer_list(&peers))
+        })
+        .collect()
+}
+
+fn merge_witnessed_node(nodes: &mut HashMap<PeerId, DHTNode>, node: DHTNode) {
+    match nodes.entry(node.peer_id) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.get_mut().merge_from(node);
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(node);
+        }
+    }
+}
+
+fn sort_vote_counts_by_distance(vote_counts: &mut [(PeerId, usize)], address: &[u8; 32]) {
+    vote_counts.sort_by(|left, right| {
+        peer_xor_distance(&left.0, address)
+            .cmp(&peer_xor_distance(&right.0, address))
+            .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+    });
+}
+
+fn witnessed_vote_counts_and_nodes(
+    witnessed: &WitnessedCloseGroup,
+    address: &[u8; 32],
+) -> WitnessedVoteData {
+    let mut known_nodes = HashMap::new();
+    for node in &witnessed.initial_closest {
+        merge_witnessed_node(&mut known_nodes, node.clone());
+    }
+
+    let mut voters_by_peer: HashMap<PeerId, HashSet<PeerId>> = HashMap::new();
+    for view in &witnessed.responder_views {
+        let mut voted = HashSet::new();
+        for node in &view.closest {
+            merge_witnessed_node(&mut known_nodes, node.clone());
+            if voted.insert(node.peer_id) {
+                voters_by_peer
+                    .entry(node.peer_id)
+                    .or_default()
+                    .insert(view.responder);
+            }
+        }
+    }
+
+    let mut vote_counts: Vec<(PeerId, usize)> = voters_by_peer
+        .iter()
+        .map(|(peer_id, voters)| (*peer_id, voters.len()))
+        .collect();
+    sort_vote_counts_by_distance(&mut vote_counts, address);
+    (known_nodes, voters_by_peer, vote_counts)
+}
+
+fn witnessed_consensus_candidates(
+    witnessed: &WitnessedCloseGroup,
+    address: &[u8; 32],
+    quorum: usize,
+) -> Vec<WitnessedQuoteCandidate> {
+    let (known_nodes, voters_by_peer, vote_counts) =
+        witnessed_vote_counts_and_nodes(witnessed, address);
+    let mut candidates = vote_counts
+        .iter()
+        .filter_map(|(peer_id, votes)| {
+            if *votes < quorum {
+                return None;
+            }
+            known_nodes.get(peer_id).cloned().and_then(|node| {
+                voters_by_peer
+                    .get(peer_id)
+                    .cloned()
+                    .map(|voters| WitnessedQuoteCandidate {
+                        node,
+                        votes: *votes,
+                        voters,
+                    })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        peer_xor_distance(&left.node.peer_id, address)
+            .cmp(&peer_xor_distance(&right.node.peer_id, address))
+            .then_with(|| right.votes.cmp(&left.votes))
+            .then_with(|| {
+                left.node
+                    .peer_id
+                    .as_bytes()
+                    .cmp(right.node.peer_id.as_bytes())
+            })
+    });
+    candidates
+}
+
+fn witnessed_vote_counts(witnessed: &WitnessedCloseGroup, address: &[u8; 32]) -> Vec<String> {
+    let (_, _, vote_counts) = witnessed_vote_counts_and_nodes(witnessed, address);
+    vote_counts
+        .iter()
+        .map(|(peer_id, votes)| format!("{peer_id}:{votes}"))
+        .collect()
+}
+
+fn witnessed_consensus(
+    witnessed: &WitnessedCloseGroup,
+    address: &[u8; 32],
+    quorum: usize,
+) -> Vec<String> {
+    witnessed_consensus_candidates(witnessed, address, quorum)
+        .iter()
+        .map(|candidate| format!("{}:{}", candidate.node.peer_id, candidate.votes))
+        .collect()
+}
+
+fn witnessed_close_group_diagnostics(
+    address: &[u8; 32],
+    witnessed: &WitnessedCloseGroup,
+    quorum: usize,
+) -> String {
+    format!(
+        "target={}, initial={:?}, responder_views={:?}, vote_counts={:?}, quorum={}, final={:?}",
+        hex::encode(address),
+        witnessed_initial_peers(witnessed),
+        witnessed_responder_views(witnessed),
+        witnessed_vote_counts(witnessed, address),
+        quorum,
+        witnessed_consensus(witnessed, address, quorum)
+    )
+}
+
+fn witnessed_quote_selection_or_error(
+    address: &[u8; 32],
+    witnessed: &WitnessedCloseGroup,
+    required: usize,
+    quorum: usize,
+) -> Result<WitnessedQuoteSelection> {
+    let candidates = witnessed_consensus_candidates(witnessed, address, quorum);
+    if candidates.len() < required {
+        return Err(Error::InsufficientPeers(format!(
+            "Witnessed close group inconclusive before payment: got {}/{} quorum-recognised peers. {}",
+            candidates.len(),
+            required,
+            witnessed_close_group_diagnostics(address, witnessed, quorum)
+        )));
+    }
+
+    let initial_put_peers = witnessed
+        .initial_closest
+        .iter()
+        .take(CLOSE_GROUP_SIZE)
+        .map(|node| (node.peer_id, node.addresses_by_priority()))
+        .collect::<Vec<_>>();
+
+    if initial_put_peers.len() < CLOSE_GROUP_SIZE {
+        return Err(Error::InsufficientPeers(format!(
+            "Witnessed close group returned only {}/{} initial PUT peers before payment. {}",
+            initial_put_peers.len(),
+            CLOSE_GROUP_SIZE,
+            witnessed_close_group_diagnostics(address, witnessed, quorum)
+        )));
+    }
+
+    let quote_peers = candidates
+        .into_iter()
+        .map(|candidate| WitnessedQuotePeer {
+            peer_id: candidate.node.peer_id,
+            addrs: candidate.node.addresses_by_priority(),
+            voters: candidate.voters,
+        })
+        .collect();
+
+    Ok(WitnessedQuoteSelection {
+        quote_peers,
+        initial_put_peers,
+        quorum,
+    })
+}
+
+pub(crate) fn median_paid_quote_issuer(
+    quotes: &[(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)],
+) -> Option<(PeerId, Amount)> {
+    if quotes.len() <= MEDIAN_QUOTE_INDEX {
+        return None;
+    }
+
+    let mut by_price: Vec<(usize, PeerId, Amount)> = quotes
+        .iter()
+        .enumerate()
+        .map(|(index, (peer_id, _, _, price))| (index, *peer_id, *price))
+        .collect();
+    by_price.sort_by_key(|(index, _, price)| (*price, *index));
+    by_price
+        .get(MEDIAN_QUOTE_INDEX)
+        .map(|(_, peer_id, price)| (*peer_id, *price))
+}
+
+fn sort_quotes_by_distance(quotes: &mut [StoreQuote], address: &[u8; 32]) {
+    quotes.sort_by(|left, right| {
+        peer_xor_distance(&left.0, address)
+            .cmp(&peer_xor_distance(&right.0, address))
+            .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+    });
+}
+
+fn median_paid_quote_issuer_for_indices(
+    quotes: &[StoreQuote],
+    indices: &[usize],
+) -> Option<(PeerId, Amount)> {
+    if indices.len() <= MEDIAN_QUOTE_INDEX {
+        return None;
+    }
+
+    let mut by_price: Vec<(usize, PeerId, Amount)> = indices
+        .iter()
+        .enumerate()
+        .map(|(selected_index, quote_index)| {
+            let (peer_id, _, _, price) = &quotes[*quote_index];
+            (selected_index, *peer_id, *price)
+        })
+        .collect();
+    by_price.sort_by_key(|(selected_index, _, price)| (*price, *selected_index));
+    by_price
+        .get(MEDIAN_QUOTE_INDEX)
+        .map(|(_, peer_id, price)| (*peer_id, *price))
+}
+
+fn median_issuer_voter_support(
+    quotes: &[StoreQuote],
+    indices: &[usize],
+    voters_by_peer: &VotersByPeer,
+) -> Option<(PeerId, usize)> {
+    let (median_peer_id, _) = median_paid_quote_issuer_for_indices(quotes, indices)?;
+    let voters = voters_by_peer.get(&median_peer_id)?;
+    Some((median_peer_id, voters.len()))
+}
+
+fn visit_quote_subsets<F>(
+    quote_count: usize,
+    subset_size: usize,
+    start_index: usize,
+    current: &mut Vec<usize>,
+    visit: &mut F,
+) where
+    F: FnMut(&[usize]),
+{
+    if current.len() == subset_size {
+        visit(current);
+        return;
+    }
+
+    let remaining = subset_size - current.len();
+    let last_start = quote_count - remaining;
+    for index in start_index..=last_start {
+        current.push(index);
+        visit_quote_subsets(quote_count, subset_size, index + 1, current, visit);
+        current.pop();
+    }
+}
+
+fn select_closest_quotes(mut quotes: Vec<StoreQuote>, address: &[u8; 32]) -> Vec<StoreQuote> {
+    sort_quotes_by_distance(&mut quotes, address);
+    quotes.truncate(CLOSE_GROUP_SIZE);
+    quotes
+}
+
+fn select_witnessed_median_voter_quotes(
+    mut quotes: Vec<StoreQuote>,
+    address: &[u8; 32],
+    voters_by_peer: &VotersByPeer,
+    required_support: usize,
+) -> Option<Vec<StoreQuote>> {
+    if quotes.len() < CLOSE_GROUP_SIZE {
+        return None;
+    }
+
+    sort_quotes_by_distance(&mut quotes, address);
+
+    let mut best_indices: Option<(usize, Vec<usize>)> = None;
+    let mut current_indices = Vec::with_capacity(CLOSE_GROUP_SIZE);
+    visit_quote_subsets(
+        quotes.len(),
+        CLOSE_GROUP_SIZE,
+        0,
+        &mut current_indices,
+        &mut |indices| {
+            let Some((_, support)) = median_issuer_voter_support(&quotes, indices, voters_by_peer)
+            else {
+                return;
+            };
+            if support < required_support {
+                return;
+            }
+            match &best_indices {
+                Some((best_support, best)) if *best_support > support => {}
+                Some((best_support, best))
+                    if *best_support == support && best.as_slice() <= indices => {}
+                _ => best_indices = Some((support, indices.to_vec())),
+            }
+        },
+    );
+
+    best_indices.map(|(_, indices)| {
+        indices
+            .into_iter()
+            .map(|index| quotes[index].clone())
+            .collect()
+    })
+}
+
+fn put_peers_with_median_voters_first(
+    quotes: &[StoreQuote],
+    put_peers: &[(PeerId, Vec<MultiAddr>)],
+    voters_by_peer: &VotersByPeer,
+    required_support: usize,
+) -> Option<Vec<(PeerId, Vec<MultiAddr>)>> {
+    let (median_peer_id, _) = median_paid_quote_issuer(quotes)?;
+    let voters = voters_by_peer.get(&median_peer_id)?;
+
+    let mut supporting_peers = Vec::new();
+    let mut fallback_peers = Vec::new();
+    for (peer_id, addrs) in put_peers {
+        let peer = (*peer_id, addrs.clone());
+        if voters.contains(peer_id) {
+            supporting_peers.push(peer);
+        } else {
+            fallback_peers.push(peer);
+        }
+    }
+
+    if supporting_peers.len() < required_support {
+        return None;
+    }
+
+    supporting_peers.extend(fallback_peers);
+    Some(supporting_peers)
+}
+
 impl Client {
     /// Get storage quotes from the closest peers for a given address.
     ///
-    /// Queries 2x `CLOSE_GROUP_SIZE` peers from the DHT for fault tolerance,
-    /// requests quotes from all of them concurrently, and returns the
-    /// `CLOSE_GROUP_SIZE` closest successful responders sorted by XOR distance.
+    /// Builds a quorum-witnessed candidate set with at least
+    /// `CLOSE_GROUP_SIZE` peers, requests quotes from all of them concurrently,
+    /// and returns the closest supported `CLOSE_GROUP_SIZE` successful
+    /// responders. When multiple sets are possible, the client prefers the
+    /// one with the strongest paid-median voter support, then the closest
+    /// peers by XOR distance.
     ///
     /// Returns `Error::AlreadyStored` early if `CLOSE_GROUP_MAJORITY` peers
     /// report the chunk is already stored.
@@ -163,26 +701,168 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if insufficient quotes can be collected.
-    #[allow(clippy::too_many_lines)]
     pub async fn get_store_quotes(
         &self,
         address: &[u8; 32],
         data_size: u64,
         data_type: u32,
     ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
-        let node = self.network().node();
+        Ok(self
+            .get_store_quote_plan(address, data_size, data_type)
+            .await?
+            .quotes)
+    }
 
-        // Over-query for fault tolerance: ask 2x peers, keep closest successful ones.
-        let over_query_count = CLOSE_GROUP_SIZE * 2;
-        debug!(
-            "Requesting quotes from up to {over_query_count} peers for address {} (size: {data_size})",
-            hex::encode(address)
-        );
+    /// Get storage quotes plus PUT targets ordered for paid-median acceptance.
+    ///
+    /// Quote order is preserved for proof construction because tied quote
+    /// prices rely on stable median selection. PUT target order is separate:
+    /// peers that voted for the paid median issuer are placed first so the
+    /// initial write wave is locally acceptable to a storage majority.
+    pub(crate) async fn get_store_quote_plan(
+        &self,
+        address: &[u8; 32],
+        data_size: u64,
+        data_type: u32,
+    ) -> Result<StoreQuotePlan> {
+        let witnessed_selection = self.select_witnessed_quote_selection(address).await?;
+        let voters_by_peer: VotersByPeer = witnessed_selection
+            .quote_peers
+            .iter()
+            .map(|peer| (peer.peer_id, peer.voters.clone()))
+            .collect();
+        let remote_peers = witnessed_selection
+            .quote_peers
+            .into_iter()
+            .map(|peer| (peer.peer_id, peer.addrs))
+            .collect();
+        let initial_put_peers = witnessed_selection.initial_put_peers;
+        let quorum = witnessed_selection.quorum;
+        let quotes = self
+            .collect_store_quotes_from_remote_peers(
+                address,
+                data_size,
+                data_type,
+                remote_peers,
+                QuoteSelectionPolicy::WitnessedMedianVoters {
+                    voters_by_peer: voters_by_peer.clone(),
+                    quorum,
+                },
+            )
+            .await?;
+        let put_peers = put_peers_with_median_voters_first(
+            &quotes,
+            &initial_put_peers,
+            &voters_by_peer,
+            quorum,
+        )
+        .ok_or_else(|| {
+            Error::InsufficientPeers(format!(
+                "Collected {} witnessed quotes, but fewer than {} initial witness PUT peers \
+                 voted for the paid median issuer for {}",
+                quotes.len(),
+                quorum,
+                hex::encode(address)
+            ))
+        })?;
 
+        Ok(StoreQuotePlan { quotes, put_peers })
+    }
+
+    /// Get storage quotes with the previous over-query behaviour.
+    ///
+    /// Merkle preflight uses quote responses only as an already-stored probe;
+    /// the actual payment still happens through merkle candidate pools. Keep
+    /// the extra peer buffer there so merkle upload behaviour remains
+    /// unchanged when a few peers are slow or return unusable quote bindings.
+    pub(crate) async fn get_store_quotes_with_fault_tolerance(
+        &self,
+        address: &[u8; 32],
+        data_size: u64,
+        data_type: u32,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
+        let peer_query_count = fault_tolerant_quote_query_count();
         let remote_peers = self
             .network()
-            .find_closest_peers(address, over_query_count)
+            .find_closest_peers(address, peer_query_count)
             .await?;
+
+        self.collect_store_quotes_from_remote_peers(
+            address,
+            data_size,
+            data_type,
+            remote_peers,
+            QuoteSelectionPolicy::ClosestByDistance,
+        )
+        .await
+    }
+
+    async fn select_witnessed_quote_selection(
+        &self,
+        address: &[u8; 32],
+    ) -> Result<WitnessedQuoteSelection> {
+        let required = single_node_quote_query_count();
+        let witnessed = self
+            .network()
+            .find_witnessed_close_group_with_view_count(
+                address,
+                required,
+                SINGLE_NODE_WITNESSED_VIEW_COUNT,
+            )
+            .await
+            .map_err(|e| {
+                Error::InsufficientPeers(format!(
+                    "Witnessed close group lookup failed before payment for target {}: {e}",
+                    hex::encode(address)
+                ))
+            })?;
+        let base_quorum = witnessed_close_group_quorum();
+        let missing_views = missing_witnessed_responder_views(&witnessed);
+        let quorum = witnessed_close_group_quorum_for_transcript(&witnessed);
+
+        if missing_views > 0 {
+            warn!(
+                target = %hex::encode(address),
+                initial = witnessed.initial_closest.len(),
+                responder_views = witnessed.responder_views.len(),
+                missing_views = missing_views,
+                base_quorum = base_quorum,
+                adjusted_quorum = quorum,
+                "Witnessed close group transcript is missing responder views; lowering SNP witness quorum"
+            );
+        }
+
+        debug!(
+            target = %hex::encode(address),
+            quorum = quorum,
+            view_count = SINGLE_NODE_WITNESSED_VIEW_COUNT,
+            initial = ?witnessed_initial_peers(&witnessed),
+            responder_views = ?witnessed_responder_views(&witnessed),
+            vote_counts = ?witnessed_vote_counts(&witnessed, address),
+            final_witnessed_set = ?witnessed_consensus(&witnessed, address, quorum),
+            "Witnessed close group selected for SNP quote collection"
+        );
+
+        witnessed_quote_selection_or_error(address, &witnessed, required, quorum)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn collect_store_quotes_from_remote_peers(
+        &self,
+        address: &[u8; 32],
+        data_size: u64,
+        data_type: u32,
+        remote_peers: Vec<(PeerId, Vec<MultiAddr>)>,
+        quote_selection_policy: QuoteSelectionPolicy,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
+        let peer_query_count = remote_peers.len();
+
+        let node = self.network().node();
+
+        debug!(
+            "Requesting quotes from up to {peer_query_count} peers for address {} (size: {data_size})",
+            hex::encode(address)
+        );
 
         if remote_peers.len() < CLOSE_GROUP_SIZE {
             return Err(Error::InsufficientPeers(format!(
@@ -190,88 +870,15 @@ impl Client {
                 remote_peers.len()
             )));
         }
+        debug_assert!(peer_query_count >= CLOSE_GROUP_SIZE);
 
         let per_peer_timeout = Duration::from_secs(self.config().quote_timeout_secs);
-        // Overall timeout for collecting all quotes. Must accommodate
-        // connect_with_fallback cascade (direct 5s + hole-punch 15s×3 + relay 30s ≈ 80s)
-        // plus the per-peer quote timeout. 120s is generous.
-        let overall_timeout = Duration::from_secs(120);
+        let overall_timeout = Duration::from_secs(QUOTE_COLLECTION_TIMEOUT_SECS);
 
-        // Request quotes from all peers concurrently
-        let mut quote_futures = FuturesUnordered::new();
-
-        for (peer_id, peer_addrs) in &remote_peers {
-            let request_id = self.next_request_id();
-            let request = ChunkQuoteRequest {
-                address: *address,
-                data_size,
-                data_type,
-            };
-            let message = ChunkMessage {
-                request_id,
-                body: ChunkMessageBody::QuoteRequest(request),
-            };
-
-            let message_bytes = match message.encode() {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    warn!("Failed to encode quote request for {peer_id}: {e}");
-                    continue;
-                }
-            };
-
-            let peer_id_clone = *peer_id;
-            let addrs_clone = peer_addrs.clone();
-            let node_clone = node.clone();
-
-            let quote_future = async move {
-                let start = Instant::now();
-                let result = send_and_await_chunk_response(
-                    &node_clone,
-                    &peer_id_clone,
-                    message_bytes,
-                    request_id,
-                    per_peer_timeout,
-                    &addrs_clone,
-                    |body| match body {
-                        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
-                            quote,
-                            already_stored,
-                        }) => Some(classify_quote_response(
-                            &peer_id_clone,
-                            &quote,
-                            already_stored,
-                        )),
-                        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
-                            Error::Protocol(format!("Quote error from {peer_id_clone}: {e}")),
-                        )),
-                        _ => None,
-                    },
-                    |e| {
-                        Error::Network(format!(
-                            "Failed to send quote request to {peer_id_clone}: {e}"
-                        ))
-                    },
-                    || Error::Timeout(format!("Timeout waiting for quote from {peer_id_clone}")),
-                )
-                .await;
-
-                // Record the per-peer outcome for the AIMD bootstrap cache.
-                // See `quote_outcome_is_success` for the full classification.
-                let success = quote_outcome_is_success(&result);
-                let rtt_ms = success.then(|| start.elapsed().as_millis() as u64);
-                record_peer_outcome(&node_clone, peer_id_clone, &addrs_clone, success, rtt_ms)
-                    .await;
-
-                (peer_id_clone, addrs_clone, result)
-            };
-
-            quote_futures.push(quote_future);
-        }
-
-        // Collect all responses with an overall timeout to prevent indefinite stalls.
-        // Over-query means we have 2x peers, so we can tolerate failures.
-        let mut quotes = Vec::with_capacity(over_query_count);
+        // Collect quote responses. SNP/witnessed collection deliberately tries
+        // the closest witnessed peers first and only falls back to further
+        // witnessed peers when a closer peer fails to produce a usable quote.
+        let mut quotes = Vec::with_capacity(peer_query_count);
         let mut already_stored_peers: Vec<(PeerId, [u8; 32])> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
 
@@ -281,46 +888,120 @@ impl Client {
         // network-broken) and the user benefits from seeing them called out.
         let mut bad_quote_count = 0usize;
 
-        let collect_result: std::result::Result<std::result::Result<(), Error>, _> =
-            tokio::time::timeout(overall_timeout, async {
-                while let Some((peer_id, addrs, quote_result)) = quote_futures.next().await {
-                    match quote_result {
-                        Ok((quote, price)) => {
-                            quotes.push((peer_id, addrs, quote, price));
-                        }
-                        Err(Error::AlreadyStored) => {
-                            info!("Peer {peer_id} reports chunk already stored");
-                            let dist = peer_xor_distance(&peer_id, address);
-                            already_stored_peers.push((peer_id, dist));
-                        }
-                        Err(e) => {
-                            // Count bad-binding peers separately (typed
-                            // variant — no string sniffing). Treat as a
-                            // normal failure for InsufficientPeers reporting.
-                            if matches!(&e, Error::BadQuoteBinding { .. }) {
-                                bad_quote_count += 1;
-                            }
-                            warn!("Failed to get quote from {peer_id}: {e}");
-                            failures.push(format!("{peer_id}: {e}"));
-                        }
-                    }
-                }
-                Ok(())
-            })
-            .await;
+        let staged_witnessed_collection = matches!(
+            &quote_selection_policy,
+            QuoteSelectionPolicy::WitnessedMedianVoters { .. }
+        );
 
-        match collect_result {
-            Err(_elapsed) => {
-                warn!(
-                    "Quote collection timed out after {overall_timeout:?} for address {}",
-                    hex::encode(address)
-                );
-                // Fall through to check if we have enough quotes despite timeout.
-                // The timeout fires when slow peers haven't responded yet, but we
-                // may already have enough successful quotes from fast peers.
+        if staged_witnessed_collection {
+            let mut quote_futures = FuturesUnordered::new();
+            let mut next_peer_index = 0usize;
+            let collect_result: std::result::Result<std::result::Result<(), Error>, _> =
+                tokio::time::timeout(overall_timeout, async {
+                    loop {
+                        let launch_count = witnessed_quote_launch_budget(
+                            quotes.len(),
+                            quote_futures.len(),
+                            remote_peers.len().saturating_sub(next_peer_index),
+                        );
+                        for _ in 0..launch_count {
+                            let (peer_id, peer_addrs) = &remote_peers[next_peer_index];
+                            next_peer_index += 1;
+                            quote_futures.push(request_store_quote_from_peer(
+                                node.clone(),
+                                *peer_id,
+                                peer_addrs.clone(),
+                                self.next_request_id(),
+                                *address,
+                                data_size,
+                                data_type,
+                                per_peer_timeout,
+                            ));
+                        }
+
+                        if quotes.len() >= CLOSE_GROUP_SIZE || quote_futures.is_empty() {
+                            break;
+                        }
+
+                        let Some((peer_id, addrs, quote_result)) = quote_futures.next().await
+                        else {
+                            break;
+                        };
+                        record_store_quote_result(
+                            peer_id,
+                            addrs,
+                            quote_result,
+                            address,
+                            &mut quotes,
+                            &mut already_stored_peers,
+                            &mut failures,
+                            &mut bad_quote_count,
+                        );
+                    }
+                    Ok(())
+                })
+                .await;
+
+            match collect_result {
+                Err(_elapsed) => {
+                    warn!(
+                        "Quote collection timed out after {overall_timeout:?} for address {}",
+                        hex::encode(address)
+                    );
+                }
+                Ok(Err(e)) => return Err(e),
+                Ok(Ok(())) => {}
             }
-            Ok(Err(e)) => return Err(e),
-            Ok(Ok(())) => {}
+        } else {
+            // Merkle preflight keeps the previous behaviour: query the full
+            // over-query set concurrently because those quote responses are
+            // only used as an already-stored probe.
+            let mut quote_futures = FuturesUnordered::new();
+
+            for (peer_id, peer_addrs) in &remote_peers {
+                quote_futures.push(request_store_quote_from_peer(
+                    node.clone(),
+                    *peer_id,
+                    peer_addrs.clone(),
+                    self.next_request_id(),
+                    *address,
+                    data_size,
+                    data_type,
+                    per_peer_timeout,
+                ));
+            }
+
+            let collect_result: std::result::Result<std::result::Result<(), Error>, _> =
+                tokio::time::timeout(overall_timeout, async {
+                    while let Some((peer_id, addrs, quote_result)) = quote_futures.next().await {
+                        record_store_quote_result(
+                            peer_id,
+                            addrs,
+                            quote_result,
+                            address,
+                            &mut quotes,
+                            &mut already_stored_peers,
+                            &mut failures,
+                            &mut bad_quote_count,
+                        );
+                    }
+                    Ok(())
+                })
+                .await;
+
+            match collect_result {
+                Err(_elapsed) => {
+                    warn!(
+                        "Quote collection timed out after {overall_timeout:?} for address {}",
+                        hex::encode(address)
+                    );
+                    // Fall through to check if we have enough quotes despite timeout.
+                    // The timeout fires when slow peers haven't responded yet, but we
+                    // may already have enough successful quotes from fast peers.
+                }
+                Ok(Err(e)) => return Err(e),
+                Ok(Ok(())) => {}
+            }
         }
 
         // Defensive double-check: the per-peer handler already filters
@@ -371,22 +1052,34 @@ impl Client {
         let total_responses = quote_count + failure_count + already_stored_count;
 
         if quotes.len() >= CLOSE_GROUP_SIZE {
-            // Sort by XOR distance to target, keep the closest CLOSE_GROUP_SIZE.
-            quotes.sort_by(|a, b| {
-                let dist_a = peer_xor_distance(&a.0, address);
-                let dist_b = peer_xor_distance(&b.0, address);
-                dist_a.cmp(&dist_b)
-            });
-            quotes.truncate(CLOSE_GROUP_SIZE);
+            let selected_quotes = match quote_selection_policy {
+                QuoteSelectionPolicy::ClosestByDistance => select_closest_quotes(quotes, address),
+                QuoteSelectionPolicy::WitnessedMedianVoters {
+                    voters_by_peer,
+                    quorum,
+                } => select_witnessed_median_voter_quotes(quotes, address, &voters_by_peer, quorum)
+                    .ok_or_else(|| {
+                        Error::InsufficientPeers(format!(
+                            "Got {quote_count} quotes, need {CLOSE_GROUP_SIZE} whose paid \
+                                 median issuer is recognised by at least {} \
+                                 selected witness peers ({total_responses} responses: \
+                                 {already_stored_count} already_stored, {failure_count} failed \
+                                 including {bad_quote_count} with mismatched peer bindings). \
+                                 Failures: [{}]",
+                            quorum,
+                            failures.join("; ")
+                        ))
+                    })?,
+            };
 
             info!(
                 "Collected {} quotes for address {} ({total_responses} responses: \
                  {quote_count} ok, {already_stored_count} already_stored, {failure_count} failed, \
                  {bad_quote_count} bad-binding)",
-                quotes.len(),
+                selected_quotes.len(),
                 hex::encode(address),
             );
-            return Ok(quotes);
+            return Ok(selected_quotes);
         }
 
         Err(Error::InsufficientPeers(format!(
@@ -415,7 +1108,7 @@ mod tests {
     use super::*;
     use ant_protocol::evm::RewardsAddress;
     use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaPublicKey};
-    use ant_protocol::transport::MlDsa65;
+    use ant_protocol::transport::{DHTNode, MlDsa65, ResponderView, WitnessedCloseGroup};
     use std::time::SystemTime;
     use xor_name::XorName;
 
@@ -469,6 +1162,70 @@ mod tests {
             signature: Vec::new(),
         };
         (claimed.peer_id, Vec::new(), quote, Amount::ZERO)
+    }
+
+    fn witnessed_test_node(seed: u8) -> DHTNode {
+        DHTNode {
+            peer_id: PeerId::from_bytes([seed; 32]),
+            addresses: Vec::new(),
+            address_types: Vec::new(),
+            distance: None,
+            reliability: 1.0,
+        }
+    }
+
+    fn witnessed_test_nodes(seeds: &[u8]) -> Vec<DHTNode> {
+        seeds.iter().copied().map(witnessed_test_node).collect()
+    }
+
+    fn witnessed_test_view(responder: u8, closest: &[u8]) -> ResponderView {
+        ResponderView {
+            responder: PeerId::from_bytes([responder; 32]),
+            closest: witnessed_test_nodes(closest),
+        }
+    }
+
+    fn synthetic_peer(seed: u8) -> PeerId {
+        PeerId::from_bytes([seed; 32])
+    }
+
+    fn synthetic_quote(seed: u8, price: u64) -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount) {
+        let amount = Amount::from(price);
+        let quote = PaymentQuote {
+            content: XorName([0u8; 32]),
+            timestamp: SystemTime::UNIX_EPOCH,
+            price: amount,
+            rewards_address: RewardsAddress::new([0u8; 20]),
+            pub_key: Vec::new(),
+            signature: Vec::new(),
+        };
+        (synthetic_peer(seed), Vec::new(), quote, amount)
+    }
+
+    fn synthetic_voters(seeds: &[u8]) -> HashSet<PeerId> {
+        seeds.iter().copied().map(synthetic_peer).collect()
+    }
+
+    fn quote_peer_seeds(quotes: &[(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)]) -> Vec<u8> {
+        quotes
+            .iter()
+            .map(|(peer_id, _, _, _)| peer_id.as_bytes()[0])
+            .collect()
+    }
+
+    fn put_peer_seeds(peers: &[(PeerId, Vec<MultiAddr>)]) -> Vec<u8> {
+        peers
+            .iter()
+            .map(|(peer_id, _)| peer_id.as_bytes()[0])
+            .collect()
+    }
+
+    fn put_peers_from_seeds(seeds: &[u8]) -> Vec<(PeerId, Vec<MultiAddr>)> {
+        seeds
+            .iter()
+            .copied()
+            .map(|seed| (synthetic_peer(seed), Vec::new()))
+            .collect()
     }
 
     /// Independent re-implementation of the storer-side binding spec
@@ -553,6 +1310,351 @@ mod tests {
     // ============================================================
 
     #[test]
+    fn quote_query_counts_keep_single_node_close_group_only() {
+        assert_eq!(single_node_quote_query_count(), CLOSE_GROUP_SIZE);
+        assert_eq!(SINGLE_NODE_WITNESSED_VIEW_COUNT, 20);
+        assert!(SINGLE_NODE_WITNESSED_VIEW_COUNT > single_node_quote_query_count());
+        assert_eq!(witnessed_close_group_quorum(), 5);
+        assert_eq!(witnessed_close_group_quorum_for_missing_views(0), 5);
+        assert_eq!(witnessed_close_group_quorum_for_missing_views(1), 4);
+        assert_eq!(witnessed_close_group_quorum_for_missing_views(2), 3);
+        assert_eq!(
+            fault_tolerant_quote_query_count(),
+            CLOSE_GROUP_SIZE * FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER
+        );
+        assert!(fault_tolerant_quote_query_count() > single_node_quote_query_count());
+    }
+
+    #[test]
+    fn witnessed_quote_launch_budget_keeps_exact_quote_window() {
+        assert_eq!(
+            witnessed_quote_launch_budget(0, 0, CLOSE_GROUP_SIZE * 2),
+            CLOSE_GROUP_SIZE,
+            "initial SNP quote fetch should launch the closest seven peers"
+        );
+        assert_eq!(
+            witnessed_quote_launch_budget(1, CLOSE_GROUP_SIZE - 1, CLOSE_GROUP_SIZE),
+            0,
+            "a successful quote should not launch an extra fallback"
+        );
+        assert_eq!(
+            witnessed_quote_launch_budget(0, CLOSE_GROUP_SIZE - 1, CLOSE_GROUP_SIZE),
+            1,
+            "a failed in-flight quote should launch the next closest fallback"
+        );
+        assert_eq!(
+            witnessed_quote_launch_budget(CLOSE_GROUP_SIZE - 1, 0, 3),
+            1,
+            "only one more peer is needed for the seventh quote"
+        );
+        assert_eq!(
+            witnessed_quote_launch_budget(0, 0, CLOSE_GROUP_SIZE - 1),
+            CLOSE_GROUP_SIZE - 1,
+            "launch budget is capped by remaining candidates"
+        );
+    }
+
+    #[test]
+    fn witnessed_candidates_sort_by_xor_distance_then_votes() {
+        let address = [0u8; 32];
+        let witnessed = WitnessedCloseGroup {
+            target: address,
+            k: CLOSE_GROUP_SIZE,
+            initial_closest: witnessed_test_nodes(&[1, 2, 3, 4, 5, 6, 7]),
+            responder_views: vec![
+                witnessed_test_view(1, &[1, 9]),
+                witnessed_test_view(2, &[1, 9]),
+                witnessed_test_view(3, &[1, 9]),
+                witnessed_test_view(4, &[1, 9]),
+                witnessed_test_view(5, &[1, 9]),
+                witnessed_test_view(6, &[9]),
+                witnessed_test_view(7, &[9]),
+            ],
+        };
+
+        let candidates =
+            witnessed_consensus_candidates(&witnessed, &address, witnessed_close_group_quorum());
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.node.peer_id.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            vec![1, 9],
+            "XOR closeness must be the primary sort before quote collection"
+        );
+    }
+
+    #[test]
+    fn witnessed_quote_peers_error_is_typed_and_pre_payment_when_consensus_is_short() {
+        let address = [0u8; 32];
+        let responder_views = (1..=7)
+            .map(|responder| witnessed_test_view(responder, &[1, 2, 3, 4]))
+            .collect();
+        let witnessed = WitnessedCloseGroup {
+            target: address,
+            k: CLOSE_GROUP_SIZE,
+            initial_closest: witnessed_test_nodes(&[1, 2, 3, 4, 5, 6, 7]),
+            responder_views,
+        };
+
+        let err = witnessed_quote_selection_or_error(
+            &address,
+            &witnessed,
+            CLOSE_GROUP_SIZE,
+            witnessed_close_group_quorum(),
+        )
+        .expect_err("short witnessed consensus must fail before payment");
+
+        match err {
+            Error::InsufficientPeers(message) => {
+                assert!(message.contains("before payment"));
+                assert!(message.contains("vote_counts"));
+                assert!(message.contains("quorum"));
+            }
+            other => panic!("expected typed InsufficientPeers error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn witnessed_quote_peers_include_quorum_fallback_candidates() {
+        const EXTRA_QUORUM_CANDIDATES: usize = 1;
+
+        let address = [0u8; 32];
+        let witnessed = WitnessedCloseGroup {
+            target: address,
+            k: CLOSE_GROUP_SIZE,
+            initial_closest: witnessed_test_nodes(&[1, 2, 3, 4, 5, 6, 7]),
+            responder_views: vec![
+                witnessed_test_view(1, &[1, 2, 3, 4, 5, 6, 7]),
+                witnessed_test_view(2, &[1, 2, 3, 4, 5, 6, 8]),
+                witnessed_test_view(3, &[1, 2, 3, 4, 5, 7, 8]),
+                witnessed_test_view(4, &[1, 2, 3, 4, 6, 7, 8]),
+                witnessed_test_view(5, &[1, 2, 3, 5, 6, 7, 8]),
+                witnessed_test_view(6, &[1, 2, 4, 5, 6, 7, 8]),
+                witnessed_test_view(7, &[1, 3, 4, 5, 6, 7, 8]),
+            ],
+        };
+
+        let selection = witnessed_quote_selection_or_error(
+            &address,
+            &witnessed,
+            CLOSE_GROUP_SIZE,
+            witnessed_close_group_quorum(),
+        )
+        .expect("fallback candidates should be retained for quote collection");
+
+        assert_eq!(
+            selection.quote_peers.len(),
+            CLOSE_GROUP_SIZE + EXTRA_QUORUM_CANDIDATES
+        );
+        assert_eq!(
+            selection
+                .quote_peers
+                .iter()
+                .map(|peer| peer.peer_id.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            put_peer_seeds(&selection.initial_put_peers),
+            vec![1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn witnessed_quote_peers_lower_quorum_for_missing_responder_views() {
+        let address = [0u8; 32];
+        let witnessed = WitnessedCloseGroup {
+            target: address,
+            k: CLOSE_GROUP_SIZE,
+            initial_closest: witnessed_test_nodes(&[1, 2, 3, 4, 5, 6, 7]),
+            responder_views: vec![
+                witnessed_test_view(1, &[1, 2, 3, 4, 5, 6, 7]),
+                witnessed_test_view(2, &[1, 2, 3, 4, 5, 6, 8]),
+                witnessed_test_view(3, &[1, 2, 3, 4, 5, 7, 8]),
+                witnessed_test_view(4, &[1, 2, 3, 4, 6, 7, 8]),
+                witnessed_test_view(5, &[1, 2, 3, 5, 6, 7, 8]),
+                witnessed_test_view(6, &[1, 2, 4, 5, 6, 7, 8]),
+            ],
+        };
+        let quorum = witnessed_close_group_quorum_for_transcript(&witnessed);
+
+        assert_eq!(missing_witnessed_responder_views(&witnessed), 1);
+        assert_eq!(quorum, 4);
+
+        let selection =
+            witnessed_quote_selection_or_error(&address, &witnessed, CLOSE_GROUP_SIZE, quorum)
+                .expect(
+                    "one missing responder view should lower quorum and still select candidates",
+                );
+
+        assert_eq!(
+            selection
+                .quote_peers
+                .iter()
+                .map(|peer| peer.peer_id.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(selection.quorum, quorum);
+    }
+
+    #[test]
+    fn witnessed_quote_selection_keeps_closest_set_with_median_voter_quorum() {
+        const MEDIAN_ISSUER_SEED: u8 = 7;
+        const FAR_SUPPORTING_VOTER_SEED: u8 = 20;
+        const UNSUCCESSFUL_SUPPORTING_VOTER_SEED: u8 = 21;
+
+        let address = [0u8; 32];
+        let quotes = vec![
+            synthetic_quote(1, 10),
+            synthetic_quote(2, 20),
+            synthetic_quote(3, 30),
+            synthetic_quote(6, 50),
+            synthetic_quote(MEDIAN_ISSUER_SEED, 40),
+            synthetic_quote(8, 60),
+            synthetic_quote(9, 70),
+            synthetic_quote(FAR_SUPPORTING_VOTER_SEED, 80),
+        ];
+        let mut voters_by_peer = HashMap::new();
+        voters_by_peer.insert(
+            synthetic_peer(MEDIAN_ISSUER_SEED),
+            synthetic_voters(&[
+                1,
+                2,
+                3,
+                MEDIAN_ISSUER_SEED,
+                FAR_SUPPORTING_VOTER_SEED,
+                UNSUCCESSFUL_SUPPORTING_VOTER_SEED,
+            ]),
+        );
+
+        let quorum = witnessed_close_group_quorum();
+        let selected =
+            select_witnessed_median_voter_quotes(quotes, &address, &voters_by_peer, quorum)
+                .expect("a supported close-group quote set should be selected");
+
+        assert_eq!(quote_peer_seeds(&selected), vec![1, 2, 3, 6, 7, 8, 9]);
+        let (median_peer_id, _) =
+            median_paid_quote_issuer(&selected).expect("selected quotes have a median");
+        assert_eq!(median_peer_id, synthetic_peer(MEDIAN_ISSUER_SEED));
+        assert!(voters_by_peer[&median_peer_id].len() >= quorum);
+    }
+
+    #[test]
+    fn witnessed_quote_selection_uses_direct_median_witness_recognition() {
+        const MEDIAN_ISSUER_SEED: u8 = 7;
+
+        let address = [0u8; 32];
+        let quotes = vec![
+            synthetic_quote(1, 10),
+            synthetic_quote(2, 20),
+            synthetic_quote(3, 30),
+            synthetic_quote(4, 50),
+            synthetic_quote(MEDIAN_ISSUER_SEED, 40),
+            synthetic_quote(8, 60),
+            synthetic_quote(9, 70),
+        ];
+        let mut voters_by_peer = HashMap::new();
+        voters_by_peer.insert(
+            synthetic_peer(MEDIAN_ISSUER_SEED),
+            synthetic_voters(&[20, 21, 22, 23, 24]),
+        );
+
+        let quorum = witnessed_close_group_quorum();
+        let selected =
+            select_witnessed_median_voter_quotes(quotes, &address, &voters_by_peer, quorum)
+                .expect("direct witness recognition should support the paid median issuer");
+
+        let (median_peer_id, _) =
+            median_paid_quote_issuer(&selected).expect("selected quotes have a median");
+        let selected_peers = selected
+            .iter()
+            .map(|(peer_id, _, _, _)| *peer_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(median_peer_id, synthetic_peer(MEDIAN_ISSUER_SEED));
+        assert_eq!(
+            voters_by_peer[&median_peer_id]
+                .intersection(&selected_peers)
+                .count(),
+            0,
+            "recognising witnesses need not also be selected quote issuers"
+        );
+        assert_eq!(voters_by_peer[&median_peer_id].len(), quorum);
+    }
+
+    #[test]
+    fn witnessed_quote_selection_rejects_median_without_witness_quorum() {
+        const MEDIAN_ISSUER_SEED: u8 = 7;
+
+        let address = [0u8; 32];
+        let quotes = vec![
+            synthetic_quote(1, 10),
+            synthetic_quote(2, 20),
+            synthetic_quote(3, 30),
+            synthetic_quote(6, 50),
+            synthetic_quote(MEDIAN_ISSUER_SEED, 40),
+            synthetic_quote(8, 60),
+            synthetic_quote(9, 70),
+            synthetic_quote(10, 80),
+        ];
+        let mut voters_by_peer = HashMap::new();
+        voters_by_peer.insert(
+            synthetic_peer(MEDIAN_ISSUER_SEED),
+            synthetic_voters(&[1, 2, 3, 20]),
+        );
+
+        let selected = select_witnessed_median_voter_quotes(
+            quotes,
+            &address,
+            &voters_by_peer,
+            witnessed_close_group_quorum(),
+        );
+
+        assert!(
+            selected.is_none(),
+            "the selector must not return a paid quote set when fewer than the \
+             witnessed median voter quorum recognised the paid median issuer"
+        );
+    }
+
+    #[test]
+    fn put_peers_prioritise_median_voters_without_reordering_quotes() {
+        const MEDIAN_ISSUER_SEED: u8 = 7;
+
+        let quotes = vec![
+            synthetic_quote(1, 10),
+            synthetic_quote(2, 20),
+            synthetic_quote(3, 30),
+            synthetic_quote(4, 50),
+            synthetic_quote(5, 60),
+            synthetic_quote(6, 70),
+            synthetic_quote(MEDIAN_ISSUER_SEED, 40),
+        ];
+        let mut voters_by_peer = HashMap::new();
+        voters_by_peer.insert(
+            synthetic_peer(MEDIAN_ISSUER_SEED),
+            synthetic_voters(&[3, 4, 5, 6, MEDIAN_ISSUER_SEED]),
+        );
+
+        let put_candidates = put_peers_from_seeds(&[1, 2, 3, 4, 5, 6, 7]);
+        let put_peers = put_peers_with_median_voters_first(
+            &quotes,
+            &put_candidates,
+            &voters_by_peer,
+            witnessed_close_group_quorum(),
+        )
+        .expect("median voters should produce an ordered PUT set");
+
+        assert_eq!(quote_peer_seeds(&quotes), vec![1, 2, 3, 4, 5, 6, 7]);
+        let (median_peer_id, _) =
+            median_paid_quote_issuer(&quotes).expect("selected quotes have a median");
+        assert_eq!(median_peer_id, synthetic_peer(MEDIAN_ISSUER_SEED));
+        assert_eq!(put_peer_seeds(&put_peers), vec![3, 4, 5, 6, 7, 1, 2]);
+    }
+
+    #[test]
     fn filter_drops_only_bad_bindings_and_leaves_storer_acceptable_quotes() {
         let mut quotes = vec![
             good_quote_real(),
@@ -594,15 +1696,15 @@ mod tests {
 
     #[test]
     fn filter_drops_all_when_every_responder_is_bad() {
-        // The "all hostile" case: every over-queried peer returned a bad
-        // binding. The patch should leave us with zero quotes (not panic,
-        // not skip the filter, not return malformed quotes). The caller in
-        // get_store_quotes then surfaces InsufficientPeers.
-        let mut quotes: Vec<_> = (0..CLOSE_GROUP_SIZE * 2)
+        // The "all hostile" case: every peer returned a bad binding. The
+        // patch should leave us with zero quotes (not panic, not skip the
+        // filter, not return malformed quotes). The caller then surfaces
+        // InsufficientPeers.
+        let mut quotes: Vec<_> = (0..fault_tolerant_quote_query_count())
             .map(|_| bad_quote_real())
             .collect();
         let dropped = drop_quotes_with_bad_bindings(&mut quotes);
-        assert_eq!(dropped, CLOSE_GROUP_SIZE * 2);
+        assert_eq!(dropped, fault_tolerant_quote_query_count());
         assert!(quotes.is_empty());
     }
 
@@ -642,10 +1744,11 @@ mod tests {
     /// quote, and the storer's `validate_peer_bindings` rejected the
     /// entire close-group proof — burning the chunk's payment.
     ///
-    /// This test is the strongest proof the patch fixes that failure shape:
+    /// This test proves the fault-tolerant quote path still fixes that failure
+    /// shape:
     ///
     /// 1. We assemble `2x CLOSE_GROUP_SIZE` real ML-DSA-65 quotes — the same
-    ///    over-query buffer the production code uses (line 93 of this file).
+    ///    buffer merkle preflight and merkle-mode estimates retain for probes.
     /// 2. One of them is a *crossed-key* quote — the production failure shape.
     /// 3. We run an independent `storer_would_accept` check (re-derived from
     ///    the storer spec, not from `quote_binding_is_valid`) over the
@@ -653,14 +1756,14 @@ mod tests {
     ///    storer **would** burn the chunk's payment if we proceeded unfiltered.
     /// 4. We run `drop_quotes_with_bad_bindings`.
     /// 5. We re-run `storer_would_accept` over the post-filter set; we confirm
-    ///    EVERY remaining quote would be accepted, proving the patched
-    ///    `ProofOfPayment` will not trigger the `validate_peer_bindings`
-    ///    rejection that caused the Apr 30 outage.
+    ///    EVERY remaining quote would be accepted, proving the filtered set
+    ///    will not trigger the `validate_peer_bindings` rejection that caused
+    ///    the Apr 30 outage.
     /// 6. We confirm the post-filter set has at least `CLOSE_GROUP_SIZE`
     ///    quotes — the over-query buffer (2x) is sufficient.
     #[test]
     fn repro_apr_30_storer_would_have_rejected_pre_filter_and_accepts_post_filter() {
-        let over_query_count = CLOSE_GROUP_SIZE * 2;
+        let over_query_count = fault_tolerant_quote_query_count();
         let mut quotes: Vec<_> = (0..over_query_count - 1)
             .map(|_| good_quote_real())
             .collect();
@@ -688,7 +1791,7 @@ mod tests {
             assert!(
                 storer_binding_would_accept(peer_id, quote),
                 "every post-filter quote must be accepted by the storer spec — \
-                 this is what the patch guarantees: no more burned payments"
+                 this is what the filter guarantees before any quote set is used"
             );
         }
 
@@ -696,7 +1799,7 @@ mod tests {
         assert!(
             quotes.len() >= CLOSE_GROUP_SIZE,
             "after filtering, at least CLOSE_GROUP_SIZE good quotes must remain \
-             so we can build a non-rejected ProofOfPayment"
+             so a fault-tolerant probe can still return a full close group"
         );
     }
 
@@ -706,9 +1809,8 @@ mod tests {
     /// and return `InsufficientPeers`.
     #[test]
     fn filter_leaves_short_set_when_too_many_bad_peers() {
-        // Buffer is 2x; if more than half are bad, there's no way to refill.
-        let bad_count = CLOSE_GROUP_SIZE + 1;
         let good_count = CLOSE_GROUP_SIZE - 1;
+        let bad_count = fault_tolerant_quote_query_count() - good_count;
         let mut quotes: Vec<_> = std::iter::repeat_with(bad_quote_real)
             .take(bad_count)
             .chain(std::iter::repeat_with(good_quote_real).take(good_count))
@@ -823,61 +1925,6 @@ mod tests {
             matches!(result, Err(Error::Serialization(_))),
             "garbage bytes must produce a Serialization error; got {result:?}"
         );
-    }
-
-    // ============================================================
-    // AIMD attribution: every error variant is classified correctly
-    // for `record_peer_outcome` so misbehaving peers are deprioritized
-    // and reachable-but-already-storing peers stay reputable.
-    // ============================================================
-
-    #[test]
-    fn aimd_success_for_ok_result() {
-        let (_, _, quote, _) = good_quote_real();
-        let result: std::result::Result<(PaymentQuote, Amount), Error> =
-            Ok((quote.clone(), quote.price));
-        assert!(quote_outcome_is_success(&result));
-    }
-
-    #[test]
-    fn aimd_success_for_already_stored() {
-        let result: std::result::Result<(PaymentQuote, Amount), Error> = Err(Error::AlreadyStored);
-        assert!(
-            quote_outcome_is_success(&result),
-            "an honest peer reporting already_stored is a benign outcome — \
-             the peer is reachable and well-behaved, so the AIMD cache must \
-             keep them at high reputation"
-        );
-    }
-
-    #[test]
-    fn aimd_failure_for_bad_quote_binding() {
-        let result: std::result::Result<(PaymentQuote, Amount), Error> =
-            Err(Error::BadQuoteBinding {
-                peer_id: "abc123".to_string(),
-                detail: "test".to_string(),
-            });
-        assert!(
-            !quote_outcome_is_success(&result),
-            "BadQuoteBinding peers must be marked as failures so the AIMD \
-             bootstrap cache learns to stop asking them on every upload"
-        );
-    }
-
-    #[test]
-    fn aimd_failure_for_network_and_timeout_and_protocol_and_serialization() {
-        for err in [
-            Error::Network("net".to_string()),
-            Error::Timeout("to".to_string()),
-            Error::Protocol("proto".to_string()),
-            Error::Serialization("ser".to_string()),
-        ] {
-            let result: std::result::Result<(PaymentQuote, Amount), Error> = Err(err);
-            assert!(
-                !quote_outcome_is_success(&result),
-                "network-class errors must be classified as failures: {result:?}"
-            );
-        }
     }
 
     /// Cross-validate the classifier's binding verdict against the

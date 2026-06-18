@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,8 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use ant_core::data::{
-    Client, CollisionPolicy, DownloadEvent, Error as DataError, PaymentMode, UploadEvent,
+    Client, CollisionPolicy, CostEstimateConfidence, DownloadEvent, Error as DataError,
+    PaymentMode, UploadEvent,
 };
 use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
 
@@ -68,6 +70,9 @@ pub enum FileAction {
         /// written to the current directory).
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Number of closest peers to try for each chunk fetch.
+        #[arg(long, alias = "peer-count", value_name = "COUNT")]
+        peers: Option<NonZeroUsize>,
     },
     /// Estimate the cost of uploading a file without uploading.
     ///
@@ -153,6 +158,7 @@ impl FileAction {
                 address,
                 datamap,
                 output,
+                peers,
             } => {
                 let resolved_output = resolve_download_output(output, datamap.as_deref())?;
                 handle_file_download(
@@ -161,6 +167,7 @@ impl FileAction {
                     datamap.as_deref(),
                     resolved_output,
                     json,
+                    peers,
                 )
                 .await
             }
@@ -202,8 +209,12 @@ async fn handle_file_upload(
     );
 
     let upload_outcome = if json_output {
-        // No progress bars in JSON mode
-        client.file_upload_with_mode(path, mode).await
+        // No progress bars in JSON mode.
+        if public {
+            client.file_upload_public_with_mode(path, mode).await
+        } else {
+            client.file_upload_with_mode(path, mode).await
+        }
     } else {
         // Set up progress channel and drive progress bars
         let (tx, rx) = mpsc::channel(64);
@@ -213,7 +224,13 @@ async fn handle_file_upload(
             file_size,
         ));
 
-        let upload_result = client.file_upload_with_progress(path, mode, Some(tx)).await;
+        let upload_result = if public {
+            client
+                .file_upload_public_with_progress(path, mode, Some(tx))
+                .await
+        } else {
+            client.file_upload_with_progress(path, mode, Some(tx)).await
+        };
 
         // Wait for progress display to finish (sender dropped → receiver exits)
         let _ = pb_handle.await;
@@ -227,6 +244,7 @@ async fn handle_file_upload(
             stored_count,
             failed_count,
             total_chunks,
+            spend,
             reason,
             ..
         }) => {
@@ -236,12 +254,18 @@ async fn handle_file_upload(
                     total_chunks,
                     chunks_stored: stored_count,
                     chunks_failed: failed_count,
+                    storage_cost_atto: spend.storage_cost_atto.clone(),
+                    gas_cost_wei: spend.gas_cost_wei.to_string(),
                     reason: &reason,
                 };
                 println!("{}", serde_json::to_string(&out)?);
             }
+            // The partial upload still spent money on-chain for the chunks it
+            // paid for; report it so the user knows what the failed attempt cost.
+            let cost_display = format_cost(&spend.storage_cost_atto, spend.gas_cost_wei);
             anyhow::bail!(
-                "Upload failed: {stored_count}/{total_chunks} stored, {failed_count} failed: {reason}"
+                "Upload failed: {stored_count}/{total_chunks} stored, {failed_count} failed \
+                 (spent {cost_display}): {reason}"
             );
         }
         Err(e) => anyhow::bail!("File upload failed: {e}"),
@@ -250,41 +274,13 @@ async fn handle_file_upload(
     let elapsed = start.elapsed();
 
     if public {
-        let spinner = if !json_output {
-            Some(progress::new_spinner("Storing public data map..."))
-        } else {
-            None
-        };
-        let dm_result = client.data_map_store(&result.data_map).await;
-        if let Some(s) = &spinner {
-            s.finish_and_clear();
-        }
-        let dm_address = match dm_result {
-            Ok(addr) => addr,
-            Err(e) => {
-                // The file body is fully stored and paid for at this point —
-                // only the public DataMap chunk failed. In JSON mode emit a
-                // parseable failure record (like the PartialUpload arm above)
-                // so callers don't report 0/0 chunks for an upload that is one
-                // chunk away from being retrievable.
-                if json_output {
-                    let reason = format!("failed to store public DataMap: {e}");
-                    let out = UploadFailureJson {
-                        error: "datamap_store_failed",
-                        total_chunks: result.chunks_stored + 1,
-                        chunks_stored: result.chunks_stored,
-                        chunks_failed: 1,
-                        reason: &reason,
-                    };
-                    println!("{}", serde_json::to_string(&out)?);
-                }
-                anyhow::bail!("Failed to store public DataMap: {e}");
-            }
-        };
-
+        let dm_address = result
+            .data_map_address
+            .ok_or_else(|| anyhow::anyhow!("Public upload completed without a DataMap address"))?;
         let hex_addr = hex::encode(dm_address);
         let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
-        let total_chunks = result.chunks_stored + 1; // +1 for the public data map chunk
+        let total_chunks = result.total_chunks;
+        let data_chunks = total_chunks.saturating_sub(1);
 
         if json_output {
             let out = UploadJsonResult {
@@ -293,8 +289,8 @@ async fn handle_file_upload(
                 mode: "public".into(),
                 chunks: total_chunks,
                 total_chunks,
-                chunks_stored: total_chunks,
-                chunks_failed: 0,
+                chunks_stored: result.chunks_stored,
+                chunks_failed: result.chunks_failed,
                 size: file_size,
                 storage_cost_atto: result.storage_cost_atto.clone(),
                 gas_cost_wei: result.gas_cost_wei.to_string(),
@@ -308,10 +304,7 @@ async fn handle_file_upload(
             println!();
             println!("Upload complete!");
             println!("  Address: {hex_addr}");
-            println!(
-                "  Chunks:  {total_chunks} ({} + 1 data map)",
-                result.chunks_stored
-            );
+            println!("  Chunks:  {total_chunks} ({} + 1 data map)", data_chunks);
             println!("  Size:    {}", format_size(file_size));
             println!("  Cost:    {cost_display}");
             println!("  Time:    {:.1}s", elapsed.as_secs_f64());
@@ -322,7 +315,7 @@ async fn handle_file_upload(
 
         info!(
             "Public upload complete: address={hex_addr}, chunks={}",
-            result.chunks_stored
+            result.total_chunks
         );
     } else {
         let parent = path
@@ -445,22 +438,34 @@ async fn handle_file_download(
     datamap_path: Option<&Path>,
     output: PathBuf,
     json_output: bool,
+    peer_count: Option<NonZeroUsize>,
 ) -> anyhow::Result<()> {
     let output_path = output;
     let start = Instant::now();
 
     let data_map = if let Some(addr_hex) = address {
         info!("Downloading public file from address {addr_hex}");
+        let address = parse_address(addr_hex)?;
         if !json_output {
             let spinner = progress::new_spinner("Fetching data map...");
-            let result = client.data_map_fetch(&parse_address(addr_hex)?).await;
+            let result = if let Some(peer_count) = peer_count {
+                client
+                    .data_map_fetch_from_closest_peers(&address, peer_count)
+                    .await
+            } else {
+                client.data_map_fetch(&address).await
+            };
             spinner.finish_and_clear();
             result.map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
         } else {
-            client
-                .data_map_fetch(&parse_address(addr_hex)?)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
+            if let Some(peer_count) = peer_count {
+                client
+                    .data_map_fetch_from_closest_peers(&address, peer_count)
+                    .await
+            } else {
+                client.data_map_fetch(&address).await
+            }
+            .map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
         }
     } else {
         let dm_path = datamap_path
@@ -470,10 +475,15 @@ async fn handle_file_download(
     };
 
     if json_output {
-        client
-            .file_download(&data_map, &output_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+        let download_result = if let Some(peer_count) = peer_count {
+            client
+                .file_download_from_closest_peers(&data_map, &output_path, peer_count)
+                .await
+        } else {
+            client.file_download(&data_map, &output_path).await
+        };
+
+        download_result.map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
     } else {
         let (tx, mut rx) = mpsc::channel(64);
 
@@ -512,9 +522,20 @@ async fn handle_file_download(
             pb.finish_and_clear();
         });
 
-        let download_result = client
-            .file_download_with_progress(&data_map, &output_path, Some(tx))
-            .await;
+        let download_result = if let Some(peer_count) = peer_count {
+            client
+                .file_download_with_progress_from_closest_peers(
+                    &data_map,
+                    &output_path,
+                    Some(tx),
+                    peer_count,
+                )
+                .await
+        } else {
+            client
+                .file_download_with_progress(&data_map, &output_path, Some(tx))
+                .await
+        };
 
         // Wait for progress bar cleanup (sender dropped → receiver exits)
         let _ = progress_handle.await;
@@ -565,24 +586,26 @@ async fn handle_file_cost(
         result
     };
 
-    let estimate = match raw_result {
-        Ok(e) => e,
-        Err(DataError::CostEstimationInconclusive(msg)) => {
-            anyhow::bail!(
-                "Cost estimation inconclusive: {msg}. The sampled chunks are \
-                 already stored on the network, so we can't sample a representative \
-                 price for the rest of the file. Try again later or upload a file \
-                 that contains some new data."
-            );
-        }
-        Err(e) => anyhow::bail!("Cost estimation failed: {e}"),
-    };
+    let estimate = raw_result.map_err(|e| anyhow::anyhow!("Cost estimation failed: {e}"))?;
 
     if json_output {
         println!("{}", serde_json::to_string(&estimate)?);
     } else {
-        let gas_wei: u128 = estimate.estimated_gas_cost_wei.parse().unwrap_or(0);
-        let cost_display = format_cost(&estimate.storage_cost_atto, gas_wei);
+        // The estimate is display-only; the real upload reconciles the true
+        // cost at payment time. When every sampled chunk is already stored we
+        // say so rather than print a misleading priced number.
+        let cost_display = match estimate.confidence {
+            CostEstimateConfidence::VerifiedAllAlreadyStored => {
+                "already stored on the network — free".to_string()
+            }
+            CostEstimateConfidence::AllSamplesAlreadyStoredIncomplete => {
+                "likely already stored — free (confirmed at payment)".to_string()
+            }
+            CostEstimateConfidence::PricedSample => {
+                let gas_wei: u128 = estimate.estimated_gas_cost_wei.parse().unwrap_or(0);
+                format_cost(&estimate.storage_cost_atto, gas_wei)
+            }
+        };
 
         println!();
         println!("Estimated upload cost for {}", path.display());
@@ -625,6 +648,11 @@ struct UploadFailureJson<'a> {
     total_chunks: usize,
     chunks_stored: usize,
     chunks_failed: usize,
+    /// Storage cost paid on-chain so far, in atto-tokens. A partial upload
+    /// still spends money for the chunks it paid for.
+    storage_cost_atto: String,
+    /// Gas cost paid on-chain so far, in wei.
+    gas_cost_wei: String,
     reason: &'a str,
 }
 
@@ -697,6 +725,21 @@ fn format_cost(storage_cost_atto: &str, gas_cost_wei: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct TestFileCli {
+        #[command(subcommand)]
+        action: FileAction,
+    }
+
+    const TEST_ADDRESS_BYTE_LEN: usize = 32;
+    const PUBLIC_DOWNLOAD_PEERS: usize = 12;
+    const PRIVATE_DOWNLOAD_PEERS: usize = 9;
+
+    fn test_address() -> String {
+        "00".repeat(TEST_ADDRESS_BYTE_LEN)
+    }
 
     #[test]
     fn resolve_download_output_returns_explicit_output_unchanged() {
@@ -753,5 +796,72 @@ mod tests {
         let datamap = PathBuf::from("photo.jpg");
         let err = resolve_download_output(None, Some(datamap.as_path())).unwrap_err();
         assert!(err.to_string().contains("Cannot derive"));
+    }
+
+    #[test]
+    fn download_peers_is_accepted_for_public_download() {
+        let address = test_address();
+        let peer_count = PUBLIC_DOWNLOAD_PEERS.to_string();
+        let cli = TestFileCli::try_parse_from([
+            "test",
+            "download",
+            address.as_str(),
+            "--peers",
+            peer_count.as_str(),
+            "--output",
+            "out.bin",
+        ])
+        .expect("--peers must parse for address downloads");
+
+        match cli.action {
+            FileAction::Download { peers, address, .. } => {
+                assert!(address.is_some());
+                assert_eq!(peers.map(NonZeroUsize::get), Some(PUBLIC_DOWNLOAD_PEERS));
+            }
+            FileAction::Upload { .. } | FileAction::Cost { .. } => {
+                panic!("expected file download action")
+            }
+        }
+    }
+
+    #[test]
+    fn download_peers_is_accepted_for_private_download() {
+        let peer_count = PRIVATE_DOWNLOAD_PEERS.to_string();
+        let cli = TestFileCli::try_parse_from([
+            "test",
+            "download",
+            "--datamap",
+            "photo.jpg.datamap",
+            "--peers",
+            peer_count.as_str(),
+        ])
+        .expect("--peers must parse for datamap downloads");
+
+        match cli.action {
+            FileAction::Download { peers, datamap, .. } => {
+                assert!(datamap.is_some());
+                assert_eq!(peers.map(NonZeroUsize::get), Some(PRIVATE_DOWNLOAD_PEERS));
+            }
+            FileAction::Upload { .. } | FileAction::Cost { .. } => {
+                panic!("expected file download action")
+            }
+        }
+    }
+
+    #[test]
+    fn download_peers_rejects_zero() {
+        let address = test_address();
+        let err = TestFileCli::try_parse_from([
+            "test",
+            "download",
+            address.as_str(),
+            "--peers",
+            "0",
+            "--output",
+            "out.bin",
+        ])
+        .expect_err("--peers=0 must fail");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 }
