@@ -25,8 +25,10 @@ pub use ant_protocol::{compute_address, DataChunk, XorName};
 pub use client::batch::{finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk};
 pub use client::data::DataUploadResult;
 pub use client::file::{
-    CostEstimateConfidence, DownloadEvent, ExternalPaymentInfo, FileUploadResult, PreparedUpload,
-    UploadCostEstimate, UploadEvent, Visibility,
+    CostEstimateConfidence, DownloadEvent, ExternalPaymentInfo, FileChunkPeerReport,
+    FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport,
+    FileDownloadWithPeerReport, FileUploadResult, PreparedUpload, UploadCostEstimate, UploadEvent,
+    Visibility,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,

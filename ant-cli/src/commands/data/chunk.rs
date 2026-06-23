@@ -243,7 +243,7 @@ fn peer_get_status(result: &ChunkPeerGetResult, summary: &mut PeerGetSummary) ->
     summary.record(&result.chunk_result)
 }
 
-fn xor_distance_decimal(distance: &[u8; XORNAME_BYTE_LEN]) -> String {
+pub(super) fn xor_distance_decimal(distance: &[u8; XORNAME_BYTE_LEN]) -> String {
     let mut digits = vec![0u8];
 
     for byte in distance {
