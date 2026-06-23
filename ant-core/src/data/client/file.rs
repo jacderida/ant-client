@@ -14,6 +14,7 @@ use crate::data::client::adaptive::{observe_op, rebucketed_unordered};
 use crate::data::client::batch::{
     finalize_batch_payment, PaymentIntent, PreparedChunk, WaveAggregateStats,
 };
+use crate::data::client::chunk::ChunkPeerGetResult;
 use crate::data::client::classify_error;
 use crate::data::client::merkle::{
     chunk_contents_for_upload_addresses, finalize_merkle_batch, merkle_deferred_retry,
@@ -24,7 +25,7 @@ use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
 use ant_protocol::evm::{Amount, PaymentQuote, QuoteHash, TxHash, MAX_LEAVES};
 use ant_protocol::transport::{MultiAddr, PeerId};
-use ant_protocol::{compute_address, DATA_TYPE_CHUNK};
+use ant_protocol::{compute_address, XorName as ChunkAddress, DATA_TYPE_CHUNK};
 use bytes::Bytes;
 use fs2::FileExt;
 use futures::stream::{self, StreamExt};
@@ -82,10 +83,69 @@ pub enum DownloadEvent {
     ChunksFetched { fetched: usize, total: usize },
 }
 
+/// File download result when peer-health diagnostics are enabled.
+#[derive(Debug, Clone)]
+pub struct FileDownloadWithPeerReport {
+    /// Number of plaintext bytes written to the destination.
+    pub bytes_written: u64,
+    /// Per-file-chunk closest-peer GET results collected during the actual download.
+    pub chunk_reports: Vec<FileChunkPeerReport>,
+}
+
+/// Closest-peer GET results for one file chunk.
+#[derive(Debug, Clone)]
+pub struct FileChunkPeerReport {
+    /// 1-based chunk index in the resolved file DataMap.
+    pub index: usize,
+    /// Chunk address.
+    pub address: ChunkAddress,
+    /// Per-peer results, sorted closest first.
+    pub peers: Vec<FileChunkPeerReportPeer>,
+}
+
+/// One peer result in a [`FileChunkPeerReport`].
+#[derive(Debug, Clone)]
+pub struct FileChunkPeerReportPeer {
+    /// Peer queried for the chunk.
+    pub peer_id: PeerId,
+    /// Known network addresses used for the peer.
+    pub peer_addrs: Vec<MultiAddr>,
+    /// XOR distance from `peer_id` to the chunk address.
+    pub xor_distance: ChunkAddress,
+    /// Whether this peer returned the chunk or why it did not.
+    pub status: FileChunkPeerStatus,
+}
+
+/// Peer-level file chunk GET diagnostic status.
+#[derive(Debug, Clone)]
+pub enum FileChunkPeerStatus {
+    /// The peer returned the chunk.
+    Found { bytes: usize },
+    /// The peer responded authoritatively that it does not store the chunk.
+    NotFound,
+    /// The peer did not respond before the timeout.
+    Timeout { message: String },
+    /// The transport/network path to the peer failed.
+    NetworkError { message: String },
+    /// Any other per-peer error.
+    Error { message: String },
+}
+
 /// One entry in the per-chunk quote list returned by
 /// [`Client::get_store_quotes`]: the responding peer, its addresses, the
 /// signed quote it returned, and the payment amount it is demanding.
 type QuoteEntry = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount);
+
+type DownloadBatchEntry = (usize, std::result::Result<Bytes, XorName>);
+
+#[derive(Clone)]
+struct FileDownloadFetchContext {
+    total_chunks: usize,
+    peer_count: usize,
+    fetched_ref: Arc<std::sync::atomic::AtomicUsize>,
+    progress_ref: Option<mpsc::Sender<DownloadEvent>>,
+    peer_reports: Option<Arc<Mutex<Vec<FileChunkPeerReport>>>>,
+}
 
 /// Number of chunks per upload wave (matches batch.rs PAYMENT_WAVE_SIZE).
 const UPLOAD_WAVE_SIZE: usize = 64;
@@ -136,6 +196,56 @@ fn distributed_sample_indices(total: usize, cap: usize) -> Vec<usize> {
         .collect();
     indices.dedup(); // defensive: already strictly increasing for cap >= 2
     indices
+}
+
+fn file_chunk_report_from_peer_results(
+    index: usize,
+    address: ChunkAddress,
+    results: &[ChunkPeerGetResult],
+) -> (Option<Bytes>, FileChunkPeerReport) {
+    let mut content = None;
+    let peers = results
+        .iter()
+        .map(|result| {
+            if content.is_none() {
+                if let Ok(Some(chunk)) = &result.chunk_result {
+                    content = Some(chunk.content.clone());
+                }
+            }
+
+            FileChunkPeerReportPeer {
+                peer_id: result.peer_id,
+                peer_addrs: result.peer_addrs.clone(),
+                xor_distance: result.xor_distance,
+                status: file_chunk_peer_status(&result.chunk_result),
+            }
+        })
+        .collect();
+
+    (
+        content,
+        FileChunkPeerReport {
+            index,
+            address,
+            peers,
+        },
+    )
+}
+
+fn file_chunk_peer_status(
+    chunk_result: &std::result::Result<Option<ant_protocol::DataChunk>, Error>,
+) -> FileChunkPeerStatus {
+    match chunk_result {
+        Ok(Some(chunk)) => FileChunkPeerStatus::Found {
+            bytes: chunk.content.len(),
+        },
+        Ok(None) => FileChunkPeerStatus::NotFound,
+        Err(Error::Timeout(e)) => FileChunkPeerStatus::Timeout { message: e.clone() },
+        Err(Error::Network(e)) => FileChunkPeerStatus::NetworkError { message: e.clone() },
+        Err(e) => FileChunkPeerStatus::Error {
+            message: e.to_string(),
+        },
+    }
 }
 
 /// Gas used by one `pay_for_quotes` transaction that packs up to
@@ -2694,86 +2804,136 @@ impl Client {
         .await
     }
 
-    /// Resolve a hierarchical [`DataMap`] to the root map containing file chunks.
+    /// Download and decrypt a file with peer-health diagnostics.
     ///
-    /// Non-hierarchical maps are returned unchanged. Hierarchical maps fetch
-    /// their child DataMap chunks from the default close group.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any child DataMap chunk cannot be retrieved or
-    /// deserialized.
-    pub async fn data_map_resolve(&self, data_map: &DataMap) -> Result<DataMap> {
-        self.data_map_resolve_using_peer_count(data_map, self.config().close_group_size)
-            .await
-    }
-
-    /// Resolve a hierarchical [`DataMap`] to the root map containing file chunks,
-    /// trying the requested number of closest peers for child DataMap chunks.
-    ///
-    /// Non-hierarchical maps are returned unchanged.
+    /// Each file chunk is fetched by querying every selected closest peer,
+    /// not by returning after the first successful peer. The returned report
+    /// records which peers had each chunk and which did not. DataMap
+    /// resolution still uses the normal early-return fetch path; diagnostics
+    /// are for file chunks only.
     ///
     /// # Errors
     ///
-    /// Returns an error if any child DataMap chunk cannot be retrieved or
-    /// deserialized.
-    pub async fn data_map_resolve_from_closest_peers(
+    /// Returns an error if any chunk cannot be retrieved, decryption fails,
+    /// or the file cannot be written.
+    pub async fn file_download_with_peer_report_from_closest_peers(
         &self,
         data_map: &DataMap,
+        output: &Path,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: NonZeroUsize,
-    ) -> Result<DataMap> {
-        self.data_map_resolve_using_peer_count(data_map, peer_count.get())
-            .await
+    ) -> Result<FileDownloadWithPeerReport> {
+        let chunk_reports = Arc::new(Mutex::new(Vec::new()));
+        let bytes_written = self
+            .file_download_with_progress_using_peer_count_and_reports(
+                data_map,
+                output,
+                progress,
+                peer_count.get(),
+                Some(chunk_reports.clone()),
+            )
+            .await?;
+
+        let mut chunk_reports = chunk_reports
+            .lock()
+            .map_err(|_| Error::Storage("file chunk peer report lock poisoned".to_string()))?
+            .clone();
+        chunk_reports.sort_by_key(|report| report.index);
+
+        Ok(FileDownloadWithPeerReport {
+            bytes_written,
+            chunk_reports,
+        })
     }
 
-    async fn data_map_resolve_using_peer_count(
+    async fn download_fetch_file_chunk(
         &self,
-        data_map: &DataMap,
-        peer_count: usize,
-    ) -> Result<DataMap> {
-        if !data_map.is_child() {
-            return Ok(data_map.clone());
+        idx: usize,
+        hash: XorName,
+        context: FileDownloadFetchContext,
+        is_deferred_retry: bool,
+    ) -> std::result::Result<DownloadBatchEntry, self_encryption::Error> {
+        let addr = hash.0;
+        let addr_hex = hex::encode(addr);
+
+        let chunk_content = if let Some(peer_reports) = context.peer_reports {
+            match self
+                .chunk_get_from_closest_peer_group(&addr, context.peer_count)
+                .await
+            {
+                Ok(results) => {
+                    let (content, report) =
+                        file_chunk_report_from_peer_results(idx + 1, addr, &results);
+                    if let Some(content) = content {
+                        peer_reports
+                            .lock()
+                            .map_err(|_| {
+                                self_encryption::Error::Generic(
+                                    "file chunk peer report lock poisoned".to_string(),
+                                )
+                            })?
+                            .push(report);
+                        Some(content)
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    if is_deferred_retry {
+                        info!(
+                            "Deferred all-peer retry for {addr_hex} hit transient error: {e}; re-deferring"
+                        );
+                    } else {
+                        info!("First-pass all-peer fetch error for {addr_hex}: {e}; deferring");
+                    }
+                    None
+                }
+            }
+        } else {
+            match self
+                .chunk_get_observed_from_closest_peers(&addr, context.peer_count)
+                .await
+            {
+                Ok(Some(chunk)) => Some(chunk.content),
+                Ok(None) => None,
+                Err(e) => {
+                    if is_deferred_retry {
+                        info!(
+                            "Deferred retry for {addr_hex} hit transient error: {e}; re-deferring"
+                        );
+                    } else {
+                        info!("First-pass fetch error for {addr_hex}: {e}; deferring");
+                    }
+                    None
+                }
+            }
+        };
+
+        let Some(content) = chunk_content else {
+            return Ok((idx, Err(hash)));
+        };
+
+        let fetched = context
+            .fetched_ref
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if is_deferred_retry {
+            info!(
+                "Downloaded {fetched}/{} (deferred retry)",
+                context.total_chunks
+            );
+        } else {
+            let total_chunks = context.total_chunks;
+            info!("Downloaded {fetched}/{total_chunks}");
+        }
+        if let Some(ref tx) = context.progress_ref {
+            let _ = tx.try_send(DownloadEvent::ChunksFetched {
+                fetched,
+                total: context.total_chunks,
+            });
         }
 
-        let handle = Handle::current();
-        let peer_count = peer_count.max(1);
-
-        tokio::task::block_in_place(|| {
-            let fetch = |batch: &[(usize, XorName)]| {
-                let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
-                let fetch_limiter = self.controller().fetch.clone();
-                handle.block_on(async {
-                    let mut results = rebucketed_unordered(
-                        &fetch_limiter,
-                        batch_owned,
-                        |(idx, hash): (usize, XorName)| async move {
-                            let addr = hash.0;
-                            let chunk = self
-                                .chunk_get_observed_from_closest_peers(&addr, peer_count)
-                                .await
-                                .map_err(|e| {
-                                    self_encryption::Error::Generic(format!(
-                                        "DataMap resolution failed: {e}"
-                                    ))
-                                })?
-                                .ok_or_else(|| {
-                                    self_encryption::Error::Generic(format!(
-                                        "DataMap chunk not found: {}",
-                                        hex::encode(addr)
-                                    ))
-                                })?;
-                            Ok::<_, self_encryption::Error>((idx, chunk.content))
-                        },
-                    )
-                    .await?;
-
-                    results.sort_by_key(|(idx, _)| *idx);
-                    Ok(results)
-                })
-            };
-            get_root_data_map_parallel(data_map.clone(), &fetch)
-        })
-        .map_err(|e| Error::Encryption(format!("DataMap resolution failed: {e}")))
+        Ok((idx, Ok(content)))
     }
 
     /// Shared download core: resolve the DataMap, then fetch + streaming-decrypt
@@ -2797,6 +2957,7 @@ impl Client {
         data_map: &DataMap,
         progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: usize,
+        peer_reports: Option<Arc<Mutex<Vec<FileChunkPeerReport>>>>,
         mut on_chunk: F,
     ) -> Result<u64>
     where
@@ -2908,6 +3069,7 @@ impl Client {
         let fetched_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetched_for_closure = fetched_counter.clone();
         let progress_for_closure = progress.clone();
+        let peer_reports_for_closure = peer_reports.clone();
 
         let fetch_limiter_outer = self.controller().fetch.clone();
         let usable_memory = usable_memory_bytes();
@@ -2932,78 +3094,33 @@ impl Client {
             &root_map,
             |batch: &[(usize, XorName)]| {
                 let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
-                let fetched_ref = fetched_for_closure.clone();
-                let progress_ref = progress_for_closure.clone();
+                let fetch_context = FileDownloadFetchContext {
+                    total_chunks,
+                    peer_count,
+                    fetched_ref: fetched_for_closure.clone(),
+                    progress_ref: progress_for_closure.clone(),
+                    peer_reports: peer_reports_for_closure.clone(),
+                };
                 let fetch_limiter = fetch_limiter_outer.clone();
 
                 tokio::task::block_in_place(|| {
                     handle.block_on(async {
-                        // First pass: try every chunk in the batch via
-                        // chunk_get_observed (which already does its own
-                        // first-attempt + retry sweep). A chunk that
-                        // returns Ok(None) here is NOT a fatal failure
-                        // — it's a candidate for a deferred retry below.
-                        // We carry the chunk's XorName through so the
-                        // retry pass can re-fetch by address.
-                        //
-                        // The closure ONLY returns Err on a true
-                        // protocol/network error from chunk_get (the
-                        // Err variant). Ok(None) is encoded as
-                        // `Err(addr)` in the inner Result so the outer
-                        // rebucketed pass doesn't early-abort on it.
-                        type BatchEntry =
-                            (usize, std::result::Result<bytes::Bytes, XorName>);
-                        let raw: Vec<BatchEntry> = rebucketed_unordered(
+                        // First pass: try every chunk in the batch. Normal mode
+                        // uses chunk_get_observed (early-return after a found
+                        // peer); diagnostic mode asks every selected closest
+                        // peer and records that sweep before returning bytes.
+                        // Any missing chunk or transient fetch error is encoded
+                        // as Err(hash), so one noisy chunk does not abort the
+                        // whole batch before the deferred retry rounds run.
+                        let first_fetch_context = fetch_context.clone();
+                        let raw: Vec<DownloadBatchEntry> = rebucketed_unordered(
                             &fetch_limiter,
                             batch_owned,
                             |(idx, hash): (usize, XorName)| {
-                                let fetched_ref = fetched_ref.clone();
-                                let progress_ref = progress_ref.clone();
+                                let fetch_context = first_fetch_context.clone();
                                 async move {
-                                    let addr = hash.0;
-                                    let addr_hex = hex::encode(addr);
-                                    match self
-                                        .chunk_get_observed_from_closest_peers(&addr, peer_count)
+                                    self.download_fetch_file_chunk(idx, hash, fetch_context, false)
                                         .await
-                                    {
-                                        Ok(Some(chunk)) => {
-                                            let fetched = fetched_ref.fetch_add(
-                                                1,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            ) + 1;
-                                            info!("Downloaded {fetched}/{total_chunks}");
-                                            if let Some(ref tx) = progress_ref {
-                                                let _ = tx.try_send(
-                                                    DownloadEvent::ChunksFetched {
-                                                        fetched,
-                                                        total: total_chunks,
-                                                    },
-                                                );
-                                            }
-                                            Ok::<BatchEntry, self_encryption::Error>((
-                                                idx,
-                                                Ok(chunk.content),
-                                            ))
-                                        }
-                                        // chunk_get returned Ok(None): defer
-                                        // this chunk for a later retry rather
-                                        // than aborting the whole batch.
-                                        Ok(None) => Ok((idx, Err(hash))),
-                                        // A transient error for one chunk
-                                        // (e.g. its close-group DHT walk
-                                        // erroring on this pass) must not
-                                        // abort a multi-hundred-chunk
-                                        // download. Defer it to the retry
-                                        // rounds, same as Ok(None); only a
-                                        // chunk that survives all deferred
-                                        // rounds is fatal.
-                                        Err(e) => {
-                                            info!(
-                                                "First-pass fetch error for {addr_hex}: {e}; deferring"
-                                            );
-                                            Ok((idx, Err(hash)))
-                                        }
-                                    }
                                 }
                             },
                         )
@@ -3044,18 +3161,15 @@ impl Client {
                                 deferred.len()
                             );
                             let mut remaining = deferred;
-                            for (round, &delay_secs) in DEFERRED_ROUND_DELAYS_SECS
-                                .iter()
-                                .enumerate()
+                            for (round, &delay_secs) in
+                                DEFERRED_ROUND_DELAYS_SECS.iter().enumerate()
                             {
                                 if remaining.is_empty() {
                                     break;
                                 }
                                 if delay_secs > 0 {
-                                    tokio::time::sleep(std::time::Duration::from_secs(
-                                        delay_secs,
-                                    ))
-                                    .await;
+                                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs))
+                                        .await;
                                 }
                                 info!(
                                     "Deferred retry round {}/{}: {} chunk(s)",
@@ -3064,55 +3178,20 @@ impl Client {
                                     remaining.len(),
                                 );
                                 let round_input = std::mem::take(&mut remaining);
-                                let round_results: Vec<BatchEntry> = rebucketed_unordered(
+                                let retry_fetch_context = fetch_context.clone();
+                                let round_results: Vec<DownloadBatchEntry> = rebucketed_unordered(
                                     &fetch_limiter,
                                     round_input,
                                     |(idx, hash): (usize, XorName)| {
-                                        let fetched_ref = fetched_ref.clone();
-                                        let progress_ref = progress_ref.clone();
+                                        let fetch_context = retry_fetch_context.clone();
                                         async move {
-                                            let addr = hash.0;
-                                            // Both Ok(None) and a transient
-                                            // Err re-defer the chunk to the
-                                            // next round rather than
-                                            // aborting; only the final
-                                            // round's leftovers are fatal.
-                                            match self
-                                                .chunk_get_observed_from_closest_peers(
-                                                    &addr, peer_count,
-                                                )
-                                                .await
-                                            {
-                                                Ok(Some(chunk)) => {
-                                                    let fetched = fetched_ref.fetch_add(
-                                                        1,
-                                                        std::sync::atomic::Ordering::Relaxed,
-                                                    ) + 1;
-                                                    info!(
-                                                        "Downloaded {fetched}/{total_chunks} (deferred retry)"
-                                                    );
-                                                    if let Some(ref tx) = progress_ref {
-                                                        let _ = tx.try_send(
-                                                            DownloadEvent::ChunksFetched {
-                                                                fetched,
-                                                                total: total_chunks,
-                                                            },
-                                                        );
-                                                    }
-                                                    Ok::<BatchEntry, self_encryption::Error>((
-                                                        idx,
-                                                        Ok(chunk.content),
-                                                    ))
-                                                }
-                                                Ok(None) => Ok((idx, Err(hash))),
-                                                Err(e) => {
-                                                    info!(
-                                                        "Deferred retry for {} hit transient error: {e}; re-deferring",
-                                                        hex::encode(addr)
-                                                    );
-                                                    Ok((idx, Err(hash)))
-                                                }
-                                            }
+                                            self.download_fetch_file_chunk(
+                                                idx,
+                                                hash,
+                                                fetch_context,
+                                                true,
+                                            )
+                                            .await
                                         }
                                     },
                                 )
@@ -3195,6 +3274,20 @@ impl Client {
         progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: usize,
     ) -> Result<u64> {
+        self.file_download_with_progress_using_peer_count_and_reports(
+            data_map, output, progress, peer_count, None,
+        )
+        .await
+    }
+
+    async fn file_download_with_progress_using_peer_count_and_reports(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+        peer_count: usize,
+        peer_reports: Option<Arc<Mutex<Vec<FileChunkPeerReport>>>>,
+    ) -> Result<u64> {
         debug!("Downloading file to {}", output.display());
 
         let parent = output.parent().unwrap_or_else(|| Path::new("."));
@@ -3209,7 +3302,7 @@ impl Client {
         let mut file = std::fs::File::create(tmp.path())?;
 
         let bytes_written = self
-            .download_decrypted_chunks(data_map, progress, peer_count, |bytes| {
+            .download_decrypted_chunks(data_map, progress, peer_count, peer_reports, |bytes| {
                 let r = file.write_all(&bytes).map_err(Error::from);
                 std::future::ready(r)
             })
@@ -3251,7 +3344,7 @@ impl Client {
         progress: Option<mpsc::Sender<DownloadEvent>>,
     ) -> Result<u64> {
         let peer_count = self.config().close_group_size;
-        self.download_decrypted_chunks(data_map, progress, peer_count, |bytes| {
+        self.download_decrypted_chunks(data_map, progress, peer_count, None, |bytes| {
             let sink = sink.clone();
             async move {
                 sink.send(Ok(bytes))

@@ -8,16 +8,13 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use ant_core::data::client::chunk::ChunkPeerGetResult;
 use ant_core::data::{
-    Client, CollisionPolicy, CostEstimateConfidence, DataMap, DownloadEvent, Error as DataError,
-    PaymentMode, UploadEvent, XorName,
+    Client, CollisionPolicy, CostEstimateConfidence, DownloadEvent, Error as DataError,
+    FileChunkPeerReport, FileChunkPeerReportPeer, FileChunkPeerStatus, PaymentMode, UploadEvent,
 };
 use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
 
-use super::chunk::{
-    parse_address, peer_get_status, print_peer_get_results, xor_distance_decimal, PeerGetSummary,
-};
+use super::chunk::{parse_address, xor_distance_decimal};
 use crate::progress;
 
 /// File subcommands.
@@ -73,11 +70,11 @@ pub enum FileAction {
         /// written to the current directory).
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Number of closest peers to try for each chunk fetch and --all-peers check.
+        /// Number of closest peers to try for each chunk fetch.
         #[arg(long, alias = "peer-count", value_name = "COUNT")]
         peers: Option<NonZeroUsize>,
-        /// Try every selected closest peer for each downloaded file chunk and
-        /// print ranked per-peer results after a successful download.
+        /// Fetch each file chunk from every selected closest peer and print
+        /// ranked per-peer results after a successful download.
         #[arg(long, alias = "try-all-peers")]
         all_peers: bool,
     },
@@ -484,16 +481,31 @@ async fn handle_file_download(
         read_datamap(dm_path).map_err(|e| anyhow::anyhow!("Failed to read datamap: {e}"))?
     };
 
-    if json_output {
-        let download_result = if let Some(peer_count) = peer_count {
-            client
-                .file_download_from_closest_peers(&data_map, &output_path, peer_count)
+    let chunk_peer_check = if json_output {
+        if all_peers {
+            let peer_count = download_peer_check_count(client, peer_count)?;
+            let report = client
+                .file_download_with_peer_report_from_closest_peers(
+                    &data_map,
+                    &output_path,
+                    None,
+                    peer_count,
+                )
                 .await
+                .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+            Some(file_peer_check_from_reports(report.chunk_reports))
         } else {
-            client.file_download(&data_map, &output_path).await
-        };
+            let download_result = if let Some(peer_count) = peer_count {
+                client
+                    .file_download_from_closest_peers(&data_map, &output_path, peer_count)
+                    .await
+            } else {
+                client.file_download(&data_map, &output_path).await
+            };
 
-        download_result.map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+            download_result.map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+            None
+        }
     } else {
         let (tx, mut rx) = mpsc::channel(64);
 
@@ -532,36 +544,47 @@ async fn handle_file_download(
             pb.finish_and_clear();
         });
 
-        let download_result = if let Some(peer_count) = peer_count {
-            client
-                .file_download_with_progress_from_closest_peers(
+        let chunk_peer_check = if all_peers {
+            let peer_count = download_peer_check_count(client, peer_count)?;
+            let report = client
+                .file_download_with_peer_report_from_closest_peers(
                     &data_map,
                     &output_path,
                     Some(tx),
                     peer_count,
                 )
                 .await
+                .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+            Some(file_peer_check_from_reports(report.chunk_reports))
         } else {
-            client
-                .file_download_with_progress(&data_map, &output_path, Some(tx))
-                .await
+            let download_result = if let Some(peer_count) = peer_count {
+                client
+                    .file_download_with_progress_from_closest_peers(
+                        &data_map,
+                        &output_path,
+                        Some(tx),
+                        peer_count,
+                    )
+                    .await
+            } else {
+                client
+                    .file_download_with_progress(&data_map, &output_path, Some(tx))
+                    .await
+            };
+            download_result.map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+            None
         };
 
         // Wait for progress bar cleanup (sender dropped → receiver exits)
         let _ = progress_handle.await;
 
-        download_result.map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
-    }
+        chunk_peer_check
+    };
 
     let file_size = std::fs::metadata(&output_path)?.len();
     let elapsed = start.elapsed();
 
     if json_output {
-        let chunk_peer_check = if all_peers {
-            Some(run_file_chunk_peer_check(client, &data_map, peer_count, false).await?)
-        } else {
-            None
-        };
         let out = DownloadJsonResult {
             file: output_path.display().to_string(),
             size: file_size,
@@ -575,97 +598,12 @@ async fn handle_file_download(
         println!("  Size: {}", format_size(file_size));
         println!("  Time: {:.1}s", elapsed.as_secs_f64());
 
-        if all_peers {
-            run_file_chunk_peer_check(client, &data_map, peer_count, true).await?;
+        if let Some(ref chunk_peer_check) = chunk_peer_check {
+            print_file_peer_check(chunk_peer_check);
         }
     }
 
     Ok(())
-}
-
-async fn run_file_chunk_peer_check(
-    client: &Client,
-    data_map: &DataMap,
-    peer_count: Option<NonZeroUsize>,
-    print_results: bool,
-) -> anyhow::Result<FilePeerCheckJson> {
-    let root_map = if let Some(peer_count) = peer_count {
-        client
-            .data_map_resolve_from_closest_peers(data_map, peer_count)
-            .await
-    } else {
-        client.data_map_resolve(data_map).await
-    }
-    .map_err(|e| anyhow::anyhow!("Chunk peer check failed to resolve DataMap: {e}"))?;
-
-    let addresses: Vec<XorName> = root_map
-        .infos()
-        .iter()
-        .map(|info| info.dst_hash.0)
-        .collect();
-    let total_chunks = addresses.len();
-
-    if print_results {
-        println!();
-        println!("Closest peer GET results for {total_chunks} file chunk(s):");
-    }
-
-    let mut summary = FilePeerCheckSummaryJson {
-        chunks: total_chunks,
-        ..FilePeerCheckSummaryJson::default()
-    };
-    let mut chunks = Vec::with_capacity(total_chunks);
-
-    for (index, address) in addresses.iter().enumerate() {
-        let chunk_number = index + 1;
-        let address_hex = hex::encode(address);
-
-        if print_results {
-            println!();
-            println!("Chunk {chunk_number}/{total_chunks}:");
-        }
-
-        let results = if let Some(peer_count) = peer_count {
-            client
-                .chunk_get_from_closest_peer_group(address, peer_count.get())
-                .await
-        } else {
-            client.chunk_get_from_close_group(address).await
-        };
-
-        match results {
-            Ok(results) => {
-                if print_results {
-                    print_peer_get_results(&address_hex, &results);
-                }
-                let report = file_chunk_peer_report(chunk_number, address_hex, &results, None);
-                summary.record_chunk(&report.summary);
-                chunks.push(report);
-            }
-            Err(e) => {
-                summary.failed_chunks += 1;
-                if print_results {
-                    println!(
-                        "Chunk {chunk_number}/{total_chunks} {address_hex}: peer check failed: {e}"
-                    );
-                }
-                chunks.push(FileChunkPeerCheckJson {
-                    index: chunk_number,
-                    address: address_hex,
-                    error: Some(e.to_string()),
-                    summary: PeerGetSummaryJson::default(),
-                    peers: Vec::new(),
-                });
-            }
-        }
-    }
-
-    if print_results {
-        println!();
-        print_file_peer_check_summary(&summary);
-    }
-
-    Ok(FilePeerCheckJson { summary, chunks })
 }
 
 async fn handle_file_cost(
@@ -820,15 +758,29 @@ struct PeerGetSummaryJson {
     error: usize,
 }
 
-impl From<PeerGetSummary> for PeerGetSummaryJson {
-    fn from(summary: PeerGetSummary) -> Self {
-        Self {
-            peers_queried: 0,
-            found: summary.found,
-            not_found: summary.not_found,
-            timeout: summary.timeout,
-            network_error: summary.network_error,
-            error: summary.error,
+impl PeerGetSummaryJson {
+    fn record_status(&mut self, status: &FileChunkPeerStatus) -> String {
+        match status {
+            FileChunkPeerStatus::Found { bytes } => {
+                self.found += 1;
+                format!("found bytes={bytes}")
+            }
+            FileChunkPeerStatus::NotFound => {
+                self.not_found += 1;
+                "not_found".to_string()
+            }
+            FileChunkPeerStatus::Timeout { message } => {
+                self.timeout += 1;
+                format!("timeout message={message}")
+            }
+            FileChunkPeerStatus::NetworkError { message } => {
+                self.network_error += 1;
+                format!("network_error message={message}")
+            }
+            FileChunkPeerStatus::Error { message } => {
+                self.error += 1;
+                format!("error message={message}")
+            }
         }
     }
 }
@@ -842,37 +794,105 @@ struct PeerGetResultJson {
     result: String,
 }
 
-fn file_chunk_peer_report(
-    index: usize,
-    address: String,
-    results: &[ChunkPeerGetResult],
-    error: Option<String>,
-) -> FileChunkPeerCheckJson {
-    let mut summary = PeerGetSummary::default();
-    let peers = results
+fn download_peer_check_count(
+    client: &Client,
+    peer_count: Option<NonZeroUsize>,
+) -> anyhow::Result<NonZeroUsize> {
+    if let Some(peer_count) = peer_count {
+        return Ok(peer_count);
+    }
+
+    NonZeroUsize::new(client.config().close_group_size)
+        .ok_or_else(|| anyhow::anyhow!("Client close group size must be greater than 0"))
+}
+
+fn file_peer_check_from_reports(reports: Vec<FileChunkPeerReport>) -> FilePeerCheckJson {
+    let mut summary = FilePeerCheckSummaryJson {
+        chunks: reports.len(),
+        ..FilePeerCheckSummaryJson::default()
+    };
+    let chunks = reports
         .iter()
-        .enumerate()
-        .map(|(peer_index, result)| {
-            let result_status = peer_get_status(result, &mut summary);
-            PeerGetResultJson {
-                rank: peer_index + 1,
-                peer: result.peer_id.to_string(),
-                distance: xor_distance_decimal(&result.xor_distance),
-                addrs: result.peer_addrs.len(),
-                result: result_status,
-            }
+        .map(|report| {
+            let chunk = file_chunk_peer_report(report);
+            summary.record_chunk(&chunk.summary);
+            chunk
         })
         .collect();
-    let mut summary = PeerGetSummaryJson::from(summary);
-    summary.peers_queried = results.len();
+
+    FilePeerCheckJson { summary, chunks }
+}
+
+fn file_chunk_peer_report(report: &FileChunkPeerReport) -> FileChunkPeerCheckJson {
+    let mut summary = PeerGetSummaryJson {
+        peers_queried: report.peers.len(),
+        ..PeerGetSummaryJson::default()
+    };
+    let peers = report
+        .peers
+        .iter()
+        .enumerate()
+        .map(|(peer_index, peer)| peer_get_result_json(peer_index, peer, &mut summary))
+        .collect();
 
     FileChunkPeerCheckJson {
-        index,
-        address,
-        error,
+        index: report.index,
+        address: hex::encode(report.address),
+        error: None,
         summary,
         peers,
     }
+}
+
+fn peer_get_result_json(
+    peer_index: usize,
+    peer: &FileChunkPeerReportPeer,
+    summary: &mut PeerGetSummaryJson,
+) -> PeerGetResultJson {
+    PeerGetResultJson {
+        rank: peer_index + 1,
+        peer: peer.peer_id.to_string(),
+        distance: xor_distance_decimal(&peer.xor_distance),
+        addrs: peer.peer_addrs.len(),
+        result: summary.record_status(&peer.status),
+    }
+}
+
+fn print_file_peer_check(report: &FilePeerCheckJson) {
+    let total_chunks = report.summary.chunks;
+    println!();
+    println!("Closest peer GET results for {total_chunks} file chunk(s):");
+
+    for chunk in &report.chunks {
+        println!();
+        println!("Chunk {}/{}:", chunk.index, total_chunks);
+        println!("Closest peer GET results for {}:", chunk.address);
+        for peer in &chunk.peers {
+            let rank = peer.rank;
+            let peer_id = &peer.peer;
+            let distance = &peer.distance;
+            let addr_count = peer.addrs;
+            let status = &peer.result;
+            println!(
+                "{rank}. peer={peer_id} distance={distance} addrs={addr_count} result={status}"
+            );
+        }
+        print_peer_get_summary(&chunk.summary);
+    }
+
+    println!();
+    print_file_peer_check_summary(&report.summary);
+}
+
+fn print_peer_get_summary(summary: &PeerGetSummaryJson) {
+    let found = summary.found;
+    let not_found = summary.not_found;
+    let timeout = summary.timeout;
+    let network_error = summary.network_error;
+    let error = summary.error;
+    println!(
+        "Summary: found={found} not_found={not_found} timeout={timeout} network_error={network_error} error={error}",
+    );
 }
 
 fn print_file_peer_check_summary(summary: &FilePeerCheckSummaryJson) {
