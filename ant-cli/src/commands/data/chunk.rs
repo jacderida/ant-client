@@ -107,16 +107,16 @@ const BYTE_RADIX: u16 = u8::MAX as u16 + 1;
 const ASCII_ZERO: u8 = b'0';
 
 #[derive(Default)]
-struct PeerGetSummary {
-    found: usize,
-    not_found: usize,
-    timeout: usize,
-    network_error: usize,
-    error: usize,
+pub(super) struct PeerGetSummary {
+    pub found: usize,
+    pub not_found: usize,
+    pub timeout: usize,
+    pub network_error: usize,
+    pub error: usize,
 }
 
 impl PeerGetSummary {
-    fn record(
+    pub(super) fn record(
         &mut self,
         chunk_result: &std::result::Result<Option<DataChunk>, DataError>,
     ) -> String {
@@ -215,7 +215,10 @@ async fn get_chunk_from_all_peers(
     Ok(())
 }
 
-fn print_peer_get_results(address: &str, results: &[ChunkPeerGetResult]) -> PeerGetSummary {
+pub(super) fn print_peer_get_results(
+    address: &str,
+    results: &[ChunkPeerGetResult],
+) -> PeerGetSummary {
     let mut summary = PeerGetSummary::default();
 
     println!("Closest peer GET results for {address}:");
@@ -239,11 +242,11 @@ fn print_peer_get_results(address: &str, results: &[ChunkPeerGetResult]) -> Peer
     summary
 }
 
-fn peer_get_status(result: &ChunkPeerGetResult, summary: &mut PeerGetSummary) -> String {
+pub(super) fn peer_get_status(result: &ChunkPeerGetResult, summary: &mut PeerGetSummary) -> String {
     summary.record(&result.chunk_result)
 }
 
-fn xor_distance_decimal(distance: &[u8; XORNAME_BYTE_LEN]) -> String {
+pub(super) fn xor_distance_decimal(distance: &[u8; XORNAME_BYTE_LEN]) -> String {
     let mut digits = vec![0u8];
 
     for byte in distance {

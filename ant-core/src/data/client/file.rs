@@ -2694,6 +2694,88 @@ impl Client {
         .await
     }
 
+    /// Resolve a hierarchical [`DataMap`] to the root map containing file chunks.
+    ///
+    /// Non-hierarchical maps are returned unchanged. Hierarchical maps fetch
+    /// their child DataMap chunks from the default close group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any child DataMap chunk cannot be retrieved or
+    /// deserialized.
+    pub async fn data_map_resolve(&self, data_map: &DataMap) -> Result<DataMap> {
+        self.data_map_resolve_using_peer_count(data_map, self.config().close_group_size)
+            .await
+    }
+
+    /// Resolve a hierarchical [`DataMap`] to the root map containing file chunks,
+    /// trying the requested number of closest peers for child DataMap chunks.
+    ///
+    /// Non-hierarchical maps are returned unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any child DataMap chunk cannot be retrieved or
+    /// deserialized.
+    pub async fn data_map_resolve_from_closest_peers(
+        &self,
+        data_map: &DataMap,
+        peer_count: NonZeroUsize,
+    ) -> Result<DataMap> {
+        self.data_map_resolve_using_peer_count(data_map, peer_count.get())
+            .await
+    }
+
+    async fn data_map_resolve_using_peer_count(
+        &self,
+        data_map: &DataMap,
+        peer_count: usize,
+    ) -> Result<DataMap> {
+        if !data_map.is_child() {
+            return Ok(data_map.clone());
+        }
+
+        let handle = Handle::current();
+        let peer_count = peer_count.max(1);
+
+        tokio::task::block_in_place(|| {
+            let fetch = |batch: &[(usize, XorName)]| {
+                let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
+                let fetch_limiter = self.controller().fetch.clone();
+                handle.block_on(async {
+                    let mut results = rebucketed_unordered(
+                        &fetch_limiter,
+                        batch_owned,
+                        |(idx, hash): (usize, XorName)| async move {
+                            let addr = hash.0;
+                            let chunk = self
+                                .chunk_get_observed_from_closest_peers(&addr, peer_count)
+                                .await
+                                .map_err(|e| {
+                                    self_encryption::Error::Generic(format!(
+                                        "DataMap resolution failed: {e}"
+                                    ))
+                                })?
+                                .ok_or_else(|| {
+                                    self_encryption::Error::Generic(format!(
+                                        "DataMap chunk not found: {}",
+                                        hex::encode(addr)
+                                    ))
+                                })?;
+                            Ok::<_, self_encryption::Error>((idx, chunk.content))
+                        },
+                    )
+                    .await?;
+
+                    results.sort_by_key(|(idx, _)| *idx);
+                    Ok(results)
+                })
+            };
+            get_root_data_map_parallel(data_map.clone(), &fetch)
+        })
+        .map_err(|e| Error::Encryption(format!("DataMap resolution failed: {e}")))
+    }
+
     /// Shared download core: resolve the DataMap, then fetch + streaming-decrypt
     /// the file one batch at a time, handing each decrypted plaintext segment
     /// (in order) to `on_chunk`. Constant memory — only one decrypt batch is
