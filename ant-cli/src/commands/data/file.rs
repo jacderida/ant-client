@@ -10,7 +10,8 @@ use tracing::info;
 
 use ant_core::data::{
     Client, CollisionPolicy, CostEstimateConfidence, DownloadEvent, Error as DataError,
-    FileChunkPeerReport, FileChunkPeerReportPeer, FileChunkPeerStatus, PaymentMode, UploadEvent,
+    FileChunkPeerReport, FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport,
+    PaymentMode, UploadEvent,
 };
 use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
 
@@ -717,7 +718,8 @@ struct FilePeerCheckJson {
 #[derive(Default, Serialize)]
 struct FilePeerCheckSummaryJson {
     chunks: usize,
-    failed_chunks: usize,
+    sweeps: usize,
+    failed_sweeps: usize,
     peers_queried: usize,
     found: usize,
     not_found: usize,
@@ -741,10 +743,17 @@ impl FilePeerCheckSummaryJson {
 struct FileChunkPeerCheckJson {
     index: usize,
     address: String,
+    summary: PeerGetSummaryJson,
+    sweeps: Vec<PeerSweepResultJson>,
+}
+
+#[derive(Serialize)]
+struct PeerSweepResultJson {
+    attempt: usize,
+    deferred_retry: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     summary: PeerGetSummaryJson,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     peers: Vec<PeerGetResultJson>,
 }
 
@@ -759,6 +768,15 @@ struct PeerGetSummaryJson {
 }
 
 impl PeerGetSummaryJson {
+    fn record_summary(&mut self, summary: &PeerGetSummaryJson) {
+        self.peers_queried += summary.peers_queried;
+        self.found += summary.found;
+        self.not_found += summary.not_found;
+        self.timeout += summary.timeout;
+        self.network_error += summary.network_error;
+        self.error += summary.error;
+    }
+
     fn record_status(&mut self, status: &FileChunkPeerStatus) -> String {
         match status {
             FileChunkPeerStatus::Found { bytes } => {
@@ -815,6 +833,12 @@ fn file_peer_check_from_reports(reports: Vec<FileChunkPeerReport>) -> FilePeerCh
         .iter()
         .map(|report| {
             let chunk = file_chunk_peer_report(report);
+            summary.sweeps += chunk.sweeps.len();
+            summary.failed_sweeps += chunk
+                .sweeps
+                .iter()
+                .filter(|sweep| peer_sweep_failed(sweep))
+                .count();
             summary.record_chunk(&chunk.summary);
             chunk
         })
@@ -824,21 +848,44 @@ fn file_peer_check_from_reports(reports: Vec<FileChunkPeerReport>) -> FilePeerCh
 }
 
 fn file_chunk_peer_report(report: &FileChunkPeerReport) -> FileChunkPeerCheckJson {
+    let mut summary = PeerGetSummaryJson::default();
+    let sweeps = report
+        .sweeps
+        .iter()
+        .map(|sweep| {
+            let sweep = file_chunk_peer_sweep_report(sweep);
+            summary.record_summary(&sweep.summary);
+            sweep
+        })
+        .collect();
+
+    FileChunkPeerCheckJson {
+        index: report.index,
+        address: hex::encode(report.address),
+        summary,
+        sweeps,
+    }
+}
+
+fn file_chunk_peer_sweep_report(sweep: &FileChunkPeerSweepReport) -> PeerSweepResultJson {
     let mut summary = PeerGetSummaryJson {
-        peers_queried: report.peers.len(),
+        peers_queried: sweep.peers.len(),
         ..PeerGetSummaryJson::default()
     };
-    let peers = report
+    if sweep.error.is_some() {
+        summary.error += 1;
+    }
+    let peers = sweep
         .peers
         .iter()
         .enumerate()
         .map(|(peer_index, peer)| peer_get_result_json(peer_index, peer, &mut summary))
         .collect();
 
-    FileChunkPeerCheckJson {
-        index: report.index,
-        address: hex::encode(report.address),
-        error: None,
+    PeerSweepResultJson {
+        attempt: sweep.attempt,
+        deferred_retry: sweep.deferred_retry,
+        error: sweep.error.clone(),
         summary,
         peers,
     }
@@ -858,6 +905,10 @@ fn peer_get_result_json(
     }
 }
 
+fn peer_sweep_failed(sweep: &PeerSweepResultJson) -> bool {
+    sweep.error.is_some() || sweep.summary.found == 0
+}
+
 fn print_file_peer_check(report: &FilePeerCheckJson) {
     let total_chunks = report.summary.chunks;
     println!();
@@ -866,17 +917,31 @@ fn print_file_peer_check(report: &FilePeerCheckJson) {
     for chunk in &report.chunks {
         println!();
         println!("Chunk {}/{}:", chunk.index, total_chunks);
-        println!("Closest peer GET results for {}:", chunk.address);
-        for peer in &chunk.peers {
-            let rank = peer.rank;
-            let peer_id = &peer.peer;
-            let distance = &peer.distance;
-            let addr_count = peer.addrs;
-            let status = &peer.result;
-            println!(
-                "{rank}. peer={peer_id} distance={distance} addrs={addr_count} result={status}"
-            );
+        for sweep in &chunk.sweeps {
+            println!();
+            let attempt = sweep.attempt;
+            if sweep.deferred_retry {
+                println!("Attempt {attempt} (deferred retry):");
+            } else {
+                println!("Attempt {attempt}:");
+            }
+            if let Some(error) = &sweep.error {
+                println!("Sweep error: {error}");
+            }
+            println!("Closest peer GET results for {}:", chunk.address);
+            for peer in &sweep.peers {
+                let rank = peer.rank;
+                let peer_id = &peer.peer;
+                let distance = &peer.distance;
+                let addr_count = peer.addrs;
+                let status = &peer.result;
+                println!(
+                    "{rank}. peer={peer_id} distance={distance} addrs={addr_count} result={status}"
+                );
+            }
+            print_peer_get_summary(&sweep.summary);
         }
+        println!("Chunk aggregate:");
         print_peer_get_summary(&chunk.summary);
     }
 
@@ -897,7 +962,8 @@ fn print_peer_get_summary(summary: &PeerGetSummaryJson) {
 
 fn print_file_peer_check_summary(summary: &FilePeerCheckSummaryJson) {
     let chunks = summary.chunks;
-    let failed_chunks = summary.failed_chunks;
+    let sweeps = summary.sweeps;
+    let failed_sweeps = summary.failed_sweeps;
     let peers_queried = summary.peers_queried;
     let found = summary.found;
     let not_found = summary.not_found;
@@ -905,7 +971,7 @@ fn print_file_peer_check_summary(summary: &FilePeerCheckSummaryJson) {
     let network_error = summary.network_error;
     let error = summary.error;
     println!(
-        "File chunk peer check summary: chunks={chunks} failed_chunks={failed_chunks} peers_queried={peers_queried} found={found} not_found={not_found} timeout={timeout} network_error={network_error} error={error}",
+        "File chunk peer check summary: chunks={chunks} sweeps={sweeps} failed_sweeps={failed_sweeps} peers_queried={peers_queried} found={found} not_found={not_found} timeout={timeout} network_error={network_error} error={error}",
     );
 }
 

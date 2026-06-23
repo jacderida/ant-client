@@ -99,6 +99,19 @@ pub struct FileChunkPeerReport {
     pub index: usize,
     /// Chunk address.
     pub address: ChunkAddress,
+    /// All diagnostic GET sweeps attempted for this chunk.
+    pub sweeps: Vec<FileChunkPeerSweepReport>,
+}
+
+/// One all-peer diagnostic GET sweep for a file chunk.
+#[derive(Debug, Clone)]
+pub struct FileChunkPeerSweepReport {
+    /// 1-based attempt number for this chunk.
+    pub attempt: usize,
+    /// Whether this sweep happened during a deferred retry round.
+    pub deferred_retry: bool,
+    /// DHT lookup / sweep-level error, if the closest-peer group could not be queried.
+    pub error: Option<String>,
     /// Per-peer results, sorted closest first.
     pub peers: Vec<FileChunkPeerReportPeer>,
 }
@@ -138,13 +151,20 @@ type QuoteEntry = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount);
 
 type DownloadBatchEntry = (usize, std::result::Result<Bytes, XorName>);
 
+#[derive(Debug, Clone)]
+struct RecordedFileChunkPeerSweep {
+    index: usize,
+    address: ChunkAddress,
+    sweep: FileChunkPeerSweepReport,
+}
+
 #[derive(Clone)]
 struct FileDownloadFetchContext {
     total_chunks: usize,
     peer_count: usize,
     fetched_ref: Arc<std::sync::atomic::AtomicUsize>,
     progress_ref: Option<mpsc::Sender<DownloadEvent>>,
-    peer_reports: Option<Arc<Mutex<Vec<FileChunkPeerReport>>>>,
+    peer_reports: Option<Arc<Mutex<Vec<RecordedFileChunkPeerSweep>>>>,
 }
 
 /// Number of chunks per upload wave (matches batch.rs PAYMENT_WAVE_SIZE).
@@ -170,6 +190,12 @@ const DOWNLOAD_STREAM_BATCH_BYTES_PER_CHUNK_MULTIPLIER: u64 = 3;
 /// `AlreadyStored` retry path, which only matters when many leading chunks
 /// of a file already live on the network.
 const ESTIMATE_SAMPLE_CAP: usize = 5;
+
+/// First diagnostic all-peer fetch attempt for a file chunk.
+const FIRST_DIAGNOSTIC_FETCH_ATTEMPT: usize = 1;
+
+/// Deferred retry attempt number for retry round 0.
+const DEFERRED_RETRY_ATTEMPT_OFFSET: usize = 2;
 
 /// Pick up to `cap` chunk indices spread evenly across `[0, total)`, always
 /// including the first and last chunk.
@@ -198,11 +224,11 @@ fn distributed_sample_indices(total: usize, cap: usize) -> Vec<usize> {
     indices
 }
 
-fn file_chunk_report_from_peer_results(
-    index: usize,
-    address: ChunkAddress,
+fn file_chunk_sweep_report_from_peer_results(
+    attempt: usize,
+    deferred_retry: bool,
     results: &[ChunkPeerGetResult],
-) -> (Option<Bytes>, FileChunkPeerReport) {
+) -> (Option<Bytes>, FileChunkPeerSweepReport) {
     let mut content = None;
     let peers = results
         .iter()
@@ -224,12 +250,51 @@ fn file_chunk_report_from_peer_results(
 
     (
         content,
-        FileChunkPeerReport {
-            index,
-            address,
+        FileChunkPeerSweepReport {
+            attempt,
+            deferred_retry,
+            error: None,
             peers,
         },
     )
+}
+
+fn file_chunk_sweep_report_from_error(
+    attempt: usize,
+    deferred_retry: bool,
+    error: &Error,
+) -> FileChunkPeerSweepReport {
+    FileChunkPeerSweepReport {
+        attempt,
+        deferred_retry,
+        error: Some(error.to_string()),
+        peers: Vec::new(),
+    }
+}
+
+fn file_chunk_reports_from_recorded_sweeps(
+    mut sweeps: Vec<RecordedFileChunkPeerSweep>,
+) -> Vec<FileChunkPeerReport> {
+    sweeps.sort_by_key(|record| (record.index, record.sweep.attempt));
+
+    let mut reports: Vec<FileChunkPeerReport> = Vec::new();
+    for record in sweeps {
+        if let Some(report) = reports
+            .last_mut()
+            .filter(|report| report.index == record.index)
+        {
+            report.sweeps.push(record.sweep);
+            continue;
+        }
+
+        reports.push(FileChunkPeerReport {
+            index: record.index,
+            address: record.address,
+            sweeps: vec![record.sweep],
+        });
+    }
+
+    reports
 }
 
 fn file_chunk_peer_status(
@@ -2834,11 +2899,11 @@ impl Client {
             )
             .await?;
 
-        let mut chunk_reports = chunk_reports
+        let chunk_reports = chunk_reports
             .lock()
             .map_err(|_| Error::Storage("file chunk peer report lock poisoned".to_string()))?
             .clone();
-        chunk_reports.sort_by_key(|report| report.index);
+        let chunk_reports = file_chunk_reports_from_recorded_sweeps(chunk_reports);
 
         Ok(FileDownloadWithPeerReport {
             bytes_written,
@@ -2852,6 +2917,7 @@ impl Client {
         hash: XorName,
         context: FileDownloadFetchContext,
         is_deferred_retry: bool,
+        attempt: usize,
     ) -> std::result::Result<DownloadBatchEntry, self_encryption::Error> {
         let addr = hash.0;
         let addr_hex = hex::encode(addr);
@@ -2862,21 +2928,24 @@ impl Client {
                 .await
             {
                 Ok(results) => {
-                    let (content, report) =
-                        file_chunk_report_from_peer_results(idx + 1, addr, &results);
-                    if let Some(content) = content {
-                        peer_reports
-                            .lock()
-                            .map_err(|_| {
-                                self_encryption::Error::Generic(
-                                    "file chunk peer report lock poisoned".to_string(),
-                                )
-                            })?
-                            .push(report);
-                        Some(content)
-                    } else {
-                        None
-                    }
+                    let (content, sweep) = file_chunk_sweep_report_from_peer_results(
+                        attempt,
+                        is_deferred_retry,
+                        &results,
+                    );
+                    peer_reports
+                        .lock()
+                        .map_err(|_| {
+                            self_encryption::Error::Generic(
+                                "file chunk peer report lock poisoned".to_string(),
+                            )
+                        })?
+                        .push(RecordedFileChunkPeerSweep {
+                            index: idx + 1,
+                            address: addr,
+                            sweep,
+                        });
+                    content
                 }
                 Err(e) => {
                     if is_deferred_retry {
@@ -2886,6 +2955,22 @@ impl Client {
                     } else {
                         info!("First-pass all-peer fetch error for {addr_hex}: {e}; deferring");
                     }
+                    peer_reports
+                        .lock()
+                        .map_err(|_| {
+                            self_encryption::Error::Generic(
+                                "file chunk peer report lock poisoned".to_string(),
+                            )
+                        })?
+                        .push(RecordedFileChunkPeerSweep {
+                            index: idx + 1,
+                            address: addr,
+                            sweep: file_chunk_sweep_report_from_error(
+                                attempt,
+                                is_deferred_retry,
+                                &e,
+                            ),
+                        });
                     None
                 }
             }
@@ -2957,7 +3042,7 @@ impl Client {
         data_map: &DataMap,
         progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: usize,
-        peer_reports: Option<Arc<Mutex<Vec<FileChunkPeerReport>>>>,
+        peer_reports: Option<Arc<Mutex<Vec<RecordedFileChunkPeerSweep>>>>,
         mut on_chunk: F,
     ) -> Result<u64>
     where
@@ -3119,8 +3204,14 @@ impl Client {
                             |(idx, hash): (usize, XorName)| {
                                 let fetch_context = first_fetch_context.clone();
                                 async move {
-                                    self.download_fetch_file_chunk(idx, hash, fetch_context, false)
-                                        .await
+                                    self.download_fetch_file_chunk(
+                                        idx,
+                                        hash,
+                                        fetch_context,
+                                        false,
+                                        FIRST_DIAGNOSTIC_FETCH_ATTEMPT,
+                                    )
+                                    .await
                                 }
                             },
                         )
@@ -3190,6 +3281,7 @@ impl Client {
                                                 hash,
                                                 fetch_context,
                                                 true,
+                                                round + DEFERRED_RETRY_ATTEMPT_OFFSET,
                                             )
                                             .await
                                         }
@@ -3286,7 +3378,7 @@ impl Client {
         output: &Path,
         progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: usize,
-        peer_reports: Option<Arc<Mutex<Vec<FileChunkPeerReport>>>>,
+        peer_reports: Option<Arc<Mutex<Vec<RecordedFileChunkPeerSweep>>>>,
     ) -> Result<u64> {
         debug!("Downloading file to {}", output.display());
 

@@ -26,8 +26,9 @@ pub use client::batch::{finalize_batch_payment, PaidChunk, PaymentIntent, Prepar
 pub use client::data::DataUploadResult;
 pub use client::file::{
     CostEstimateConfidence, DownloadEvent, ExternalPaymentInfo, FileChunkPeerReport,
-    FileChunkPeerReportPeer, FileChunkPeerStatus, FileDownloadWithPeerReport, FileUploadResult,
-    PreparedUpload, UploadCostEstimate, UploadEvent, Visibility,
+    FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport,
+    FileDownloadWithPeerReport, FileUploadResult, PreparedUpload, UploadCostEstimate, UploadEvent,
+    Visibility,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
