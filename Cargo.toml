@@ -1,3 +1,7 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
 resolver = "2"
+
+[patch.crates-io]
+saorsa-core = { git = "https://github.com/jacderida/saorsa-core.git", rev = "a23a8af12778041316a8b33c7b3b3d113ee063e5" }  # branch: experiment/dialer-evict-unreachable
+ant-protocol = { git = "https://github.com/jacderida/ant-protocol.git", rev = "e72394dce5e7ae6eb5958d8c704dd2aeb29f7c9d" }  # branch: experiment/dialer-evict-unreachable
