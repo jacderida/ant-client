@@ -943,8 +943,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f61260c89bbc0039e0643f3e2ec79b1c17aee9d81b58d7edbc52314689489f39"
+source = "git+https://github.com/jacderida/ant-protocol.git?rev=2796bb13b0f2e62931069336fe4862c1ef6bf8f3#2796bb13b0f2e62931069336fe4862c1ef6bf8f3"
 dependencies = [
  "blake3",
  "bytes",
@@ -3261,7 +3260,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -5251,8 +5250,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa8cc1b7f59f97d018760ff150bbb4f217197c41622b83f7085c9cf0424b736e"
+source = "git+https://github.com/jacderida/saorsa-core.git?rev=e940bf596bb33ca221457f7117c37964cf6fd73b#e940bf596bb33ca221457f7117c37964cf6fd73b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5366,8 +5364,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "621d0a207914a8fd6453f25e4bcc369914cbfaf59a2857e898c079b95f52f5bb"
+source = "git+https://github.com/jacderida/saorsa-transport.git?rev=9da15c80bae6eb2e52d20ff4f3e0e2e89fe4eb83#9da15c80bae6eb2e52d20ff4f3e0e2e89fe4eb83"
 dependencies = [
  "anyhow",
  "async-trait",

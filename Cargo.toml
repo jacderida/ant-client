@@ -1,3 +1,13 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
 resolver = "2"
+
+# Testnet build: ADR-011 authenticated leased relay-port reservations.
+# ant-client has no direct saorsa deps (it goes through ant-protocol re-exports),
+# but [patch.crates-io] overrides the whole transitive graph — so all three forks
+# are pinned. The saorsa-core fork is what carries the client-side dial-failure
+# cache self-heal (must be in the `ant` binary, per the V2-463 dep-skew lesson).
+[patch.crates-io]
+saorsa-transport = { git = "https://github.com/jacderida/saorsa-transport.git", rev = "9da15c80bae6eb2e52d20ff4f3e0e2e89fe4eb83" }  # branch: feat-consistent_relay_port
+saorsa-core = { git = "https://github.com/jacderida/saorsa-core.git", rev = "e940bf596bb33ca221457f7117c37964cf6fd73b" }  # branch: feat-consistent_relay_port
+ant-protocol = { git = "https://github.com/jacderida/ant-protocol.git", rev = "2796bb13b0f2e62931069336fe4862c1ef6bf8f3" }  # branch: feat-consistent_relay_port
