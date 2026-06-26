@@ -2,15 +2,7 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
-# Testnet build: ADR-011 authenticated leased relay-port reservations.
-# ant-client has no direct saorsa deps (it goes through ant-protocol re-exports),
-# but [patch.crates-io] overrides the whole transitive graph — so all three forks
-# are pinned. saorsa-core is the testnet branch (0.26.0 + crates.io transport req)
-# so published deps resolve (ant-core links ant-node 0.13.0 -> saorsa-core ^0.26.0);
-# transport is redirected to the tested relay fork (jacderida acfd0034). The
-# saorsa-core fork carries the client-side dial-failure cache self-heal (must be in
-# the `ant` binary, per the V2-463 dep-skew lesson).
-[patch.crates-io]
-saorsa-transport = { git = "https://github.com/jacderida/saorsa-transport.git", rev = "acfd003442ec6d7a2ba8ae0933c37d2f9cbff90f" }  # branch: feat-consistent_relay_port
-saorsa-core = { git = "https://github.com/jacderida/saorsa-core.git", rev = "923bf7855ecbf5f0723b1355fa3702254e8bf7f0" }  # branch: testnet-2026.6.3
-ant-protocol = { git = "https://github.com/jacderida/ant-protocol.git", rev = "08484b782a1aafb6fef934b8966939f0d3326a6e" }  # branch: feat-consistent_relay_port
+# Testnet build (ADR-011 relay-port reservations): ant-core pins ant-node and
+# ant-protocol directly to the rc PR branch commits (git deps), which pulls the
+# whole fork lineage (saorsa-core + saorsa-transport rc). No [patch.crates-io]
+# needed — git deps don't version-match, so the rc pre-releases resolve cleanly.

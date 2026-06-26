@@ -892,9 +892,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7e57398bdba4060e26a0114f1af4fc3ec8f401a1676b4899aa047d1924d075d"
+version = "0.14.0"
+source = "git+https://github.com/jacderida/ant-node.git?rev=4a9f99d05afaaed7d12cd690553430cd52a4e6a0#4a9f99d05afaaed7d12cd690553430cd52a4e6a0"
 dependencies = [
  "ant-protocol",
  "blake3",
@@ -943,7 +942,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.2.0"
-source = "git+https://github.com/jacderida/ant-protocol.git?rev=08484b782a1aafb6fef934b8966939f0d3326a6e#08484b782a1aafb6fef934b8966939f0d3326a6e"
+source = "git+https://github.com/jacderida/ant-protocol.git?rev=1489b6e8b10c1f4aeeeeab299b00e6401be1428a#1489b6e8b10c1f4aeeeeab299b00e6401be1428a"
 dependencies = [
  "blake3",
  "bytes",
@@ -3260,7 +3259,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -5249,8 +5248,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.26.0"
-source = "git+https://github.com/jacderida/saorsa-core.git?rev=923bf7855ecbf5f0723b1355fa3702254e8bf7f0#923bf7855ecbf5f0723b1355fa3702254e8bf7f0"
+version = "0.26.1-rc.1"
+source = "git+https://github.com/jacderida/saorsa-core.git?rev=523740269911185fba22afeddc5877869d50a97c#523740269911185fba22afeddc5877869d50a97c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5363,8 +5362,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.35.0"
-source = "git+https://github.com/jacderida/saorsa-transport.git?rev=acfd003442ec6d7a2ba8ae0933c37d2f9cbff90f#acfd003442ec6d7a2ba8ae0933c37d2f9cbff90f"
+version = "0.35.1-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-transport?branch=rc-2026.6.3#8f6eb3452b93695e6c99c6d6251f6036d29f94b4"
 dependencies = [
  "anyhow",
  "async-trait",

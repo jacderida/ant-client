@@ -37,7 +37,7 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = "2.2.0"
+ant-protocol = { git = "https://github.com/jacderida/ant-protocol.git", rev = "1489b6e8b10c1f4aeeeeab299b00e6401be1428a" } # testnet: relay PR branch
 xor_name = "5"
 self_encryption = "0.36"
 futures = "0.3"
@@ -65,7 +65,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # `ant-protocol` pin above points at a git branch, this ant-node must point at
 # the matching ant-node branch carrying the same saorsa-core / ant-protocol
 # lineage rather than a released version.
-ant-node = { version = "0.13.0", optional = true }
+ant-node = { git = "https://github.com/jacderida/ant-node.git", rev = "4a9f99d05afaaed7d12cd690553430cd52a4e6a0", optional = true } # testnet: relay PR branch
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -93,7 +93,7 @@ devnet = ["dep:ant-node"]
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { version = "0.13.0", features = ["test-utils"] }
+ant-node = { git = "https://github.com/jacderida/ant-node.git", rev = "4a9f99d05afaaed7d12cd690553430cd52a4e6a0", features = ["test-utils"] } # testnet: relay PR branch
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
