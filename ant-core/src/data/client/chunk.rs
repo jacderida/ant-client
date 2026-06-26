@@ -17,24 +17,12 @@ use ant_protocol::{
 };
 use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
-
-/// Upper bound on how many of a chunk's closest peers the client will try
-/// when falling back past full or over-priced close-group members.
-///
-/// Mirrors the node-side `PAID_QUOTE_ISSUER_CLOSENESS_WIDTH`
-/// (`K_BUCKET_SIZE = 20`): a node accepts a client PUT only when one of the
-/// proof's quote issuers is within its own local 20-closest to the address,
-/// so a fallback peer beyond this neighbourhood is guaranteed to reject the
-/// reused proof. There is no point trying peers past it (ADR-0002). The
-/// constant is duplicated here because `ant-protocol` does not re-export
-/// `K_BUCKET_SIZE` to clients.
-const PUT_FALLBACK_WIDTH: usize = 20;
 
 /// Why a single-peer PUT was declined. Drives the surfaced aggregate error
 /// and keeps the store AIMD limiter honest — only a transport shortfall is a
@@ -109,7 +97,7 @@ struct CloseGroupOutcome {
 ///    reach" plus "4 non-storers," not data loss.
 ///
 /// 2. *Well-sampled*: at least `CLOSE_GROUP_MAJORITY` peers were
-///    queried. `close_group_peers` (via `find_closest_peers`) accepts
+///    queried. `closest_peers` (via `find_closest_peers`) accepts
 ///    any non-empty DHT result, so a thin/under-sampled walk can return
 ///    1 or 2 peers. A `1/1` or `3/3` NotFound from such a walk is NOT
 ///    authoritative — the real replica majority may sit entirely
@@ -303,14 +291,14 @@ impl Client {
     }
 
     /// Test-only: pay for `content`, then store it with `dead_count`
-    /// unreachable initial peers so every initial send fails.
+    /// unreachable peers prepended to the real put-target set.
     ///
-    /// This exhausts the supplied close-group list and forces
-    /// `chunk_put_to_close_group` to fetch the chunk's real next-closest peers
-    /// (the ADR-0002 extended fallback) and reuse the same `ProofOfPayment` to
-    /// reach quorum. Pass `dead_count >= CLOSE_GROUP_MAJORITY` so a full
-    /// quorum's worth of replacements must come from the fallback; a success
-    /// then proves the extended fallback works end-to-end.
+    /// Every initial send hits a dead peer and fails, so the store can only
+    /// reach quorum by falling back through the real put-targets (the closest-K
+    /// set the quote plan already returned), reusing the same `ProofOfPayment`.
+    /// Pass `dead_count >= CLOSE_GROUP_MAJORITY` so a full quorum's worth of
+    /// replacements must come from the fallback; a success proves the fallback
+    /// works end-to-end.
     ///
     /// # Errors
     ///
@@ -324,29 +312,29 @@ impl Client {
         let address = compute_address(&content);
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
-        let (proof, _real_peers) = self
+        let (proof, real_peers) = self
             .pay_for_storage(&address, data_size, CHUNK_DATA_TYPE)
             .await?;
-        // Unreachable peers (random id, no addresses): every initial send
-        // fails, so the close-group store can only reach quorum via the
-        // extended fallback fetching the real next-closest peers.
-        let dead: Vec<(PeerId, Vec<MultiAddr>)> = (0..dead_count)
+        // Unreachable peers (random id, no addresses) first: every initial send
+        // fails, so quorum can only be reached by falling back through the real
+        // put-target set that follows.
+        let mut peers: Vec<(PeerId, Vec<MultiAddr>)> = (0..dead_count)
             .map(|_| (PeerId::random(), Vec::new()))
             .collect();
-        self.chunk_put_to_close_group(content, proof, &dead).await
+        peers.extend(real_peers);
+        self.chunk_put_to_close_group(content, proof, &peers).await
     }
 
-    /// Store a chunk to `CLOSE_GROUP_MAJORITY` peers, falling back past
-    /// full or over-priced close-group members (ADR-0002).
+    /// Store a chunk to `CLOSE_GROUP_MAJORITY` peers, falling back past full or
+    /// over-priced members of the supplied put-target set (ADR-0002).
     ///
-    /// Initially sends the PUT concurrently to the first
-    /// `CLOSE_GROUP_MAJORITY` quoted peers. On each failure it advances to
-    /// the next fallback peer — first the remaining quoted peers, then the
-    /// chunk's next-closest peers within the `PUT_FALLBACK_WIDTH`
-    /// neighbourhood (fetched once, on demand). Every peer reuses the same
-    /// payment proof: a node accepts it as long as one of the proof's quote
-    /// issuers is within that peer's own local closest view, so the client
-    /// never needs to re-quote or re-pay to route around a full node.
+    /// Sends the PUT concurrently to the first `CLOSE_GROUP_MAJORITY` peers. On
+    /// each failure it advances to the next peer in `peers` — which the caller
+    /// supplies as the chunk's closest ~K neighbourhood, so no further DHT
+    /// lookup is needed. Every peer reuses the same payment proof: a node
+    /// accepts it as long as one of the proof's quote issuers is within that
+    /// peer's own local closest view, so the client never needs to re-quote or
+    /// re-pay to route around a full node.
     ///
     /// # Errors
     ///
@@ -361,17 +349,8 @@ impl Client {
         let address = compute_address(&content);
 
         let initial_count = peers.len().min(CLOSE_GROUP_MAJORITY);
-        let (initial_peers, quoted_fallback) = peers.split_at(initial_count);
-
-        // Every peer we've sent to, so the extended-neighbourhood fetch
-        // never re-sends to a node we already tried.
-        let mut tried: HashSet<PeerId> = peers.iter().map(|(p, _)| *p).collect();
-        // Fallback queue: the remaining quoted peers first, then (lazily)
-        // the next-closest peers within the `PUT_FALLBACK_WIDTH`
-        // neighbourhood, all reusing the same proof.
-        let mut fallback: VecDeque<(PeerId, Vec<MultiAddr>)> =
-            quoted_fallback.iter().cloned().collect();
-        let mut extended_fetched = false;
+        let (initial_peers, fallback_peers) = peers.split_at(initial_count);
+        let mut fallback_iter = fallback_peers.iter();
 
         let mut put_futures = FuturesUnordered::new();
         for (peer_id, addrs) in initial_peers {
@@ -385,13 +364,12 @@ impl Client {
 
         let mut success_count = 0usize;
         let mut failures: Vec<String> = Vec::new();
-        // Tally the *cause* of each failure. The store AIMD limiter must
-        // only be pushed down by a transport shortfall (V2-468): a node
-        // that responds with a structured rejection (`Error::RemotePut`)
-        // declined at the application layer and is not evidence the client
-        // is sending too fast. The per-cause counts also surface a legible
-        // aggregate reason. Hold the first remote rejection as the
-        // representative error to surface when the shortfall is app-only.
+        // Tally the *cause* of each failure. The store AIMD limiter must only
+        // be pushed down by a transport shortfall (V2-468): a node that responds
+        // with a structured rejection (`Error::RemotePut`) declined at the
+        // application layer and is not evidence the client is sending too fast.
+        // The per-cause counts also surface a legible aggregate reason; hold the
+        // first remote rejection as the representative error.
         let mut full = 0usize;
         let mut price_floor = 0usize;
         let mut other_remote = 0usize;
@@ -423,15 +401,9 @@ impl Client {
                         first_remote_rejection = Some(e);
                     }
 
-                    // Advance to the next fallback peer, reusing the proof.
-                    // When the quoted spares run out, fetch the chunk's
-                    // next-closest peers within the neighbourhood once.
-                    if fallback.is_empty() && !extended_fetched {
-                        extended_fetched = true;
-                        self.enqueue_extended_fallback(&address, &mut fallback, &mut tried)
-                            .await;
-                    }
-                    if let Some((fb_peer, fb_addrs)) = fallback.pop_front() {
+                    // Advance to the next peer in the put-target set, reusing
+                    // the same proof.
+                    if let Some((fb_peer, fb_addrs)) = fallback_iter.next() {
                         debug!(
                             "Falling back to peer {fb_peer} for chunk {}",
                             hex::encode(address)
@@ -439,8 +411,8 @@ impl Client {
                         put_futures.push(self.spawn_chunk_put(
                             content.clone(),
                             proof.clone(),
-                            fb_peer,
-                            fb_addrs,
+                            *fb_peer,
+                            fb_addrs.clone(),
                         ));
                     }
                 }
@@ -450,8 +422,7 @@ impl Client {
         // Quorum not reached. If no transport failure occurred, surface a
         // representative `RemotePut` (classifies `ApplicationError`, still
         // recoverable in the merkle retry path) so the shortfall doesn't
-        // suppress the store limiter. Otherwise it's a real capacity
-        // shortfall.
+        // suppress the store limiter. Otherwise it's a real capacity shortfall.
         if transport == 0 {
             if let Some(remote_rejection) = first_remote_rejection {
                 return Err(remote_rejection);
@@ -464,34 +435,6 @@ impl Client {
              transport: {transport}). Failures: [{}]",
             failures.join("; ")
         )))
-    }
-
-    /// Append the chunk's next-closest peers (within `PUT_FALLBACK_WIDTH`)
-    /// to the fallback queue, skipping any already tried. Best effort: a
-    /// DHT lookup failure leaves the queue unchanged (ADR-0002).
-    async fn enqueue_extended_fallback(
-        &self,
-        address: &XorName,
-        fallback: &mut VecDeque<(PeerId, Vec<MultiAddr>)>,
-        tried: &mut HashSet<PeerId>,
-    ) {
-        match self.closest_peers(address, PUT_FALLBACK_WIDTH).await {
-            Ok(extended) => {
-                for (peer, addrs) in extended {
-                    // `insert` returns false when already tried, deduping
-                    // both against the quoted set and within the fetch.
-                    if tried.insert(peer) {
-                        fallback.push_back((peer, addrs));
-                    }
-                }
-            }
-            Err(e) => {
-                debug!(
-                    "No extended fallback peers for chunk {}: {e}",
-                    hex::encode(address)
-                );
-            }
-        }
     }
 
     /// Build a chunk PUT future for a single peer. Takes owned peer data so
@@ -653,7 +596,7 @@ impl Client {
         let addr_hex = hex::encode(address);
 
         // First attempt against the current close-group view. A
-        // lookup/transport error here (e.g. close_group_peers' DHT walk
+        // lookup/transport error here (e.g. closest_peers' DHT walk
         // momentarily returning an error, or InsufficientPeers from a
         // thin routing table) is NOT fatal: fall through to the retry
         // path exactly as a non-authoritative miss would. Otherwise one

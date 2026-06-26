@@ -28,6 +28,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::debug;
 
+/// Width of the chunk PUT-target set (initial writes plus fallback): the
+/// closest `PUT_TARGET_WIDTH` peers to the address.
+///
+/// Mirrors the node-side `K_BUCKET_SIZE` / `PAID_QUOTE_ISSUER_CLOSENESS_WIDTH`
+/// (20): a node accepts a reused payment proof only when one of the proof's
+/// closest-`CLOSE_GROUP_SIZE` quote issuers is within its own local 20-closest,
+/// so trying peers past this width is pointless.
+pub(crate) const PUT_TARGET_WIDTH: usize = 20;
+
 /// Classify a `data::error::Error` into a controller `Outcome`.
 ///
 /// Capacity signals (Timeout / NetworkError) drive the controller
@@ -508,16 +517,17 @@ impl Client {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Return all peers in the close group for a target address.
+    /// Return the chunk PUT-target set: the closest [`PUT_TARGET_WIDTH`] peers
+    /// to the address, each paired with its known network addresses.
     ///
-    /// Queries the DHT for the closest peers by XOR distance.
-    /// Returns each peer paired with its known network addresses.
-    pub(crate) async fn close_group_peers(
+    /// Used by the merkle store path, which — unlike single-node payment — has
+    /// no witnessed put-target list to forward, so it fetches the closest-K
+    /// neighbourhood locally.
+    pub(crate) async fn put_target_peers(
         &self,
         target: &XorName,
     ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
-        self.closest_peers(target, self.config().close_group_size)
-            .await
+        self.closest_peers(target, PUT_TARGET_WIDTH).await
     }
 
     /// Return the requested number of closest peers for a target address.
