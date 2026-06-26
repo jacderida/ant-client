@@ -943,7 +943,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.2.0"
-source = "git+https://github.com/jacderida/ant-protocol.git?rev=fe37cd675b423dea15b7db9844c5a119db28e34b#fe37cd675b423dea15b7db9844c5a119db28e34b"
+source = "git+https://github.com/jacderida/ant-protocol.git?rev=08484b782a1aafb6fef934b8966939f0d3326a6e#08484b782a1aafb6fef934b8966939f0d3326a6e"
 dependencies = [
  "blake3",
  "bytes",
@@ -3260,7 +3260,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5250,7 +5250,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.26.0"
-source = "git+https://github.com/jacderida/saorsa-core.git?rev=3cf7e872877e4503662f9a5696bf76e42afbde31#3cf7e872877e4503662f9a5696bf76e42afbde31"
+source = "git+https://github.com/jacderida/saorsa-core.git?rev=923bf7855ecbf5f0723b1355fa3702254e8bf7f0#923bf7855ecbf5f0723b1355fa3702254e8bf7f0"
 dependencies = [
  "anyhow",
  "async-trait",
