@@ -302,6 +302,40 @@ impl Client {
         }
     }
 
+    /// Test-only: pay for `content`, then store it with `dead_count`
+    /// unreachable initial peers so every initial send fails.
+    ///
+    /// This exhausts the supplied close-group list and forces
+    /// `chunk_put_to_close_group` to fetch the chunk's real next-closest peers
+    /// (the ADR-0002 extended fallback) and reuse the same `ProofOfPayment` to
+    /// reach quorum. Pass `dead_count >= CLOSE_GROUP_MAJORITY` so a full
+    /// quorum's worth of replacements must come from the fallback; a success
+    /// then proves the extended fallback works end-to-end.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if payment fails or quorum cannot be reached.
+    #[cfg(feature = "test-utils")]
+    pub async fn chunk_put_with_dead_initial_peers(
+        &self,
+        content: Bytes,
+        dead_count: usize,
+    ) -> Result<XorName> {
+        let address = compute_address(&content);
+        let data_size = u64::try_from(content.len())
+            .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
+        let (proof, _real_peers) = self
+            .pay_for_storage(&address, data_size, CHUNK_DATA_TYPE)
+            .await?;
+        // Unreachable peers (random id, no addresses): every initial send
+        // fails, so the close-group store can only reach quorum via the
+        // extended fallback fetching the real next-closest peers.
+        let dead: Vec<(PeerId, Vec<MultiAddr>)> = (0..dead_count)
+            .map(|_| (PeerId::random(), Vec::new()))
+            .collect();
+        self.chunk_put_to_close_group(content, proof, &dead).await
+    }
+
     /// Store a chunk to `CLOSE_GROUP_MAJORITY` peers, falling back past
     /// full or over-priced close-group members (ADR-0002).
     ///
