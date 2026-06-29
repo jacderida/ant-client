@@ -43,7 +43,11 @@ pub struct PreparedChunk {
     pub content: Bytes,
     /// Content address (BLAKE3 hash).
     pub address: XorName,
-    /// Closest peers from quote collection — PUT targets for close-group replication.
+    /// Ordered PUT targets from quote planning.
+    ///
+    /// Kept under the legacy `quoted_peers` name for API compatibility; the
+    /// list can include non-quoted fallback peers beyond the quoted close
+    /// group.
     pub quoted_peers: Vec<(PeerId, Vec<MultiAddr>)>,
     /// Payment structure (quotes sorted, median selected, not yet paid on-chain).
     pub payment: SingleNodePayment,
@@ -58,7 +62,11 @@ pub struct PaidChunk {
     pub content: Bytes,
     /// Content address (BLAKE3 hash).
     pub address: XorName,
-    /// Closest peers from quote collection — PUT targets for close-group replication.
+    /// Ordered PUT targets from quote planning.
+    ///
+    /// Kept under the legacy `quoted_peers` name for API compatibility; the
+    /// list can include non-quoted fallback peers beyond the quoted close
+    /// group.
     pub quoted_peers: Vec<(PeerId, Vec<MultiAddr>)>,
     /// Serialized [`PaymentProof`] bytes.
     pub proof_bytes: Vec<u8>,
@@ -256,7 +264,8 @@ impl Client {
         };
         let quotes_with_peers = quote_plan.quotes;
 
-        // Capture all quoted peers for close-group replication.
+        // Capture the ordered PUT target set for replication. This can be
+        // wider than the peers that supplied the paid quotes.
         let quoted_peers = quote_plan.put_peers;
 
         // Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.
