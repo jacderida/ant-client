@@ -76,6 +76,16 @@ on assumption:
   provably rejects ("issuer not among this node's local K=20 closest"). Fallback is
   **best-effort**: whether a given far peer accepts depends on its own routing view
   and local price floor, which the client cannot see.
+- **Quote/pay the quorum-witnessed close group, not the raw initial list.** The
+  `CLOSE_GROUP_SIZE` peers that are quoted and paid are the *witnessed consensus*
+  close group: the peers a quorum of the closest responders agree are closest to the
+  address, taken in XOR order. This is intentionally **not** strictly the querying
+  node's initial closest-`CLOSE_GROUP_SIZE` list — the witnessed/consensus model
+  exists precisely so that a stale or biased local view cannot unilaterally pick the
+  pay set, so a consensus peer surfaced in responder views may stand in for a stale
+  initial peer. The widened put-target query (closest `20`) only *enlarges the put set
+  and the responder pool*; the quote/quorum transcript is still scoped to
+  `CLOSE_GROUP_SIZE`, leaving payment byte-for-byte unchanged.
 - **Keep write quorum at `CLOSE_GROUP_MAJORITY = 4`.** Fallback changes *which* peers
   satisfy quorum, not the threshold.
 - **Read availability:** rely on close-group convergence driven by node/membership

@@ -50,14 +50,23 @@ async fn test_chunk_put_get_round_trip() {
     testnet.teardown().await;
 }
 
-/// ADR-0002: when the initial close-group peers all fail, the client falls back
-/// to the chunk's next-closest peers (reusing the same proof) and still reaches
-/// quorum.
+/// ADR-0002: when initial PUT targets fail, the client falls back to the
+/// chunk's genuine next-closest peers — reusing the same `ProofOfPayment`,
+/// without re-quoting or re-paying — and still reaches quorum.
 ///
 /// Forces `DEAD_INITIAL_PEERS` (= `CLOSE_GROUP_MAJORITY`) unreachable initial
-/// peers, so every initial send fails and a full quorum's worth of replacements
-/// must come from the extended fallback. A successful, retrievable store proves
-/// the fallback fetched further peers and reused the same proof.
+/// peers, so every initial send fails and a full quorum's worth of stores must
+/// come from the *real* next-closest peers in the put-target set. A successful,
+/// retrievable store proves the fallback reached those real peers on the single
+/// proof produced by one payment.
+///
+/// Scope: failures here are driven by *unreachable* peers (transport), which
+/// exercises the fallback walk + single-proof reuse + quorum end-to-end. The
+/// *classification* that routes a full node's `StorageFailed` and a price-floor
+/// `PaymentFailed`/`PaymentRequired` into the same fallback is covered by the
+/// `classify_put_failure_*` unit test. A live close-group node returning
+/// `StorageFailed` (a genuinely full member) needs a node-side capacity hook the
+/// in-process MiniTestnet does not expose — tracked as a follow-up.
 #[cfg(feature = "test-utils")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
