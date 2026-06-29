@@ -85,6 +85,9 @@ default = []
 # Enable `LocalDevnet` (ant-core/src/node/devnet.rs) which wraps
 # `ant_node::devnet::Devnet` and an Anvil EVM testnet.
 devnet = ["dep:ant-node"]
+# Expose test-only client seams (e.g. forcing the ADR-0002 extended PUT
+# fallback) used by the e2e/integration test suite.
+test-utils = []
 
 [dev-dependencies]
 # Test infrastructure in tests/support/mod.rs spawns real ant-nodes

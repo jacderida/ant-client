@@ -23,7 +23,7 @@ impl Client {
     /// Pay for storage and return the serialized payment proof bytes.
     ///
     /// This orchestrates the full payment flow:
-    /// 1. Collect `CLOSE_GROUP_SIZE` quotes from the witnessed close group
+    /// 1. Collect `CLOSE_GROUP_SIZE` quotes plus ordered PUT targets
     /// 2. Build `SingleNodePayment` using node-reported prices (median 3x, others 0)
     /// 3. Pay on-chain via the wallet
     /// 4. Serialize `PaymentProof` with transaction hashes
@@ -32,9 +32,10 @@ impl Client {
     ///
     /// Returns an error if the wallet is not set, quotes cannot be collected,
     /// on-chain payment fails, or serialization fails.
-    /// Returns `(proof_bytes, quoted_peers)`. `quoted_peers` are the
-    /// `CLOSE_GROUP_SIZE` peers that provided quotes — callers should store
-    /// the chunk to at least `CLOSE_GROUP_MAJORITY` of these peers.
+    /// Returns `(proof_bytes, put_targets)`. The peer list is the ordered PUT
+    /// target set from quote planning: it starts with peers expected to accept
+    /// the paid proof and can include non-quoted fallback peers beyond the
+    /// quoted close group.
     pub async fn pay_for_storage(
         &self,
         address: &[u8; 32],
@@ -59,7 +60,8 @@ impl Client {
                 )
             })?;
 
-        // Capture all quoted peers for replication by the caller.
+        // Capture the ordered PUT target set for replication by the caller.
+        // This can be wider than the peers that supplied the paid quotes.
         let quoted_peers = quote_plan.put_peers;
 
         // 2. Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.

@@ -2578,7 +2578,7 @@ impl Client {
                         hex::encode(addr)
                     ))
                 })?;
-                let peers = self.close_group_peers(&addr).await?;
+                let peers = self.put_target_peers(&addr).await?;
                 observe_op(
                     &limiter,
                     || async move { self.chunk_put_to_close_group(content, proof, &peers).await },

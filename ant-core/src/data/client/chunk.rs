@@ -13,17 +13,79 @@ use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{
     compute_address, detect_proof_type, send_and_await_chunk_response, ChunkGetRequest,
     ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, DataChunk,
-    ProofType, XorName, CLOSE_GROUP_MAJORITY,
+    ProofType, ProtocolError, XorName, CLOSE_GROUP_MAJORITY,
 };
 use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
-use std::future::Future;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
+
+/// Why a single-peer PUT was declined. Drives the surfaced aggregate error
+/// and keeps the store AIMD limiter honest — only a transport shortfall is a
+/// "client is sending too fast" signal (V2-468); a node that responds with a
+/// structured rejection is an application-level decline (ADR-0002).
+#[derive(Clone, Copy)]
+enum PutRejection {
+    /// Node is out of storage (`ProtocolError::StorageFailed`) — try a
+    /// further peer.
+    Full,
+    /// Payment did not clear the node's local price floor, or the proof's
+    /// issuers are not close enough in this peer's view
+    /// (`ProtocolError::PaymentFailed`), or the node asked for more than was
+    /// paid (`ChunkPutResponse::PaymentRequired` → [`Error::Payment`]) — skip
+    /// this peer, do not re-quote.
+    PriceFloor,
+    /// Some other structured remote rejection.
+    OtherRemote,
+    /// Transport/timeout failure — the node did not respond.
+    Transport,
+}
+
+/// Classify a failed single-peer PUT (ADR-0002). A `RemotePut` carries the
+/// node's structured `ProtocolError`; a `PaymentRequired` response surfaces as
+/// [`Error::Payment`]; anything else is a transport failure.
+fn classify_put_failure(error: &Error) -> PutRejection {
+    match error {
+        Error::RemotePut { source, .. } => match source {
+            ProtocolError::StorageFailed(_) => PutRejection::Full,
+            ProtocolError::PaymentFailed(_) => PutRejection::PriceFloor,
+            _ => PutRejection::OtherRemote,
+        },
+        // A `PaymentRequired` PUT response (the node wants more than was paid)
+        // arrives as `Error::Payment`. It is a structured application-level
+        // decline — skip the peer and advance fallback, exactly like a
+        // price-floor `PaymentFailed` — not a transport shortfall, so it must
+        // not push the store AIMD limiter down (ADR-0002 / V2-468).
+        Error::Payment(_) => PutRejection::PriceFloor,
+        _ => PutRejection::Transport,
+    }
+}
+
+/// Decide the error for a close-group store that fell short of quorum.
+///
+/// When every failure was an application-level decline — the node responded
+/// (full / price-floor / `PaymentRequired` / other remote rejection) and there
+/// was **no** transport failure — return the representative application error so
+/// the shortfall classifies as `ApplicationError` and does not push the store
+/// AIMD limiter down as a false capacity signal (ADR-0002 / V2-468). A shortfall
+/// that included any transport failure is a genuine capacity signal and surfaces
+/// as `InsufficientPeers` (classified `NetworkError`).
+fn put_shortfall_error(
+    transport: usize,
+    first_app_rejection: Option<Error>,
+    insufficient_peers_message: String,
+) -> Error {
+    if transport == 0 {
+        if let Some(app_rejection) = first_app_rejection {
+            return app_rejection;
+        }
+    }
+    Error::InsufficientPeers(insufficient_peers_message)
+}
 
 /// Result of one sweep over a chunk's close group.
 ///
@@ -66,7 +128,7 @@ struct CloseGroupOutcome {
 ///    reach" plus "4 non-storers," not data loss.
 ///
 /// 2. *Well-sampled*: at least `CLOSE_GROUP_MAJORITY` peers were
-///    queried. `close_group_peers` (via `find_closest_peers`) accepts
+///    queried. `closest_peers` (via `find_closest_peers`) accepts
 ///    any non-empty DHT result, so a thin/under-sampled walk can return
 ///    1 or 2 peers. A `1/1` or `3/3` NotFound from such a walk is NOT
 ///    authoritative — the real replica majority may sit entirely
@@ -259,12 +321,51 @@ impl Client {
         }
     }
 
-    /// Store a chunk to `CLOSE_GROUP_MAJORITY` peers from the quoted set.
+    /// Test-only: pay for `content`, then store it with `dead_count`
+    /// unreachable peers prepended to the real put-target set.
     ///
-    /// Initially sends the PUT concurrently to the first
-    /// `CLOSE_GROUP_MAJORITY` peers. If any fail, falls back to the
-    /// remaining peers in the quoted set until majority is reached or
-    /// all peers are exhausted.
+    /// Every initial send hits a dead peer and fails, so the store can only
+    /// reach quorum by falling back through the real put-targets (the closest-K
+    /// set the quote plan already returned), reusing the same `ProofOfPayment`.
+    /// Pass `dead_count >= CLOSE_GROUP_MAJORITY` so a full quorum's worth of
+    /// replacements must come from the fallback; a success proves the fallback
+    /// works end-to-end.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if payment fails or quorum cannot be reached.
+    #[cfg(feature = "test-utils")]
+    pub async fn chunk_put_with_dead_initial_peers(
+        &self,
+        content: Bytes,
+        dead_count: usize,
+    ) -> Result<XorName> {
+        let address = compute_address(&content);
+        let data_size = u64::try_from(content.len())
+            .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
+        let (proof, real_peers) = self
+            .pay_for_storage(&address, data_size, CHUNK_DATA_TYPE)
+            .await?;
+        // Unreachable peers (random id, no addresses) first: every initial send
+        // fails, so quorum can only be reached by falling back through the real
+        // put-target set that follows.
+        let mut peers: Vec<(PeerId, Vec<MultiAddr>)> = (0..dead_count)
+            .map(|_| (PeerId::random(), Vec::new()))
+            .collect();
+        peers.extend(real_peers);
+        self.chunk_put_to_close_group(content, proof, &peers).await
+    }
+
+    /// Store a chunk to `CLOSE_GROUP_MAJORITY` peers, falling back past full or
+    /// over-priced members of the supplied put-target set (ADR-0002).
+    ///
+    /// Sends the PUT concurrently to the first `CLOSE_GROUP_MAJORITY` peers. On
+    /// each failure it advances to the next peer in `peers` — which the caller
+    /// supplies as the chunk's closest ~K neighbourhood, so no further DHT
+    /// lookup is needed. Every peer reuses the same payment proof: a node
+    /// accepts it as long as one of the proof's quote issuers is within that
+    /// peer's own local closest view, so the client never needs to re-quote or
+    /// re-pay to route around a full node.
     ///
     /// # Errors
     ///
@@ -280,26 +381,32 @@ impl Client {
 
         let initial_count = peers.len().min(CLOSE_GROUP_MAJORITY);
         let (initial_peers, fallback_peers) = peers.split_at(initial_count);
+        let mut fallback_iter = fallback_peers.iter();
 
         let mut put_futures = FuturesUnordered::new();
         for (peer_id, addrs) in initial_peers {
-            put_futures.push(self.spawn_chunk_put(content.clone(), proof.clone(), peer_id, addrs));
+            put_futures.push(self.spawn_chunk_put(
+                content.clone(),
+                proof.clone(),
+                *peer_id,
+                addrs.clone(),
+            ));
         }
 
         let mut success_count = 0usize;
         let mut failures: Vec<String> = Vec::new();
-        // Distinguish the *cause* of a quorum shortfall so it feeds the
-        // store AIMD limiter correctly (V2-468). If every failure was a
-        // structured remote application rejection (`Error::RemotePut` — the
-        // node responded and declined: pool-rejected / quote-stale /
-        // disk-full), the shortfall is not evidence the client is sending
-        // too fast and must not push the limiter down. Anything else
-        // (transport failure, or a different error) keeps it a real
-        // capacity signal. Hold the first remote rejection as the
-        // representative reason to surface when the shortfall is app-only.
-        let mut had_non_rejection_failure = false;
-        let mut first_remote_rejection: Option<Error> = None;
-        let mut fallback_iter = fallback_peers.iter();
+        // Tally the *cause* of each failure. The store AIMD limiter must only be
+        // pushed down by a transport shortfall (V2-468): a node that responds —
+        // a structured `RemotePut` decline, or `PaymentRequired` surfacing as
+        // `Error::Payment` — declined at the application layer and is not
+        // evidence the client is sending too fast. The per-cause counts also
+        // surface a legible aggregate reason; hold the first application-level
+        // rejection as the representative error.
+        let mut full = 0usize;
+        let mut price_floor = 0usize;
+        let mut other_remote = 0usize;
+        let mut transport = 0usize;
+        let mut first_app_rejection: Option<Error> = None;
 
         while let Some((peer_id, result)) = put_futures.next().await {
             match result {
@@ -316,14 +423,25 @@ impl Client {
                 Err(e) => {
                     warn!("Failed to store chunk on {peer_id}: {e}");
                     failures.push(format!("{peer_id}: {e}"));
-                    if matches!(e, Error::RemotePut { .. }) {
-                        if first_remote_rejection.is_none() {
-                            first_remote_rejection = Some(e);
-                        }
-                    } else {
-                        had_non_rejection_failure = true;
+                    match classify_put_failure(&e) {
+                        PutRejection::Full => full += 1,
+                        PutRejection::PriceFloor => price_floor += 1,
+                        PutRejection::OtherRemote => other_remote += 1,
+                        PutRejection::Transport => transport += 1,
+                    }
+                    // An application-level decline is `RemotePut` (a structured
+                    // node rejection) or `Error::Payment` (`PaymentRequired`):
+                    // capture the first so an all-application shortfall surfaces
+                    // as `ApplicationError`, not `InsufficientPeers`
+                    // (`NetworkError`), and never suppresses the limiter.
+                    if matches!(e, Error::RemotePut { .. } | Error::Payment(_))
+                        && first_app_rejection.is_none()
+                    {
+                        first_app_rejection = Some(e);
                     }
 
+                    // Advance to the next peer in the put-target set, reusing
+                    // the same proof.
                     if let Some((fb_peer, fb_addrs)) = fallback_iter.next() {
                         debug!(
                             "Falling back to peer {fb_peer} for chunk {}",
@@ -332,46 +450,43 @@ impl Client {
                         put_futures.push(self.spawn_chunk_put(
                             content.clone(),
                             proof.clone(),
-                            fb_peer,
-                            fb_addrs,
+                            *fb_peer,
+                            fb_addrs.clone(),
                         ));
                     }
                 }
             }
         }
 
-        // Quorum not reached. If the only failures were structured remote
-        // rejections, surface a representative `RemotePut` (classifies
-        // `ApplicationError`, still recoverable in the merkle retry path)
-        // so the shortfall doesn't suppress the store limiter. Otherwise
-        // it's a real capacity shortfall.
-        if !had_non_rejection_failure {
-            if let Some(remote_rejection) = first_remote_rejection {
-                return Err(remote_rejection);
-            }
-        }
-
-        Err(Error::InsufficientPeers(format!(
-            "Stored on {success_count} peers, need {CLOSE_GROUP_MAJORITY}. Failures: [{}]",
+        // Quorum not reached. An application-only shortfall surfaces the
+        // representative app error (so it doesn't suppress the limiter); a
+        // shortfall with any transport failure is a real capacity signal.
+        let aggregate = format!(
+            "Stored on {success_count} peers, need {CLOSE_GROUP_MAJORITY} \
+             (full: {full}, price-floor: {price_floor}, other-rejection: {other_remote}, \
+             transport: {transport}). Failures: [{}]",
             failures.join("; ")
-        )))
+        );
+        Err(put_shortfall_error(
+            transport,
+            first_app_rejection,
+            aggregate,
+        ))
     }
 
-    /// Spawn a chunk PUT future for a single peer.
-    fn spawn_chunk_put<'a>(
-        &'a self,
+    /// Build a chunk PUT future for a single peer. Takes owned peer data so
+    /// the future can outlive a fallback queue entry popped per iteration.
+    async fn spawn_chunk_put(
+        &self,
         content: Bytes,
         proof: Vec<u8>,
-        peer_id: &'a PeerId,
-        addrs: &'a [MultiAddr],
-    ) -> impl Future<Output = (PeerId, Result<XorName>)> + 'a {
-        let peer_id_owned = *peer_id;
-        async move {
-            let result = self
-                .chunk_put_with_proof(content, proof, &peer_id_owned, addrs)
-                .await;
-            (peer_id_owned, result)
-        }
+        peer_id: PeerId,
+        addrs: Vec<MultiAddr>,
+    ) -> (PeerId, Result<XorName>) {
+        let result = self
+            .chunk_put_with_proof(content, proof, &peer_id, &addrs)
+            .await;
+        (peer_id, result)
     }
 
     /// Store a chunk on the Autonomi network with a pre-built payment proof.
@@ -518,7 +633,7 @@ impl Client {
         let addr_hex = hex::encode(address);
 
         // First attempt against the current close-group view. A
-        // lookup/transport error here (e.g. close_group_peers' DHT walk
+        // lookup/transport error here (e.g. closest_peers' DHT walk
         // momentarily returning an error, or InsufficientPeers from a
         // thin routing table) is NOT fatal: fall through to the retry
         // path exactly as a non-authoritative miss would. Otherwise one
@@ -914,6 +1029,62 @@ mod tests {
     const TEST_XORNAME_BYTE_LEN: usize = 32;
     /// Last byte position in the test XOR distance arrays.
     const TEST_DISTANCE_TAIL_INDEX: usize = TEST_XORNAME_BYTE_LEN - 1;
+
+    #[test]
+    fn classify_put_failure_maps_remote_and_transport_reasons() {
+        let remote = |source| Error::RemotePut {
+            address: "test-addr".to_string(),
+            source,
+        };
+        assert!(matches!(
+            classify_put_failure(&remote(ProtocolError::StorageFailed("full".to_string()))),
+            PutRejection::Full
+        ));
+        assert!(matches!(
+            classify_put_failure(&remote(ProtocolError::PaymentFailed(
+                "below floor".to_string()
+            ))),
+            PutRejection::PriceFloor
+        ));
+        assert!(matches!(
+            classify_put_failure(&remote(ProtocolError::Internal("boom".to_string()))),
+            PutRejection::OtherRemote
+        ));
+        // A `PaymentRequired` PUT response surfaces as `Error::Payment` and is an
+        // application-level decline, not a transport shortfall (ADR-0002).
+        assert!(matches!(
+            classify_put_failure(&Error::Payment("Payment required: more".to_string())),
+            PutRejection::PriceFloor
+        ));
+        assert!(matches!(
+            classify_put_failure(&Error::Timeout("no response".to_string())),
+            PutRejection::Transport
+        ));
+    }
+
+    #[test]
+    fn put_shortfall_surfaces_app_error_only_without_transport_failure() {
+        let app = || Error::Payment("Payment required: more".to_string());
+        let msg = || "shortfall".to_string();
+
+        // Every failure was an application-level decline (e.g. all peers asked
+        // for more payment): surface the app error so the limiter isn't driven
+        // down as a false capacity signal (ADR-0002 / V2-468).
+        assert!(matches!(
+            put_shortfall_error(0, Some(app()), msg()),
+            Error::Payment(_)
+        ));
+        // A transport failure in the mix: a genuine capacity shortfall.
+        assert!(matches!(
+            put_shortfall_error(1, Some(app()), msg()),
+            Error::InsufficientPeers(_)
+        ));
+        // No application rejection captured at all (pure transport): capacity.
+        assert!(matches!(
+            put_shortfall_error(0, None, msg()),
+            Error::InsufficientPeers(_)
+        ));
+    }
 
     fn chunk_peer_get_result(peer_seed: u8, distance_tail: u8) -> ChunkPeerGetResult {
         let mut xor_distance = [0; TEST_XORNAME_BYTE_LEN];
