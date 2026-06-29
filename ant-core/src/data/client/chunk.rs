@@ -35,7 +35,9 @@ enum PutRejection {
     Full,
     /// Payment did not clear the node's local price floor, or the proof's
     /// issuers are not close enough in this peer's view
-    /// (`ProtocolError::PaymentFailed`) — skip this peer, do not re-quote.
+    /// (`ProtocolError::PaymentFailed`), or the node asked for more than was
+    /// paid (`ChunkPutResponse::PaymentRequired` → [`Error::Payment`]) — skip
+    /// this peer, do not re-quote.
     PriceFloor,
     /// Some other structured remote rejection.
     OtherRemote,
@@ -44,7 +46,8 @@ enum PutRejection {
 }
 
 /// Classify a failed single-peer PUT (ADR-0002). A `RemotePut` carries the
-/// node's structured `ProtocolError`; anything else is a transport failure.
+/// node's structured `ProtocolError`; a `PaymentRequired` response surfaces as
+/// [`Error::Payment`]; anything else is a transport failure.
 fn classify_put_failure(error: &Error) -> PutRejection {
     match error {
         Error::RemotePut { source, .. } => match source {
@@ -52,6 +55,12 @@ fn classify_put_failure(error: &Error) -> PutRejection {
             ProtocolError::PaymentFailed(_) => PutRejection::PriceFloor,
             _ => PutRejection::OtherRemote,
         },
+        // A `PaymentRequired` PUT response (the node wants more than was paid)
+        // arrives as `Error::Payment`. It is a structured application-level
+        // decline — skip the peer and advance fallback, exactly like a
+        // price-floor `PaymentFailed` — not a transport shortfall, so it must
+        // not push the store AIMD limiter down (ADR-0002 / V2-468).
+        Error::Payment(_) => PutRejection::PriceFloor,
         _ => PutRejection::Transport,
     }
 }
@@ -1012,6 +1021,12 @@ mod tests {
         assert!(matches!(
             classify_put_failure(&remote(ProtocolError::Internal("boom".to_string()))),
             PutRejection::OtherRemote
+        ));
+        // A `PaymentRequired` PUT response surfaces as `Error::Payment` and is an
+        // application-level decline, not a transport shortfall (ADR-0002).
+        assert!(matches!(
+            classify_put_failure(&Error::Payment("Payment required: more".to_string())),
+            PutRejection::PriceFloor
         ));
         assert!(matches!(
             classify_put_failure(&Error::Timeout("no response".to_string())),
