@@ -1455,6 +1455,116 @@ mod tests {
         );
     }
 
+    /// Ascending seeds `1..=count`, each a valid `u8` peer seed.
+    fn ascending_seeds(count: usize) -> Vec<u8> {
+        (1..=count)
+            .map(|n| u8::try_from(n).expect("test seed fits in u8"))
+            .collect()
+    }
+
+    #[test]
+    fn scope_witnessed_to_close_group_matches_native_close_group_query() {
+        // How many of the closest-`CLOSE_GROUP_SIZE` responders returned a view.
+        // The remainder are "missing", so the scoped transcript also exercises
+        // the missing-views quorum adjustment.
+        const RESPONDED_IN_SCOPE: usize = 5;
+        // Responders past the close group whose views scoping must drop.
+        const OUT_OF_SCOPE_RESPONDERS: usize = 2;
+
+        let address = [0u8; 32];
+        let close_seeds = ascending_seeds(CLOSE_GROUP_SIZE);
+        // Each view's closest list mixes in-group (1, 2) and far (8, 9) peers so
+        // candidate selection is non-trivial and must survive scoping verbatim.
+        let view_closest = [1, 2, 8, 9];
+        let in_scope_views = || -> Vec<ResponderView> {
+            ascending_seeds(RESPONDED_IN_SCOPE)
+                .into_iter()
+                .map(|responder| witnessed_test_view(responder, &view_closest))
+                .collect()
+        };
+
+        // A wide PUT_TARGET_WIDTH-peer transcript, ordered closest-first (seed n
+        // == PeerId [n; 32], whose XOR distance to the zero address is n). Two
+        // responders past the close group (out of scope) must be dropped.
+        let mut wide_views = in_scope_views();
+        for offset in 1..=OUT_OF_SCOPE_RESPONDERS {
+            let responder =
+                u8::try_from(CLOSE_GROUP_SIZE + offset).expect("out-of-scope seed fits in u8");
+            wide_views.push(witnessed_test_view(responder, &[1, 2, 3]));
+        }
+        let wide = WitnessedCloseGroup {
+            target: address,
+            k: PUT_TARGET_WIDTH,
+            initial_closest: witnessed_test_nodes(&ascending_seeds(PUT_TARGET_WIDTH)),
+            responder_views: wide_views,
+        };
+
+        // The hand-built equivalent: a native CLOSE_GROUP_SIZE-wide query with
+        // the same in-scope responders.
+        let native = WitnessedCloseGroup {
+            target: address,
+            k: CLOSE_GROUP_SIZE,
+            initial_closest: witnessed_test_nodes(&close_seeds),
+            responder_views: in_scope_views(),
+        };
+
+        let scoped = scope_witnessed_to_close_group(&wide);
+
+        // Target preserved; k and the initial set collapse to the close group.
+        assert_eq!(scoped.target, wide.target);
+        assert_eq!(scoped.k, CLOSE_GROUP_SIZE);
+        assert_eq!(
+            scoped
+                .initial_closest
+                .iter()
+                .map(|node| node.peer_id.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            close_seeds,
+            "initial set must be the closest CLOSE_GROUP_SIZE, in order"
+        );
+
+        // Out-of-close-group responder views are dropped; the in-scope ones keep
+        // their closest lists untouched (scoping filters by responder only).
+        assert_eq!(
+            scoped
+                .responder_views
+                .iter()
+                .map(|view| view.responder.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            ascending_seeds(RESPONDED_IN_SCOPE),
+            "only responders inside the close group survive"
+        );
+        assert_eq!(
+            scoped.responder_views[0]
+                .closest
+                .iter()
+                .map(|node| node.peer_id.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            view_closest.to_vec(),
+            "a surviving view's closest set must be preserved verbatim"
+        );
+
+        // The quorum math and candidate consensus run on the close group only
+        // and are byte-for-byte identical to the native CLOSE_GROUP_SIZE query.
+        assert_eq!(
+            missing_witnessed_responder_views(&scoped),
+            missing_witnessed_responder_views(&native),
+        );
+        let quorum = witnessed_close_group_quorum_for_transcript(&scoped);
+        assert_eq!(quorum, witnessed_close_group_quorum_for_transcript(&native));
+        let candidate_seeds = |group: &WitnessedCloseGroup| {
+            witnessed_consensus_candidates(group, &address, quorum)
+                .iter()
+                .map(|candidate| candidate.node.peer_id.as_bytes()[0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            candidate_seeds(&scoped),
+            candidate_seeds(&native),
+            "scoped consensus must match a native close-group query"
+        );
+    }
+
     #[test]
     fn witnessed_quote_peers_error_is_typed_and_pre_payment_when_consensus_is_short() {
         let address = [0u8; 32];
