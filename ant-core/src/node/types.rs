@@ -87,8 +87,6 @@ pub struct NodeConfig {
     #[schema(value_type = Option<String>)]
     pub log_dir: Option<PathBuf>,
     pub node_port: Option<u16>,
-    pub metrics_port: Option<u16>,
-    pub network_id: Option<u32>,
     #[schema(value_type = String)]
     pub binary_path: PathBuf,
     pub version: String,
@@ -97,6 +95,9 @@ pub struct NodeConfig {
     /// Release channel to track for automatic upgrades. `None` lets the node use its own default.
     #[serde(default)]
     pub upgrade_channel: Option<UpgradeChannel>,
+    /// EVM network the node uses for storage payments.
+    #[serde(default)]
+    pub evm_network: EvmNetwork,
 }
 
 /// Runtime information for a running node (held in daemon memory only).
@@ -180,6 +181,41 @@ impl fmt::Display for UpgradeChannel {
     }
 }
 
+/// EVM network the node uses for storage payments.
+///
+/// Maps onto the value of `ant-node`'s `--evm-network` flag. Defaults to Arbitrum One (mainnet).
+///
+/// JSON serialization is kebab-case (`"arbitrum-one"`, `"arbitrum-sepolia"`) so REST API callers
+/// use the same values as the CLI and the spawned `ant-node --evm-network` flag. The snake_case
+/// aliases keep older registries (written before this was kebab-cased) loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvmNetwork {
+    /// Arbitrum One (mainnet).
+    #[default]
+    #[serde(alias = "arbitrum_one")]
+    ArbitrumOne,
+    /// Arbitrum Sepolia testnet.
+    #[serde(alias = "arbitrum_sepolia")]
+    ArbitrumSepolia,
+}
+
+impl EvmNetwork {
+    /// The value passed to `ant-node`'s `--evm-network` flag.
+    pub fn as_arg(&self) -> &'static str {
+        match self {
+            Self::ArbitrumOne => "arbitrum-one",
+            Self::ArbitrumSepolia => "arbitrum-sepolia",
+        }
+    }
+}
+
+impl fmt::Display for EvmNetwork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_arg())
+    }
+}
+
 /// A single port or a range of ports.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
@@ -228,16 +264,12 @@ pub struct AddNodeOpts {
     pub rewards_address: String,
     /// Port or port range for node(s).
     pub node_port: Option<PortRange>,
-    /// Metrics port or range.
-    pub metrics_port: Option<PortRange>,
     /// Custom data directory prefix.
     #[schema(value_type = Option<String>)]
     pub data_dir_path: Option<PathBuf>,
     /// Custom log directory prefix.
     #[schema(value_type = Option<String>)]
     pub log_dir_path: Option<PathBuf>,
-    /// Network ID. Default: 1 (mainnet).
-    pub network_id: u32,
     /// Source for the node binary.
     pub binary_source: BinarySource,
     /// Bootstrap peer(s).
@@ -246,6 +278,12 @@ pub struct AddNodeOpts {
     pub env_variables: Vec<(String, String)>,
     /// Release channel to track for automatic upgrades. `None` lets the node use its own default.
     pub upgrade_channel: Option<UpgradeChannel>,
+    /// EVM network the node uses for storage payments. Default: Arbitrum One (mainnet).
+    ///
+    /// `#[serde(default)]` keeps pre-`evm_network` REST request bodies deserializing (they fall
+    /// back to mainnet) rather than failing with `missing field evm_network`.
+    #[serde(default)]
+    pub evm_network: EvmNetwork,
 }
 
 impl Default for AddNodeOpts {
@@ -254,14 +292,13 @@ impl Default for AddNodeOpts {
             count: 1,
             rewards_address: String::new(),
             node_port: None,
-            metrics_port: None,
             data_dir_path: None,
             log_dir_path: None,
-            network_id: 1,
             binary_source: BinarySource::default(),
             bootstrap_peers: Vec::new(),
             env_variables: Vec::new(),
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         }
     }
 }
@@ -506,7 +543,6 @@ mod tests {
     fn add_node_opts_default() {
         let opts = AddNodeOpts::default();
         assert_eq!(opts.count, 1);
-        assert_eq!(opts.network_id, 1);
         assert!(matches!(opts.binary_source, BinarySource::Latest));
     }
 
@@ -613,5 +649,56 @@ mod tests {
         let json = serde_json::to_string(&stopped).unwrap();
         assert!(json.contains("\"node_id\":1"));
         assert!(json.contains("\"service_name\":\"node1\""));
+    }
+
+    #[test]
+    fn evm_network_serializes_kebab_case() {
+        // REST/registry JSON must use the same kebab-case values as the CLI.
+        assert_eq!(
+            serde_json::to_string(&EvmNetwork::ArbitrumOne).unwrap(),
+            "\"arbitrum-one\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EvmNetwork::ArbitrumSepolia).unwrap(),
+            "\"arbitrum-sepolia\""
+        );
+    }
+
+    #[test]
+    fn evm_network_deserializes_kebab_and_legacy_snake_case() {
+        assert_eq!(
+            serde_json::from_str::<EvmNetwork>("\"arbitrum-sepolia\"").unwrap(),
+            EvmNetwork::ArbitrumSepolia
+        );
+        // Older registries persisted snake_case; the aliases keep them loading.
+        assert_eq!(
+            serde_json::from_str::<EvmNetwork>("\"arbitrum_one\"").unwrap(),
+            EvmNetwork::ArbitrumOne
+        );
+        assert_eq!(
+            serde_json::from_str::<EvmNetwork>("\"arbitrum_sepolia\"").unwrap(),
+            EvmNetwork::ArbitrumSepolia
+        );
+    }
+
+    #[test]
+    fn add_node_opts_defaults_evm_network_when_omitted() {
+        // A pre-evm_network REST request body must still deserialize, falling back to mainnet
+        // rather than failing with `missing field evm_network`.
+        let legacy = r#"{
+            "count": 1,
+            "rewards_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "node_port": null,
+            "metrics_port": null,
+            "data_dir_path": null,
+            "log_dir_path": null,
+            "network_id": 1,
+            "binary_source": { "type": "latest" },
+            "bootstrap_peers": [],
+            "env_variables": [],
+            "upgrade_channel": null
+        }"#;
+        let opts: AddNodeOpts = serde_json::from_str(legacy).unwrap();
+        assert_eq!(opts.evm_network, EvmNetwork::ArbitrumOne);
     }
 }

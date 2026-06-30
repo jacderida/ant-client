@@ -36,7 +36,6 @@ async fn add_nodes_creates_registry_and_directories() {
         count: 2,
         rewards_address: TEST_ADDR.to_string(),
         node_port: Some(PortRange::Range(12000, 12001)),
-        metrics_port: Some(PortRange::Range(13000, 13001)),
         data_dir_path: Some(tmp.path().join("data")),
         log_dir_path: Some(tmp.path().join("logs")),
         binary_source: BinarySource::LocalPath(binary),
@@ -57,8 +56,6 @@ async fn add_nodes_creates_registry_and_directories() {
     // Verify ports assigned correctly
     assert_eq!(result.nodes_added[0].node_port, Some(12000));
     assert_eq!(result.nodes_added[1].node_port, Some(12001));
-    assert_eq!(result.nodes_added[0].metrics_port, Some(13000));
-    assert_eq!(result.nodes_added[1].metrics_port, Some(13001));
 
     // Verify directories were created
     for node in &result.nodes_added {

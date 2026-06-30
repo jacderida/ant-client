@@ -852,7 +852,7 @@ async fn reconcile_registry_versions(registry: &mut NodeRegistry) {
 mod tests {
     use super::*;
     use crate::node::registry::NodeRegistry;
-    use crate::node::types::NodeConfig;
+    use crate::node::types::{EvmNetwork, NodeConfig};
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
 
@@ -872,13 +872,12 @@ mod tests {
             data_dir,
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: Some(1),
             binary_path,
             version: version.into(),
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         }
     }
 

@@ -59,15 +59,6 @@ pub async fn add_nodes(
             });
         }
     }
-    if let Some(ref port_range) = opts.metrics_port {
-        let range_len = port_range.len();
-        if range_len != 1 && range_len != opts.count {
-            return Err(Error::PortRangeMismatch {
-                range_len,
-                count: opts.count,
-            });
-        }
-    }
 
     // Resolve the binary (downloads to cache if needed)
     let install_dir = binary::binary_install_dir()?;
@@ -87,7 +78,6 @@ pub async fn add_nodes(
 
     for i in 0..opts.count {
         let node_port = resolve_port(&opts.node_port, i, opts.count);
-        let metrics_port = resolve_port(&opts.metrics_port, i, opts.count);
 
         // We use a placeholder ID (0) here; the registry will assign the real one
         let placeholder_id = 0;
@@ -102,13 +92,12 @@ pub async fn add_nodes(
             data_dir,
             log_dir,
             node_port,
-            metrics_port,
-            network_id: Some(opts.network_id),
             binary_path: PathBuf::new(), // placeholder, updated below
             version: version.clone(),
             env_variables: env_map.clone(),
             bootstrap_peers: opts.bootstrap_peers.clone(),
             upgrade_channel: opts.upgrade_channel,
+            evm_network: opts.evm_network,
         };
 
         let assigned_id = registry.add(config);
@@ -285,7 +274,7 @@ fn resolve_port(range: &Option<types::PortRange>, index: u16, _count: u16) -> Op
 mod tests {
     use super::*;
     use crate::node::binary::NoopProgress;
-    use crate::node::types::{BinarySource, PortRange};
+    use crate::node::types::{BinarySource, EvmNetwork, PortRange};
 
     /// A valid Ethereum address for use in tests.
     const TEST_ADDR: &str = "0x1234567890abcdef1234567890abcdef12345678";
@@ -489,13 +478,12 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test"),
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: None,
             binary_path: PathBuf::from("/usr/bin/antnode"),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         });
         registry.save().unwrap();
         drop(_lock);
@@ -574,13 +562,12 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test1"),
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: None,
             binary_path: PathBuf::from("/usr/bin/antnode"),
             version: "0.110.0".to_string(),
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         });
         registry.add(NodeConfig {
             id: 0,
@@ -589,13 +576,12 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test2"),
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: None,
             binary_path: PathBuf::from("/usr/bin/antnode"),
             version: "0.110.0".to_string(),
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         });
         registry.save().unwrap();
         drop(_lock);

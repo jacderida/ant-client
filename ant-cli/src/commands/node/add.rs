@@ -6,7 +6,9 @@ use colored::Colorize;
 use ant_core::node::binary::ProgressReporter;
 use ant_core::node::daemon::client;
 use ant_core::node::types::DaemonConfig;
-use ant_core::node::types::{AddNodeOpts, AddNodeResult, BinarySource, PortRange, UpgradeChannel};
+use ant_core::node::types::{
+    AddNodeOpts, AddNodeResult, BinarySource, EvmNetwork, PortRange, UpgradeChannel,
+};
 
 #[derive(Args)]
 pub struct AddArgs {
@@ -22,10 +24,6 @@ pub struct AddArgs {
     #[arg(long)]
     pub node_port: Option<String>,
 
-    /// Metrics port or range (e.g., 13000 or 13000-13004)
-    #[arg(long)]
-    pub metrics_port: Option<String>,
-
     /// Custom data directory prefix
     #[arg(long)]
     pub data_dir_path: Option<PathBuf>,
@@ -33,10 +31,6 @@ pub struct AddArgs {
     /// Custom log directory prefix
     #[arg(long)]
     pub log_dir_path: Option<PathBuf>,
-
-    /// Network ID (default: 1 for mainnet)
-    #[arg(long, default_value = "1")]
-    pub network_id: u32,
 
     /// Path to a local node binary
     #[arg(long, conflicts_with_all = &["version", "url"])]
@@ -53,6 +47,10 @@ pub struct AddArgs {
     /// Bootstrap peer(s)
     #[arg(long, value_delimiter = ',')]
     pub bootstrap: Vec<String>,
+
+    /// EVM network the node uses for storage payments
+    #[arg(long, value_enum, default_value = "arbitrum-one")]
+    pub evm_network: EvmNetworkArg,
 
     /// Release channel the node tracks for automatic upgrades
     #[arg(long, value_enum)]
@@ -75,6 +73,25 @@ impl From<UpgradeChannelArg> for UpgradeChannel {
         match arg {
             UpgradeChannelArg::Stable => Self::Stable,
             UpgradeChannelArg::Beta => Self::Beta,
+        }
+    }
+}
+
+/// CLI value for the node's EVM network. Mirrors `ant-node`'s `--evm-network` values.
+#[derive(Clone, Copy, Default, clap::ValueEnum)]
+pub enum EvmNetworkArg {
+    /// Arbitrum One (mainnet).
+    #[default]
+    ArbitrumOne,
+    /// Arbitrum Sepolia testnet.
+    ArbitrumSepolia,
+}
+
+impl From<EvmNetworkArg> for EvmNetwork {
+    fn from(arg: EvmNetworkArg) -> Self {
+        match arg {
+            EvmNetworkArg::ArbitrumOne => Self::ArbitrumOne,
+            EvmNetworkArg::ArbitrumSepolia => Self::ArbitrumSepolia,
         }
     }
 }
@@ -120,9 +137,6 @@ impl AddArgs {
                 if let Some(port) = node.node_port {
                     println!("    {} {}", "Port".dimmed(), port.to_string().cyan());
                 }
-                if let Some(port) = node.metrics_port {
-                    println!("    {} {}", "Metrics".dimmed(), port.to_string().cyan());
-                }
                 println!(
                     "    {} {}",
                     "Binary".dimmed(),
@@ -137,7 +151,6 @@ impl AddArgs {
 
     fn to_add_node_opts(&self) -> anyhow::Result<AddNodeOpts> {
         let node_port = self.parse_port_range(&self.node_port)?;
-        let metrics_port = self.parse_port_range(&self.metrics_port)?;
 
         let binary_source = if let Some(ref path) = self.path {
             BinarySource::LocalPath(path.clone())
@@ -166,14 +179,13 @@ impl AddArgs {
             count: self.count,
             rewards_address: self.rewards_address.clone(),
             node_port,
-            metrics_port,
             data_dir_path: self.data_dir_path.clone(),
             log_dir_path: self.log_dir_path.clone(),
-            network_id: self.network_id,
             binary_source,
             bootstrap_peers: self.bootstrap.clone(),
             env_variables,
             upgrade_channel: self.upgrade_channel.map(Into::into),
+            evm_network: self.evm_network.into(),
         })
     }
 
