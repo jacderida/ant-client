@@ -223,12 +223,11 @@ their configuration.
       "data_dir": "/home/user/.local/share/ant/nodes/node-1",
       "log_dir": "/home/user/.local/share/ant/nodes/node-1/logs",
       "node_port": null,
-      "metrics_port": null,
-      "network_id": 1,
       "binary_path": "/home/user/.local/share/ant/bin/antnode",
       "version": "0.110.0",
       "env_variables": {},
-      "bootstrap_peers": []
+      "bootstrap_peers": [],
+      "evm_network": "arbitrum-one"
     }
   },
   "next_id": 2

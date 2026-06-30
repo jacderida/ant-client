@@ -144,8 +144,6 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test"),
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: None,
             binary_path: PathBuf::from("/usr/bin/antnode"),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),

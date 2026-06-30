@@ -310,10 +310,8 @@ If the daemon is running, the command routes through its REST API. Otherwise, it
 | `--rewards-address <ADDR>` | Required. EVM wallet address for node earnings. |
 | `--count <N>` | Number of nodes to add (default: 1). |
 | `--node-port <PORT\|RANGE>` | Port or range (e.g., `12000` or `12000-12004`). |
-| `--metrics-port <PORT\|RANGE>` | Metrics port or range. |
 | `--data-dir-path <PATH>` | Custom data directory prefix. |
 | `--log-dir-path <PATH>` | Custom log directory prefix. |
-| `--network-id <ID>` | Network ID (default: 1 for mainnet). |
 | `--path <PATH>` | Path to a local `antnode` binary. |
 | `--version <X.Y.Z>` | Download a specific version (not yet available). |
 | `--url <URL>` | Download binary from a URL archive (not yet available). |
