@@ -6,7 +6,9 @@ use colored::Colorize;
 use ant_core::node::binary::ProgressReporter;
 use ant_core::node::daemon::client;
 use ant_core::node::types::DaemonConfig;
-use ant_core::node::types::{AddNodeOpts, AddNodeResult, BinarySource, PortRange, UpgradeChannel};
+use ant_core::node::types::{
+    AddNodeOpts, AddNodeResult, BinarySource, EvmNetwork, PortRange, UpgradeChannel,
+};
 
 #[derive(Args)]
 pub struct AddArgs {
@@ -54,6 +56,10 @@ pub struct AddArgs {
     #[arg(long, value_delimiter = ',')]
     pub bootstrap: Vec<String>,
 
+    /// EVM network the node uses for storage payments
+    #[arg(long, value_enum, default_value = "arbitrum-one")]
+    pub evm_network: EvmNetworkArg,
+
     /// Release channel the node tracks for automatic upgrades
     #[arg(long, value_enum)]
     pub upgrade_channel: Option<UpgradeChannelArg>,
@@ -75,6 +81,25 @@ impl From<UpgradeChannelArg> for UpgradeChannel {
         match arg {
             UpgradeChannelArg::Stable => Self::Stable,
             UpgradeChannelArg::Beta => Self::Beta,
+        }
+    }
+}
+
+/// CLI value for the node's EVM network. Mirrors `ant-node`'s `--evm-network` values.
+#[derive(Clone, Copy, Default, clap::ValueEnum)]
+pub enum EvmNetworkArg {
+    /// Arbitrum One (mainnet).
+    #[default]
+    ArbitrumOne,
+    /// Arbitrum Sepolia testnet.
+    ArbitrumSepolia,
+}
+
+impl From<EvmNetworkArg> for EvmNetwork {
+    fn from(arg: EvmNetworkArg) -> Self {
+        match arg {
+            EvmNetworkArg::ArbitrumOne => Self::ArbitrumOne,
+            EvmNetworkArg::ArbitrumSepolia => Self::ArbitrumSepolia,
         }
     }
 }
@@ -174,6 +199,7 @@ impl AddArgs {
             bootstrap_peers: self.bootstrap.clone(),
             env_variables,
             upgrade_channel: self.upgrade_channel.map(Into::into),
+            evm_network: self.evm_network.into(),
         })
     }
 

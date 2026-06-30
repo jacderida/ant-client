@@ -109,6 +109,7 @@ pub async fn add_nodes(
             env_variables: env_map.clone(),
             bootstrap_peers: opts.bootstrap_peers.clone(),
             upgrade_channel: opts.upgrade_channel,
+            evm_network: opts.evm_network,
         };
 
         let assigned_id = registry.add(config);
@@ -285,7 +286,7 @@ fn resolve_port(range: &Option<types::PortRange>, index: u16, _count: u16) -> Op
 mod tests {
     use super::*;
     use crate::node::binary::NoopProgress;
-    use crate::node::types::{BinarySource, PortRange};
+    use crate::node::types::{BinarySource, EvmNetwork, PortRange};
 
     /// A valid Ethereum address for use in tests.
     const TEST_ADDR: &str = "0x1234567890abcdef1234567890abcdef12345678";
@@ -496,6 +497,7 @@ mod tests {
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         });
         registry.save().unwrap();
         drop(_lock);
@@ -581,6 +583,7 @@ mod tests {
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         });
         registry.add(NodeConfig {
             id: 0,
@@ -596,6 +599,7 @@ mod tests {
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         });
         registry.save().unwrap();
         drop(_lock);

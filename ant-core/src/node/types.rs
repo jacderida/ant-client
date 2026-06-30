@@ -97,6 +97,9 @@ pub struct NodeConfig {
     /// Release channel to track for automatic upgrades. `None` lets the node use its own default.
     #[serde(default)]
     pub upgrade_channel: Option<UpgradeChannel>,
+    /// EVM network the node uses for storage payments.
+    #[serde(default)]
+    pub evm_network: EvmNetwork,
 }
 
 /// Runtime information for a running node (held in daemon memory only).
@@ -180,6 +183,35 @@ impl fmt::Display for UpgradeChannel {
     }
 }
 
+/// EVM network the node uses for storage payments.
+///
+/// Maps onto the value of `ant-node`'s `--evm-network` flag. Defaults to Arbitrum One (mainnet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EvmNetwork {
+    /// Arbitrum One (mainnet).
+    #[default]
+    ArbitrumOne,
+    /// Arbitrum Sepolia testnet.
+    ArbitrumSepolia,
+}
+
+impl EvmNetwork {
+    /// The value passed to `ant-node`'s `--evm-network` flag.
+    pub fn as_arg(&self) -> &'static str {
+        match self {
+            Self::ArbitrumOne => "arbitrum-one",
+            Self::ArbitrumSepolia => "arbitrum-sepolia",
+        }
+    }
+}
+
+impl fmt::Display for EvmNetwork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_arg())
+    }
+}
+
 /// A single port or a range of ports.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
@@ -246,6 +278,8 @@ pub struct AddNodeOpts {
     pub env_variables: Vec<(String, String)>,
     /// Release channel to track for automatic upgrades. `None` lets the node use its own default.
     pub upgrade_channel: Option<UpgradeChannel>,
+    /// EVM network the node uses for storage payments. Default: Arbitrum One (mainnet).
+    pub evm_network: EvmNetwork,
 }
 
 impl Default for AddNodeOpts {
@@ -262,6 +296,7 @@ impl Default for AddNodeOpts {
             bootstrap_peers: Vec::new(),
             env_variables: Vec::new(),
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         }
     }
 }

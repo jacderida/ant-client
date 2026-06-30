@@ -132,6 +132,7 @@ impl NodeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::types::EvmNetwork;
     use std::collections::HashMap;
     use tempfile::NamedTempFile;
 
@@ -150,6 +151,7 @@ mod tests {
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         }
     }
 
