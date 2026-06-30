@@ -87,8 +87,6 @@ pub struct NodeConfig {
     #[schema(value_type = Option<String>)]
     pub log_dir: Option<PathBuf>,
     pub node_port: Option<u16>,
-    pub metrics_port: Option<u16>,
-    pub network_id: Option<u32>,
     #[schema(value_type = String)]
     pub binary_path: PathBuf,
     pub version: String,
@@ -260,16 +258,12 @@ pub struct AddNodeOpts {
     pub rewards_address: String,
     /// Port or port range for node(s).
     pub node_port: Option<PortRange>,
-    /// Metrics port or range.
-    pub metrics_port: Option<PortRange>,
     /// Custom data directory prefix.
     #[schema(value_type = Option<String>)]
     pub data_dir_path: Option<PathBuf>,
     /// Custom log directory prefix.
     #[schema(value_type = Option<String>)]
     pub log_dir_path: Option<PathBuf>,
-    /// Network ID. Default: 1 (mainnet).
-    pub network_id: u32,
     /// Source for the node binary.
     pub binary_source: BinarySource,
     /// Bootstrap peer(s).
@@ -288,10 +282,8 @@ impl Default for AddNodeOpts {
             count: 1,
             rewards_address: String::new(),
             node_port: None,
-            metrics_port: None,
             data_dir_path: None,
             log_dir_path: None,
-            network_id: 1,
             binary_source: BinarySource::default(),
             bootstrap_peers: Vec::new(),
             env_variables: Vec::new(),
@@ -541,7 +533,6 @@ mod tests {
     fn add_node_opts_default() {
         let opts = AddNodeOpts::default();
         assert_eq!(opts.count, 1);
-        assert_eq!(opts.network_id, 1);
         assert!(matches!(opts.binary_source, BinarySource::Latest));
     }
 

@@ -872,8 +872,6 @@ mod tests {
             data_dir,
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: Some(1),
             binary_path,
             version: version.into(),
             env_variables: HashMap::new(),

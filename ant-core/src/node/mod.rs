@@ -59,15 +59,6 @@ pub async fn add_nodes(
             });
         }
     }
-    if let Some(ref port_range) = opts.metrics_port {
-        let range_len = port_range.len();
-        if range_len != 1 && range_len != opts.count {
-            return Err(Error::PortRangeMismatch {
-                range_len,
-                count: opts.count,
-            });
-        }
-    }
 
     // Resolve the binary (downloads to cache if needed)
     let install_dir = binary::binary_install_dir()?;
@@ -87,7 +78,6 @@ pub async fn add_nodes(
 
     for i in 0..opts.count {
         let node_port = resolve_port(&opts.node_port, i, opts.count);
-        let metrics_port = resolve_port(&opts.metrics_port, i, opts.count);
 
         // We use a placeholder ID (0) here; the registry will assign the real one
         let placeholder_id = 0;
@@ -102,8 +92,6 @@ pub async fn add_nodes(
             data_dir,
             log_dir,
             node_port,
-            metrics_port,
-            network_id: Some(opts.network_id),
             binary_path: PathBuf::new(), // placeholder, updated below
             version: version.clone(),
             env_variables: env_map.clone(),
@@ -490,8 +478,6 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test"),
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: None,
             binary_path: PathBuf::from("/usr/bin/antnode"),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
@@ -576,8 +562,6 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test1"),
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: None,
             binary_path: PathBuf::from("/usr/bin/antnode"),
             version: "0.110.0".to_string(),
             env_variables: HashMap::new(),
@@ -592,8 +576,6 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test2"),
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: None,
             binary_path: PathBuf::from("/usr/bin/antnode"),
             version: "0.110.0".to_string(),
             env_variables: HashMap::new(),

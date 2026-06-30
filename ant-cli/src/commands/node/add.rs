@@ -24,10 +24,6 @@ pub struct AddArgs {
     #[arg(long)]
     pub node_port: Option<String>,
 
-    /// Metrics port or range (e.g., 13000 or 13000-13004)
-    #[arg(long)]
-    pub metrics_port: Option<String>,
-
     /// Custom data directory prefix
     #[arg(long)]
     pub data_dir_path: Option<PathBuf>,
@@ -35,10 +31,6 @@ pub struct AddArgs {
     /// Custom log directory prefix
     #[arg(long)]
     pub log_dir_path: Option<PathBuf>,
-
-    /// Network ID (default: 1 for mainnet)
-    #[arg(long, default_value = "1")]
-    pub network_id: u32,
 
     /// Path to a local node binary
     #[arg(long, conflicts_with_all = &["version", "url"])]
@@ -145,9 +137,6 @@ impl AddArgs {
                 if let Some(port) = node.node_port {
                     println!("    {} {}", "Port".dimmed(), port.to_string().cyan());
                 }
-                if let Some(port) = node.metrics_port {
-                    println!("    {} {}", "Metrics".dimmed(), port.to_string().cyan());
-                }
                 println!(
                     "    {} {}",
                     "Binary".dimmed(),
@@ -162,7 +151,6 @@ impl AddArgs {
 
     fn to_add_node_opts(&self) -> anyhow::Result<AddNodeOpts> {
         let node_port = self.parse_port_range(&self.node_port)?;
-        let metrics_port = self.parse_port_range(&self.metrics_port)?;
 
         let binary_source = if let Some(ref path) = self.path {
             BinarySource::LocalPath(path.clone())
@@ -191,10 +179,8 @@ impl AddArgs {
             count: self.count,
             rewards_address: self.rewards_address.clone(),
             node_port,
-            metrics_port,
             data_dir_path: self.data_dir_path.clone(),
             log_dir_path: self.log_dir_path.clone(),
-            network_id: self.network_id,
             binary_source,
             bootstrap_peers: self.bootstrap.clone(),
             env_variables,

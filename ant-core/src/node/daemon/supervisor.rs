@@ -707,11 +707,6 @@ pub fn build_node_args(config: &NodeConfig) -> Vec<String> {
         args.push(port.to_string());
     }
 
-    if let Some(port) = config.metrics_port {
-        args.push("--metrics-port".to_string());
-        args.push(port.to_string());
-    }
-
     for peer in &config.bootstrap_peers {
         args.push("--bootstrap".to_string());
         args.push(peer.clone());
@@ -1295,8 +1290,6 @@ mod tests {
             data_dir: "/data/node-1".into(),
             log_dir: Some("/logs/node-1".into()),
             node_port: Some(12000),
-            metrics_port: Some(13000),
-            network_id: Some(1),
             binary_path: "/bin/node".into(),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
@@ -1316,8 +1309,6 @@ mod tests {
         assert!(args.contains(&"/logs/node-1".to_string()));
         assert!(args.contains(&"--port".to_string()));
         assert!(args.contains(&"12000".to_string()));
-        assert!(args.contains(&"--metrics-port".to_string()));
-        assert!(args.contains(&"13000".to_string()));
         assert!(args.contains(&"--bootstrap".to_string()));
         assert!(args.contains(&"peer1".to_string()));
         assert!(args.contains(&"peer2".to_string()));
@@ -1343,8 +1334,6 @@ mod tests {
             data_dir: "/data/node-1".into(),
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: None,
             binary_path: "/bin/node".into(),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
@@ -1370,8 +1359,6 @@ mod tests {
             data_dir: "/data/node-1".into(),
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: None,
             binary_path: "/bin/node".into(),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
@@ -1402,8 +1389,6 @@ mod tests {
             data_dir: "/data/node-1".into(),
             log_dir: None,
             node_port: None,
-            metrics_port: None,
-            network_id: None,
             binary_path: "/bin/node".into(),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
@@ -1419,7 +1404,6 @@ mod tests {
         assert!(!args.contains(&"--enable-logging".to_string()));
         assert!(!args.contains(&"--log-dir".to_string()));
         assert!(!args.contains(&"--port".to_string()));
-        assert!(!args.contains(&"--metrics-port".to_string()));
         assert!(!args.contains(&"--bootstrap".to_string()));
         assert!(args.contains(&"--stop-on-upgrade".to_string()));
     }
