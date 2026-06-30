@@ -318,6 +318,7 @@ If the daemon is running, the command routes through its REST API. Otherwise, it
 | `--version <X.Y.Z>` | Download a specific version (not yet available). |
 | `--url <URL>` | Download binary from a URL archive (not yet available). |
 | `--bootstrap <IP:PORT>` | Bootstrap peer(s), comma-separated. |
+| `--evm-network <NET>` | EVM network for storage payments: `arbitrum-one` (default) or `arbitrum-sepolia`. |
 | `--env <K=V>` | Environment variables, comma-separated. |
 
 #### `ant node start`

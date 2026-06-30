@@ -109,10 +109,11 @@ Re-run `ant node daemon info --json` and update the saved `api_base` URL (the po
 **Step 6.1 — Add nodes:**
 
 ```
-ant node add --rewards-address 0x03B770D9cD32077cC0bF330c13C114a87643B124 --count 3 --bootstrap <bootstrap-address> --json
+ant node add --rewards-address 0x03B770D9cD32077cC0bF330c13C114a87643B124 --count 3 --bootstrap <bootstrap-address> --evm-network arbitrum-sepolia --json
 ```
 
-Verify the JSON response shows 3 nodes were added (the `nodes_added` array has 3 entries).
+Verify the JSON response shows 3 nodes were added (the `nodes_added` array has 3 entries) and
+that each node reports `"evm_network": "arbitrum_sepolia"`.
 
 **Step 6.2 — Start all nodes:**
 

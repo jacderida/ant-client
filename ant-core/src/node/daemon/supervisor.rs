@@ -728,6 +728,11 @@ pub fn build_node_args(config: &NodeConfig) -> Vec<String> {
     // the parent's graceful shutdown and the grandchild fails to bind.
     args.push("--stop-on-upgrade".to_string());
 
+    // Always emit the EVM network so the node's payment network is explicit rather than relying on
+    // the binary's built-in default.
+    args.push("--evm-network".to_string());
+    args.push(config.evm_network.as_arg().to_string());
+
     args
 }
 
@@ -1240,7 +1245,7 @@ fn is_process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::types::UpgradeChannel;
+    use crate::node::types::{EvmNetwork, UpgradeChannel};
 
     #[test]
     fn adopted_flag_lifecycle() {
@@ -1297,6 +1302,7 @@ mod tests {
             env_variables: HashMap::new(),
             bootstrap_peers: vec!["peer1".to_string(), "peer2".to_string()],
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         };
 
         let args = build_node_args(&config);
@@ -1318,6 +1324,41 @@ mod tests {
         assert!(args.contains(&"--stop-on-upgrade".to_string()));
         // No upgrade channel configured -> no --upgrade-channel argument.
         assert!(!args.contains(&"--upgrade-channel".to_string()));
+        // EVM network defaults to Arbitrum One, emitted as a --evm-network flag.
+        assert_eq!(evm_network_arg(&args), Some("arbitrum-one"));
+    }
+
+    /// Return the value following `--evm-network` in a built arg list, if present.
+    fn evm_network_arg(args: &[String]) -> Option<&str> {
+        let idx = args.iter().position(|a| a == "--evm-network")?;
+        args.get(idx + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn build_node_args_emits_evm_network_flag() {
+        let mut config = NodeConfig {
+            id: 1,
+            service_name: "node1".to_string(),
+            rewards_address: "0xabc".to_string(),
+            data_dir: "/data/node-1".into(),
+            log_dir: None,
+            node_port: None,
+            metrics_port: None,
+            network_id: None,
+            binary_path: "/bin/node".into(),
+            version: "0.1.0".to_string(),
+            env_variables: HashMap::new(),
+            bootstrap_peers: vec![],
+            upgrade_channel: None,
+            evm_network: EvmNetwork::ArbitrumSepolia,
+        };
+
+        let args = build_node_args(&config);
+        assert_eq!(evm_network_arg(&args), Some("arbitrum-sepolia"));
+
+        config.evm_network = EvmNetwork::ArbitrumOne;
+        let args = build_node_args(&config);
+        assert_eq!(evm_network_arg(&args), Some("arbitrum-one"));
     }
 
     #[test]
@@ -1336,6 +1377,7 @@ mod tests {
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
             upgrade_channel: Some(UpgradeChannel::Beta),
+            evm_network: EvmNetwork::default(),
         };
 
         let args = build_node_args(&config);
@@ -1367,6 +1409,7 @@ mod tests {
             env_variables: HashMap::new(),
             bootstrap_peers: vec![],
             upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
         };
 
         let args = build_node_args(&config);
