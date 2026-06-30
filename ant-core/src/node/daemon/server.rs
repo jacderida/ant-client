@@ -15,9 +15,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
 use crate::node::binary::NoopProgress;
+use crate::node::daemon::health::{DiskThresholds, FleetHealth};
 use crate::node::daemon::supervisor::{
-    spawn_liveness_monitor, spawn_upgrade_monitor, Supervisor, LIVENESS_POLL_INTERVAL,
-    UPGRADE_POLL_INTERVAL,
+    spawn_eviction_monitor, spawn_liveness_monitor, spawn_upgrade_monitor, Supervisor,
+    EVICTION_POLL_INTERVAL, LIVENESS_POLL_INTERVAL, UPGRADE_POLL_INTERVAL,
 };
 use crate::node::events::NodeEvent;
 use crate::node::registry::NodeRegistry;
@@ -36,6 +37,9 @@ pub struct AppState {
     pub config: DaemonConfig,
     /// The actual address the server bound to (resolves port 0 to real port).
     pub bound_port: u16,
+    /// Latest fleet health snapshot, refreshed by the eviction monitor and served at
+    /// `GET /api/v1/health`.
+    pub health: Arc<RwLock<FleetHealth>>,
 }
 
 /// Start the daemon HTTP server.
@@ -82,6 +86,8 @@ pub async fn start(
         }
     }
 
+    let health = Arc::new(RwLock::new(FleetHealth::healthy()));
+
     let state = Arc::new(AppState {
         registry: registry.clone(),
         supervisor: supervisor.clone(),
@@ -89,6 +95,7 @@ pub async fn start(
         start_time: Instant::now(),
         config: config.clone(),
         bound_port: bound_addr.port(),
+        health: health.clone(),
     });
 
     // Background task: probe each Running node's on-disk binary for version drift caused by
@@ -98,6 +105,20 @@ pub async fn start(
         registry.clone(),
         supervisor.clone(),
         UPGRADE_POLL_INTERVAL,
+        shutdown.clone(),
+    );
+
+    // Background task: monitor free disk space at node data directories. Refreshes the fleet health
+    // snapshot every tick and auto-evicts a node (smallest data dir) on any partition that has
+    // fallen to the eviction threshold while ≥2 nodes remain. The threshold is a fixed internal
+    // constant (mirroring ant-node's own refuse-to-store reserve), not user-configurable.
+    spawn_eviction_monitor(
+        registry.clone(),
+        supervisor.clone(),
+        event_tx.clone(),
+        health,
+        DiskThresholds::default(),
+        EVICTION_POLL_INTERVAL,
         shutdown.clone(),
     );
 
@@ -151,6 +172,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/console", get(get_console))
         .route("/api/v1/status", get(get_status))
+        .route("/api/v1/health", get(get_health))
         .route("/api/v1/events", get(get_events))
         .route("/api/v1/nodes/status", get(get_nodes_status))
         .route("/api/v1/nodes", post(post_nodes))
@@ -183,6 +205,13 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<DaemonStatus> {
         nodes_stopped: stopped,
         nodes_errored: errored,
     })
+}
+
+/// GET /api/v1/health — Current fleet health (overall level + per-check findings).
+///
+/// Refreshed by the eviction monitor; reflects disk pressure and the next eviction candidate.
+async fn get_health(State(state): State<Arc<AppState>>) -> Json<FleetHealth> {
+    Json(state.health.read().await.clone())
 }
 
 async fn get_events(
@@ -218,9 +247,15 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
     let mut total_stopped = 0u32;
 
     for config in registry.list() {
-        let status = supervisor
-            .node_status(config.id)
-            .unwrap_or(NodeStatus::Stopped);
+        // An evicted node has no live process: its persisted marker takes precedence over any
+        // runtime status the supervisor might still report.
+        let status = if config.eviction.is_some() {
+            NodeStatus::Evicted
+        } else {
+            supervisor
+                .node_status(config.id)
+                .unwrap_or(NodeStatus::Stopped)
+        };
 
         match status {
             NodeStatus::Running | NodeStatus::Starting | NodeStatus::UpgradeScheduled => {
@@ -229,9 +264,15 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
             _ => total_stopped += 1,
         }
 
-        let pid = supervisor.node_pid(config.id);
-        let uptime_secs = supervisor.node_uptime_secs(config.id);
-        let pending_version = supervisor.node_pending_version(config.id);
+        let (pid, uptime_secs, pending_version) = if config.eviction.is_some() {
+            (None, None, None)
+        } else {
+            (
+                supervisor.node_pid(config.id),
+                supervisor.node_uptime_secs(config.id),
+                supervisor.node_pending_version(config.id),
+            )
+        };
 
         nodes.push(NodeStatusSummary {
             node_id: config.id,
@@ -241,6 +282,7 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
             pid,
             uptime_secs,
             pending_version,
+            eviction: config.eviction.clone(),
         });
     }
 
@@ -268,10 +310,17 @@ async fn get_node_detail(
     };
 
     let supervisor = state.supervisor.read().await;
-    let status = supervisor.node_status(id).unwrap_or(NodeStatus::Stopped);
-    let pid = supervisor.node_pid(id);
-    let uptime_secs = supervisor.node_uptime_secs(id);
-    let pending_version = supervisor.node_pending_version(id);
+    // A persisted eviction marker takes precedence over any runtime status.
+    let (status, pid, uptime_secs, pending_version) = if config.eviction.is_some() {
+        (NodeStatus::Evicted, None, None, None)
+    } else {
+        (
+            supervisor.node_status(id).unwrap_or(NodeStatus::Stopped),
+            supervisor.node_pid(id),
+            supervisor.node_uptime_secs(id),
+            supervisor.node_pending_version(id),
+        )
+    };
 
     Ok(Json(NodeInfo {
         config,
@@ -878,6 +927,7 @@ mod tests {
             bootstrap_peers: vec![],
             upgrade_channel: None,
             evm_network: EvmNetwork::default(),
+            eviction: None,
         }
     }
 
