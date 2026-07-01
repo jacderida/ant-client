@@ -5,9 +5,12 @@
 
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
+use crate::data::client::PUT_TARGET_WIDTH;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{Amount, PaymentQuote};
-use ant_protocol::transport::{DHTNode, MultiAddr, P2PNode, PeerId, WitnessedCloseGroup};
+use ant_protocol::transport::{
+    DHTNode, MultiAddr, P2PNode, PeerId, ResponderView, WitnessedCloseGroup,
+};
 use ant_protocol::{
     compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
     ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
@@ -285,6 +288,36 @@ fn missing_witnessed_responder_views(witnessed: &WitnessedCloseGroup) -> usize {
 
 fn witnessed_close_group_quorum_for_transcript(witnessed: &WitnessedCloseGroup) -> usize {
     witnessed_close_group_quorum_for_missing_views(missing_witnessed_responder_views(witnessed))
+}
+
+/// Restrict a witnessed transcript to its closest `CLOSE_GROUP_SIZE` peers.
+///
+/// The witnessed query is widened to `PUT_TARGET_WIDTH` peers so we
+/// have addresses for the full PUT-target set, but the consensus/quorum/quote
+/// logic must still run on the close group only. Keeping just the closest-7
+/// initial peers and the responder views contributed by those peers leaves the
+/// `missing_witnessed_responder_views` math — and the quorum derived from it —
+/// byte-for-byte identical to a `CLOSE_GROUP_SIZE`-wide query.
+fn scope_witnessed_to_close_group(witnessed: &WitnessedCloseGroup) -> WitnessedCloseGroup {
+    let initial_closest: Vec<DHTNode> = witnessed
+        .initial_closest
+        .iter()
+        .take(CLOSE_GROUP_SIZE)
+        .cloned()
+        .collect();
+    let scope: HashSet<PeerId> = initial_closest.iter().map(|node| node.peer_id).collect();
+    let responder_views: Vec<ResponderView> = witnessed
+        .responder_views
+        .iter()
+        .filter(|view| scope.contains(&view.responder))
+        .cloned()
+        .collect();
+    WitnessedCloseGroup {
+        target: witnessed.target,
+        k: CLOSE_GROUP_SIZE,
+        initial_closest,
+        responder_views,
+    }
 }
 
 fn peer_list(peers: &[PeerId]) -> Vec<String> {
@@ -801,30 +834,56 @@ impl Client {
         &self,
         address: &[u8; 32],
     ) -> Result<WitnessedQuoteSelection> {
+        // The quote/quorum/consensus scope is the closest CLOSE_GROUP_SIZE.
         let required = single_node_quote_query_count();
-        let witnessed = self
+        // Contact the closest PUT_TARGET_WIDTH peers directly so the whole
+        // PUT-target set's addresses arrive in this single query. A network
+        // with fewer than that near the target can't satisfy the wide lookup,
+        // so fall back to the close-group width — the upload still proceeds with
+        // a narrower (but valid) PUT-target set rather than failing.
+        let witnessed = match self
             .network()
             .find_witnessed_close_group_with_view_count(
                 address,
-                required,
+                PUT_TARGET_WIDTH,
                 SINGLE_NODE_WITNESSED_VIEW_COUNT,
             )
             .await
-            .map_err(|e| {
-                Error::InsufficientPeers(format!(
-                    "Witnessed close group lookup failed before payment for target {}: {e}",
-                    hex::encode(address)
-                ))
-            })?;
+        {
+            Ok(witnessed) => witnessed,
+            Err(wide_err) => {
+                debug!(
+                    target = %hex::encode(address),
+                    "Wide witnessed lookup ({PUT_TARGET_WIDTH}) failed ({wide_err}); \
+                     retrying at close-group width ({required})"
+                );
+                self.network()
+                    .find_witnessed_close_group_with_view_count(
+                        address,
+                        required,
+                        SINGLE_NODE_WITNESSED_VIEW_COUNT,
+                    )
+                    .await
+                    .map_err(|e| {
+                        Error::InsufficientPeers(format!(
+                            "Witnessed close group lookup failed before payment for target {}: {e}",
+                            hex::encode(address)
+                        ))
+                    })?
+            }
+        };
+        // Run quoting/quorum on the closest CLOSE_GROUP_SIZE only, so payment
+        // semantics are unaffected by the wider PUT query.
+        let witnessed_quote = scope_witnessed_to_close_group(&witnessed);
         let base_quorum = witnessed_close_group_quorum();
-        let missing_views = missing_witnessed_responder_views(&witnessed);
-        let quorum = witnessed_close_group_quorum_for_transcript(&witnessed);
+        let missing_views = missing_witnessed_responder_views(&witnessed_quote);
+        let quorum = witnessed_close_group_quorum_for_transcript(&witnessed_quote);
 
         if missing_views > 0 {
             warn!(
                 target = %hex::encode(address),
-                initial = witnessed.initial_closest.len(),
-                responder_views = witnessed.responder_views.len(),
+                initial = witnessed_quote.initial_closest.len(),
+                responder_views = witnessed_quote.responder_views.len(),
                 missing_views = missing_views,
                 base_quorum = base_quorum,
                 adjusted_quorum = quorum,
@@ -836,14 +895,25 @@ impl Client {
             target = %hex::encode(address),
             quorum = quorum,
             view_count = SINGLE_NODE_WITNESSED_VIEW_COUNT,
-            initial = ?witnessed_initial_peers(&witnessed),
-            responder_views = ?witnessed_responder_views(&witnessed),
-            vote_counts = ?witnessed_vote_counts(&witnessed, address),
-            final_witnessed_set = ?witnessed_consensus(&witnessed, address, quorum),
+            initial = ?witnessed_initial_peers(&witnessed_quote),
+            responder_views = ?witnessed_responder_views(&witnessed_quote),
+            vote_counts = ?witnessed_vote_counts(&witnessed_quote, address),
+            final_witnessed_set = ?witnessed_consensus(&witnessed_quote, address, quorum),
             "Witnessed close group selected for SNP quote collection"
         );
 
-        witnessed_quote_selection_or_error(address, &witnessed, required, quorum)
+        let mut selection =
+            witnessed_quote_selection_or_error(address, &witnessed_quote, required, quorum)?;
+        // Widen the PUT-target set to the closest PUT_TARGET_WIDTH
+        // directly-contacted peers; the quote set above stays the closest
+        // CLOSE_GROUP_SIZE. The same proof is reused on all of them.
+        selection.initial_put_peers = witnessed
+            .initial_closest
+            .iter()
+            .take(PUT_TARGET_WIDTH)
+            .map(|node| (node.peer_id, node.addresses_by_priority()))
+            .collect();
+        Ok(selection)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1382,6 +1452,116 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 9],
             "XOR closeness must be the primary sort before quote collection"
+        );
+    }
+
+    /// Ascending seeds `1..=count`, each a valid `u8` peer seed.
+    fn ascending_seeds(count: usize) -> Vec<u8> {
+        (1..=count)
+            .map(|n| u8::try_from(n).expect("test seed fits in u8"))
+            .collect()
+    }
+
+    #[test]
+    fn scope_witnessed_to_close_group_matches_native_close_group_query() {
+        // How many of the closest-`CLOSE_GROUP_SIZE` responders returned a view.
+        // The remainder are "missing", so the scoped transcript also exercises
+        // the missing-views quorum adjustment.
+        const RESPONDED_IN_SCOPE: usize = 5;
+        // Responders past the close group whose views scoping must drop.
+        const OUT_OF_SCOPE_RESPONDERS: usize = 2;
+
+        let address = [0u8; 32];
+        let close_seeds = ascending_seeds(CLOSE_GROUP_SIZE);
+        // Each view's closest list mixes in-group (1, 2) and far (8, 9) peers so
+        // candidate selection is non-trivial and must survive scoping verbatim.
+        let view_closest = [1, 2, 8, 9];
+        let in_scope_views = || -> Vec<ResponderView> {
+            ascending_seeds(RESPONDED_IN_SCOPE)
+                .into_iter()
+                .map(|responder| witnessed_test_view(responder, &view_closest))
+                .collect()
+        };
+
+        // A wide PUT_TARGET_WIDTH-peer transcript, ordered closest-first (seed n
+        // == PeerId [n; 32], whose XOR distance to the zero address is n). Two
+        // responders past the close group (out of scope) must be dropped.
+        let mut wide_views = in_scope_views();
+        for offset in 1..=OUT_OF_SCOPE_RESPONDERS {
+            let responder =
+                u8::try_from(CLOSE_GROUP_SIZE + offset).expect("out-of-scope seed fits in u8");
+            wide_views.push(witnessed_test_view(responder, &[1, 2, 3]));
+        }
+        let wide = WitnessedCloseGroup {
+            target: address,
+            k: PUT_TARGET_WIDTH,
+            initial_closest: witnessed_test_nodes(&ascending_seeds(PUT_TARGET_WIDTH)),
+            responder_views: wide_views,
+        };
+
+        // The hand-built equivalent: a native CLOSE_GROUP_SIZE-wide query with
+        // the same in-scope responders.
+        let native = WitnessedCloseGroup {
+            target: address,
+            k: CLOSE_GROUP_SIZE,
+            initial_closest: witnessed_test_nodes(&close_seeds),
+            responder_views: in_scope_views(),
+        };
+
+        let scoped = scope_witnessed_to_close_group(&wide);
+
+        // Target preserved; k and the initial set collapse to the close group.
+        assert_eq!(scoped.target, wide.target);
+        assert_eq!(scoped.k, CLOSE_GROUP_SIZE);
+        assert_eq!(
+            scoped
+                .initial_closest
+                .iter()
+                .map(|node| node.peer_id.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            close_seeds,
+            "initial set must be the closest CLOSE_GROUP_SIZE, in order"
+        );
+
+        // Out-of-close-group responder views are dropped; the in-scope ones keep
+        // their closest lists untouched (scoping filters by responder only).
+        assert_eq!(
+            scoped
+                .responder_views
+                .iter()
+                .map(|view| view.responder.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            ascending_seeds(RESPONDED_IN_SCOPE),
+            "only responders inside the close group survive"
+        );
+        assert_eq!(
+            scoped.responder_views[0]
+                .closest
+                .iter()
+                .map(|node| node.peer_id.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            view_closest.to_vec(),
+            "a surviving view's closest set must be preserved verbatim"
+        );
+
+        // The quorum math and candidate consensus run on the close group only
+        // and are byte-for-byte identical to the native CLOSE_GROUP_SIZE query.
+        assert_eq!(
+            missing_witnessed_responder_views(&scoped),
+            missing_witnessed_responder_views(&native),
+        );
+        let quorum = witnessed_close_group_quorum_for_transcript(&scoped);
+        assert_eq!(quorum, witnessed_close_group_quorum_for_transcript(&native));
+        let candidate_seeds = |group: &WitnessedCloseGroup| {
+            witnessed_consensus_candidates(group, &address, quorum)
+                .iter()
+                .map(|candidate| candidate.node.peer_id.as_bytes()[0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            candidate_seeds(&scoped),
+            candidate_seeds(&native),
+            "scoped consensus must match a native close-group query"
         );
     }
 

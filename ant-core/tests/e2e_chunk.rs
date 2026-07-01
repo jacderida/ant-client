@@ -50,6 +50,54 @@ async fn test_chunk_put_get_round_trip() {
     testnet.teardown().await;
 }
 
+/// ADR-0002: when initial PUT targets fail, the client falls back to the
+/// chunk's genuine next-closest peers — reusing the same `ProofOfPayment`,
+/// without re-quoting or re-paying — and still reaches quorum.
+///
+/// Forces `DEAD_INITIAL_PEERS` (= `CLOSE_GROUP_MAJORITY`) unreachable initial
+/// peers, so every initial send fails and a full quorum's worth of stores must
+/// come from the *real* next-closest peers in the put-target set. A successful,
+/// retrievable store proves the fallback reached those real peers on the single
+/// proof produced by one payment.
+///
+/// Scope: failures here are driven by *unreachable* peers (transport), which
+/// exercises the fallback walk + single-proof reuse + quorum end-to-end. The
+/// *classification* that routes a full node's `StorageFailed` and a price-floor
+/// `PaymentFailed`/`PaymentRequired` into the same fallback is covered by the
+/// `classify_put_failure_*` unit test. A live close-group node returning
+/// `StorageFailed` (a genuinely full member) needs a node-side capacity hook the
+/// in-process MiniTestnet does not expose — tracked as a follow-up.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_chunk_put_extended_fallback_reaches_quorum() {
+    /// Unreachable initial peers to inject; equals `CLOSE_GROUP_MAJORITY` so a
+    /// full quorum must be served by the extended fallback.
+    const DEAD_INITIAL_PEERS: usize = 4;
+
+    let (client, testnet) = setup().await;
+
+    let content = Bytes::from("adr-0002 extended fallback payload");
+    let address = compute_address(&content);
+
+    let stored = client
+        .chunk_put_with_dead_initial_peers(content.clone(), DEAD_INITIAL_PEERS)
+        .await
+        .expect("extended fallback should reach quorum despite dead initial peers");
+    assert_eq!(stored, address, "stored address should be BLAKE3(content)");
+
+    // Retrievable -> quorum was genuinely met via the fallback peers.
+    let retrieved = client
+        .chunk_get(&address)
+        .await
+        .expect("chunk_get should succeed");
+    let chunk = retrieved.expect("chunk should be found after fallback store");
+    assert_eq!(chunk.content.as_ref(), content.as_ref());
+
+    drop(client);
+    testnet.teardown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_chunk_put_duplicate_is_idempotent() {
