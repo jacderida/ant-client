@@ -835,7 +835,10 @@ impl Client {
                 addresses.len()
             )));
         }
-        let store_concurrency = store_limiter.current().min(batch_size.max(1));
+        // Cap closure re-read per scheduler refill so mid-flight limiter growth
+        // is applied to the rest of the batch (V2-554). Clamped to batch size —
+        // partial batches should not pay for unused slots (see PERF-RESULTS.md).
+        let cap = || store_limiter.current().min(batch_size.max(1));
 
         let chunks: Vec<([u8; 32], Bytes)> = addresses.into_iter().zip(chunk_contents).collect();
 
@@ -867,7 +870,7 @@ impl Client {
 
         let outcome = merkle_store_with_retry(
             chunks,
-            store_concurrency,
+            cap,
             MERKLE_STORE_MAX_ATTEMPTS,
             MERKLE_RETRY_BACKOFF,
             progress,
@@ -947,15 +950,18 @@ pub(crate) struct MerkleStoreOutcome {
 
 /// Drive a set of merkle chunk stores with bounded retry of quorum shortfalls.
 ///
-/// Runs `store_one` over all `chunks` concurrently (up to `store_concurrency`),
-/// collecting any `InsufficientPeers` failures rather than aborting. Failed
-/// chunks are retried — `store_one` re-collects their close group on each call,
-/// so a converged routing table can yield a fresh group — for up to
-/// `max_attempts` rounds, sleeping a jittered `backoff` between rounds. A
-/// chunk's success is counted once and recorded in the retry round it landed on
-/// (`retries_histogram[round]`). `stored_offset` seeds the returned `stored`
-/// count and the progress numbering; `total` is the whole-file total reported
-/// in progress events.
+/// Runs `store_one` over all `chunks` concurrently, keeping up to `cap()` stores
+/// in flight and RE-READING `cap()` as each slot frees — so mid-flight adaptive
+/// growth is applied to the rest of the round instead of being frozen at a
+/// per-round snapshot (V2-554). Collects quorum shortfalls
+/// (`InsufficientPeers`, `CloseGroupShortfall`, `RemotePut`) rather than
+/// aborting. Failed chunks are retried — `store_one` re-collects their close
+/// group on each call, so a converged routing table can yield a fresh group —
+/// for up to `max_attempts` rounds, sleeping a jittered `backoff` between
+/// rounds. A chunk's success is counted once and recorded in the retry round it
+/// landed on (`retries_histogram[round]`). `stored_offset` seeds the returned
+/// `stored` count and the progress numbering; `total` is the whole-file total
+/// reported in progress events.
 ///
 /// A non-quorum error stops the pass but does **not** discard progress: the
 /// successes already completed this pass stay in `stored`/`stored_addresses`,
@@ -964,9 +970,9 @@ pub(crate) struct MerkleStoreOutcome {
 /// Callers that want the old abort-everything behaviour re-raise `fatal` as
 /// `Err`; CLI callers fold it into `PartialUpload` while keeping the stores.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn merkle_store_with_retry<F, Fut>(
+pub(crate) async fn merkle_store_with_retry<F, Fut, C>(
     chunks: Vec<([u8; 32], Bytes)>,
-    store_concurrency: usize,
+    cap: C,
     max_attempts: usize,
     backoff: Duration,
     progress: Option<&mpsc::Sender<UploadEvent>>,
@@ -977,6 +983,7 @@ pub(crate) async fn merkle_store_with_retry<F, Fut>(
 where
     F: Fn([u8; 32], Bytes) -> Fut,
     Fut: std::future::Future<Output = Result<std::time::Instant>>,
+    C: Fn() -> usize,
 {
     let attempts = max_attempts.max(1);
     let mut outcome = MerkleStoreOutcome {
@@ -986,19 +993,31 @@ where
     let mut pending = chunks;
 
     for attempt in 0..attempts {
-        let concurrency = store_concurrency.min(pending.len().max(1)).max(1);
         // Carries the chunk body forward for the next round plus the last
         // quorum-shortfall message, so an exhausted set can report per-chunk
         // errors via `failed_addresses`.
         let mut next_failed: Vec<([u8; 32], Bytes, String)> = Vec::new();
 
-        let mut upload_stream = stream::iter(pending.into_iter().map(|(addr, content)| {
-            let fut = store_one(addr, content.clone());
-            async move { (addr, content, fut.await) }
-        }))
-        .buffer_unordered(concurrency);
-
-        while let Some((addr, content, result)) = upload_stream.next().await {
+        // Rolling scheduler: keep up to `cap()` stores in flight, re-reading the
+        // cap as each slot frees so limiter growth mid-round is applied to the
+        // remaining chunks (V2-554). Iterator exhaustion bounds the launch count
+        // to the pending set, so no explicit clamp to `pending.len()` is needed.
+        let mut pending_iter = pending.into_iter();
+        let mut in_flight = FuturesUnordered::new();
+        loop {
+            let slots = cap().max(1);
+            while in_flight.len() < slots {
+                match pending_iter.next() {
+                    Some((addr, content)) => {
+                        let fut = store_one(addr, content.clone());
+                        in_flight.push(async move { (addr, content, fut.await) });
+                    }
+                    None => break,
+                }
+            }
+            let Some((addr, content, result)) = in_flight.next().await else {
+                break;
+            };
             outcome.stats.chunk_attempts_total =
                 outcome.stats.chunk_attempts_total.saturating_add(1);
             match result {
@@ -1018,12 +1037,17 @@ where
                         });
                     }
                 }
-                // A quorum shortfall — whether reported as a transport
-                // shortfall (`InsufficientPeers`) or an app-only rejection
+                // A quorum shortfall — whether a timeout-bearing capacity
+                // shortfall (`InsufficientPeers`), a pure dial-churn shortfall
+                // (`CloseGroupShortfall`, V2-554), or an app-only rejection
                 // (`RemotePut`, e.g. pool-rejected / quote-stale / disk-full,
                 // which are transient) — is recoverable: defer and retry the
-                // chunk rather than aborting the whole upload (V2-468).
-                Err(e @ (Error::InsufficientPeers(_) | Error::RemotePut { .. })) => {
+                // chunk rather than aborting the whole upload (V2-468 / V2-554).
+                Err(
+                    e @ (Error::InsufficientPeers(_)
+                    | Error::CloseGroupShortfall(_)
+                    | Error::RemotePut { .. }),
+                ) => {
                     next_failed.push((addr, content, e.to_string()));
                 }
                 Err(e) => {
@@ -1211,11 +1235,13 @@ where
             // resident at a time), so the deferred path keeps the wave path's
             // memory bound regardless of how many chunks were deferred.
             let chunks = read_bodies(&batch_addrs)?;
-            let concurrency = concurrency_for(batch_addrs.len());
+            // Re-read the cap per scheduler refill (V2-554) via `concurrency_for`,
+            // which re-samples the store limiter clamped to this batch's size.
+            let cap = || concurrency_for(batch_addrs.len());
 
             let batch_outcome = merkle_store_with_retry(
                 chunks,
-                concurrency,
+                cap,
                 1,
                 Duration::ZERO,
                 progress,
@@ -1798,15 +1824,48 @@ mod tests {
             }
         };
 
-        let outcome = merkle_store_with_retry(chunks, 8, 1, Duration::ZERO, None, 0, 6, store_one)
-            .await
-            .expect("quorum shortfalls must not abort the batch");
+        let outcome =
+            merkle_store_with_retry(chunks, || 8, 1, Duration::ZERO, None, 0, 6, store_one)
+                .await
+                .expect("quorum shortfalls must not abort the batch");
 
         assert_eq!(outcome.stored, 4);
         assert_eq!(outcome.failed, 2);
         // Single attempt → all successes recorded in round 0.
         assert_eq!(outcome.stats.retries_histogram[0], 4);
         assert_eq!(outcome.stats.chunk_attempts_total, 6);
+    }
+
+    /// V2-554: the store scheduler must RE-READ the cap as each slot frees
+    /// (rolling), not snapshot it once like `buffer_unordered`. A snapshot would
+    /// invoke the cap closure once per attempt; the rolling scheduler invokes it
+    /// once per drained slot, so mid-flight limiter growth reaches the rest of
+    /// the round. Proven here by counting cap-closure invocations.
+    #[tokio::test]
+    async fn store_with_retry_rereads_cap_per_slot() {
+        let count = 6;
+        let chunks = make_chunks(count);
+        let cap_calls = Arc::new(Mutex::new(0usize));
+        let cap_calls_for_closure = cap_calls.clone();
+        let cap = move || {
+            *cap_calls_for_closure.lock().expect("cap counter poisoned") += 1;
+            2
+        };
+        let store_one =
+            move |_addr: [u8; 32], _content: Bytes| async move { Ok(std::time::Instant::now()) };
+
+        let outcome =
+            merkle_store_with_retry(chunks, cap, 1, Duration::ZERO, None, 0, count, store_one)
+                .await
+                .expect("all stores succeed");
+
+        assert_eq!(outcome.stored, count);
+        let calls = *cap_calls.lock().expect("cap counter poisoned");
+        assert!(
+            calls >= count,
+            "cap must be re-read per drained slot (rolling), not snapshotted once — \
+             expected >= {count} invocations, got {calls}",
+        );
     }
 
     /// V2-468: an app-only quorum shortfall surfaces as `Error::RemotePut`
@@ -1836,9 +1895,10 @@ mod tests {
             }
         };
 
-        let outcome = merkle_store_with_retry(chunks, 8, 1, Duration::ZERO, None, 0, 6, store_one)
-            .await
-            .expect("remote app-rejections must not abort the batch");
+        let outcome =
+            merkle_store_with_retry(chunks, || 8, 1, Duration::ZERO, None, 0, 6, store_one)
+                .await
+                .expect("remote app-rejections must not abort the batch");
 
         assert_eq!(outcome.stored, 4);
         assert_eq!(outcome.failed, 2);
@@ -1854,9 +1914,10 @@ mod tests {
             Err::<std::time::Instant, _>(Error::Payment("missing proof".into()))
         };
 
-        let outcome = merkle_store_with_retry(chunks, 8, 3, Duration::ZERO, None, 0, 3, store_one)
-            .await
-            .expect("fatal is carried in the outcome, not returned as Err");
+        let outcome =
+            merkle_store_with_retry(chunks, || 8, 3, Duration::ZERO, None, 0, 3, store_one)
+                .await
+                .expect("fatal is carried in the outcome, not returned as Err");
         assert!(matches!(outcome.fatal, Some(Error::Payment(_))));
     }
 
@@ -1876,9 +1937,10 @@ mod tests {
             }
         };
 
-        let outcome = merkle_store_with_retry(chunks, 1, 1, Duration::ZERO, None, 0, 6, store_one)
-            .await
-            .expect("fatal carried in outcome, not returned as Err");
+        let outcome =
+            merkle_store_with_retry(chunks, || 1, 1, Duration::ZERO, None, 0, 6, store_one)
+                .await
+                .expect("fatal carried in outcome, not returned as Err");
         assert!(matches!(outcome.fatal, Some(Error::Payment(_))));
         // The five chunks stored before the abort are preserved, not lost.
         assert_eq!(outcome.stored, 5);
@@ -1917,7 +1979,7 @@ mod tests {
         };
 
         let outcome =
-            merkle_store_with_retry(chunks, 8, 3, Duration::ZERO, None, 0, total, store_one)
+            merkle_store_with_retry(chunks, || 8, 3, Duration::ZERO, None, 0, total, store_one)
                 .await
                 .expect("should converge after retry");
 
@@ -1964,7 +2026,7 @@ mod tests {
         };
 
         let outcome =
-            merkle_store_with_retry(chunks, 8, 3, Duration::ZERO, None, 0, total, store_one)
+            merkle_store_with_retry(chunks, || 8, 3, Duration::ZERO, None, 0, total, store_one)
                 .await
                 .expect("flaky chunk should recover on retry");
 
@@ -1992,7 +2054,7 @@ mod tests {
 
         let outcome = merkle_store_with_retry(
             chunks,
-            8,
+            || 8,
             MERKLE_STORE_MAX_ATTEMPTS,
             Duration::ZERO,
             None,
@@ -2038,7 +2100,7 @@ mod tests {
 
         let outcome = merkle_store_with_retry(
             chunks,
-            8,
+            || 8,
             MERKLE_STORE_MAX_ATTEMPTS,
             Duration::ZERO,
             None,
@@ -2073,7 +2135,7 @@ mod tests {
 
         let outcome = merkle_store_with_retry(
             chunks,
-            8,
+            || 8,
             MERKLE_STORE_MAX_ATTEMPTS,
             Duration::ZERO,
             None,

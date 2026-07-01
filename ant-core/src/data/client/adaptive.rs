@@ -379,6 +379,23 @@ pub struct LimiterConfig {
     /// `Ok(None)` (Timeout) rate, which the timeout_ceiling check
     /// catches.
     pub latency_decrease_enabled: bool,
+    /// When `true`, a Decrease does NOT reset `samples_since_increase`, so
+    /// evidence already accrued toward the next Increase survives a transient
+    /// Decrease instead of being zeroed.
+    ///
+    /// The default (`false`) reproduces the original asymmetric gate: an
+    /// Increase needs a full fresh `window_ops` of samples, a Decrease needs
+    /// only `min_window_ops`, AND a Decrease resets the increase counter. On a
+    /// channel where decreases fire faster than a full increase window can
+    /// accrue, that combination permanently starves growth — the store cap sat
+    /// pinned at its cold-start floor of 8 for a whole 530-chunk upload
+    /// (V2-554). The store channel sets this `true` so a few-percent shortfall
+    /// rate can no longer deny the cap its next doubling: the accrued increase
+    /// credit persists across the transient Decrease, and the next genuinely
+    /// healthy window (`evaluate` returns Increase) can act on it. Sustained
+    /// unhealthiness still holds the cap down because `evaluate` keeps
+    /// returning Decrease — this only stops isolated dips from zeroing progress.
+    pub retain_increase_credit_on_decrease: bool,
 }
 
 impl LimiterConfig {
@@ -393,10 +410,11 @@ impl LimiterConfig {
             timeout_ceiling: cfg.timeout_ceiling,
             latency_inflation_factor: cfg.latency_inflation_factor,
             latency_ewma_alpha: cfg.latency_ewma_alpha,
-            // Defaults preserve the original AIMD behaviour; the fetch
-            // channel overrides both in `AdaptiveController::new`.
+            // Defaults preserve the original AIMD behaviour; the fetch and
+            // store channels override these in `AdaptiveController::new`.
             slow_start_ramp_threshold: 0,
             latency_decrease_enabled: true,
+            retain_increase_credit_on_decrease: false,
         }
     }
 
@@ -725,7 +743,13 @@ fn apply_decision(inner: &mut LimiterInner, decision: Decision, cfg: &LimiterCon
                 debug!(from = inner.current, to = next, "adaptive: decrease");
             }
             inner.current = next;
-            inner.samples_since_increase = 0;
+            // Retaining the increase credit (store channel, V2-554) keeps the
+            // evidence accrued toward the next Increase alive across a transient
+            // Decrease so a few-percent shortfall rate can't permanently starve
+            // growth. The default zeroes it, requiring a full fresh window.
+            if !cfg.retain_increase_credit_on_decrease {
+                inner.samples_since_increase = 0;
+            }
             inner.samples_since_decrease = 0;
         }
         Decision::Hold => {}
@@ -1085,6 +1109,28 @@ impl AdaptiveController {
         //   to a crawl. See the fetch override and `LimiterConfig` field docs.
         store_cfg.latency_decrease_enabled = false;
         store_cfg.slow_start_ramp_threshold = usize::MAX;
+        // Break the asymmetric gate that pinned the store cap at its cold-start
+        // floor (V2-554). Two coupled changes, both scoped to store:
+        //
+        // 1. Retain the increase credit across a Decrease. The default gate
+        //    needs a full fresh `window_ops` of samples to earn an Increase but
+        //    only `min_window_ops` to fire a Decrease, AND a Decrease zeroes the
+        //    increase counter — so an isolated dip discards accrued growth.
+        //    Retaining it lets the next healthy window act on that evidence.
+        //
+        // 2. Relax `success_target` from the global 0.95 to 0.88. Retaining the
+        //    credit is not enough on its own: a Decrease still fires every
+        //    `min_window_ops` (8) samples while eligible but an Increase only
+        //    every `window_ops` (32), a 4:1 firing ratio that lets a sustained
+        //    few-percent shortfall outpace growth and crush the cap regardless.
+        //    At 0.95 just 2 shortfalls in a 32-op window (0.9375) trip a
+        //    Decrease — normal per-chunk close-group noise. At 0.88 a Decrease
+        //    needs ~4 shortfalls in 32 (~12%), so a few-percent shortfall reads
+        //    as a healthy window and the cap can ramp. Genuine congestion (a
+        //    larger shortfall rate, or the unchanged `timeout_ceiling`) still
+        //    cuts the cap. Quote keeps the classic 0.95 gate.
+        store_cfg.retain_increase_credit_on_decrease = true;
+        store_cfg.success_target = 0.88;
         let mut fetch_cfg = LimiterConfig::from_adaptive(&config, config.max.fetch);
         // Lift the fetch channel's floor above the global
         // `min_concurrency`. Reasoning is specific to download: on
@@ -1610,6 +1656,7 @@ mod tests {
             latency_ewma_alpha: 0.5,
             slow_start_ramp_threshold: 0,
             latency_decrease_enabled: true,
+            retain_increase_credit_on_decrease: false,
         }
     }
 
@@ -1869,6 +1916,23 @@ mod tests {
             c.quote.config.slow_start_ramp_threshold, 0,
             "quote must keep classic AIMD slow-start exit",
         );
+        assert!(
+            !c.quote.config.retain_increase_credit_on_decrease,
+            "quote must keep the classic gate (Decrease resets the increase counter)",
+        );
+        assert!(
+            c.store.config.retain_increase_credit_on_decrease,
+            "store must retain increase credit across a Decrease (V2-554)",
+        );
+        assert!(
+            (c.store.config.success_target - 0.88).abs() < f64::EPSILON,
+            "store must relax success_target to 0.88 so a few-percent shortfall still ramps (V2-554), got {}",
+            c.store.config.success_target,
+        );
+        assert!(
+            (c.quote.config.success_target - c.config().success_target).abs() < f64::EPSILON,
+            "quote must keep the global success_target",
+        );
         // Store now mirrors fetch on these two knobs: node-side merkle
         // verification latency is not local congestion, and a transient
         // Decrease must not condemn the cap to a +1-per-window crawl.
@@ -1978,6 +2042,67 @@ mod tests {
             store.current(),
             start,
             "remote app-rejections must not move the store cap",
+        );
+    }
+
+    #[test]
+    fn store_gate_rebalance_ramps_where_classic_gate_pins() {
+        // V2-554 gate rebalance, end-to-end. Two limiters driven by the SAME
+        // borderline sequence — a steady ~5% shortfall (1 error per 20
+        // successes), the normal per-chunk close-group noise floor:
+        //
+        // - `fixed`: the store tuning (success_target 0.88 + retain increase
+        //   credit). A ~5% shortfall reads as a healthy window, so it ramps.
+        // - `classic`: the pre-V2-554 store gate (success_target 0.95 + reset
+        //   on Decrease). Just 2 shortfalls in a 32-op window (0.9375) trip a
+        //   Decrease that fires 4x faster than an Increase can be earned and
+        //   zeroes the increase credit, so the cap stays pinned at the floor.
+        let build = |success_target: f64, retain: bool| {
+            let mut cfg = cfg_for_tests();
+            cfg.min_concurrency = 1;
+            cfg.max_concurrency = 256;
+            cfg.window_ops = 32;
+            cfg.min_window_ops = 8;
+            cfg.success_target = success_target;
+            cfg.timeout_ceiling = 0.10;
+            // Both stay slow-start-armed with no latency-decrease so the only
+            // difference under test is the gate (target + retain).
+            cfg.slow_start_ramp_threshold = usize::MAX;
+            cfg.latency_decrease_enabled = false;
+            cfg.retain_increase_credit_on_decrease = retain;
+            Limiter::new(8, cfg)
+        };
+        let fixed = build(0.88, true);
+        let classic = build(0.95, false);
+
+        for _ in 0..80 {
+            for _ in 0..20 {
+                fixed.observe(Outcome::Success, Duration::from_millis(5));
+                classic.observe(Outcome::Success, Duration::from_millis(5));
+            }
+            fixed.observe(Outcome::NetworkError, Duration::from_millis(5));
+            classic.observe(Outcome::NetworkError, Duration::from_millis(5));
+        }
+
+        // The rebalanced gate ramps well off the cold-start floor of 8 under
+        // the noise floor that pinned the classic gate.
+        assert!(
+            fixed.current() >= 32,
+            "rebalanced store gate must ramp off the floor under ~5% shortfall, got {}",
+            fixed.current(),
+        );
+        // The classic gate stays crushed at/near the floor on the same input —
+        // this is the V2-554 pathology.
+        assert!(
+            classic.current() <= 8,
+            "classic gate should stay pinned near the floor on the same input, got {}",
+            classic.current(),
+        );
+        assert!(
+            fixed.current() > classic.current(),
+            "rebalanced gate {} must out-grow the classic gate {}",
+            fixed.current(),
+            classic.current(),
         );
     }
 

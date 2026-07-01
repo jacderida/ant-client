@@ -25,9 +25,11 @@ use tracing::{debug, info, warn};
 const CHUNK_DATA_TYPE: u32 = 0;
 
 /// Why a single-peer PUT was declined. Drives the surfaced aggregate error
-/// and keeps the store AIMD limiter honest — only a transport shortfall is a
-/// "client is sending too fast" signal (V2-468); a node that responds with a
-/// structured rejection is an application-level decline (ADR-0002).
+/// and keeps the store AIMD limiter honest — only genuine local backpressure
+/// (a PUT-response `Timeout`) is a "client is sending too fast" signal; a node
+/// that responds with a structured rejection is an application-level decline
+/// (ADR-0002 / V2-468), and a bare dial/relay failure is remote peer churn,
+/// not local capacity (V2-554).
 #[derive(Clone, Copy)]
 enum PutRejection {
     /// Node is out of storage (`ProtocolError::StorageFailed`) — try a
@@ -41,13 +43,24 @@ enum PutRejection {
     PriceFloor,
     /// Some other structured remote rejection.
     OtherRemote,
-    /// Transport/timeout failure — the node did not respond.
-    Transport,
+    /// The peer accepted the connection but did not answer the PUT within the
+    /// deadline (`Error::Timeout`). This is the genuine local-backpressure
+    /// signal: under real congestion the client's own requests time out, so a
+    /// shortfall carrying any timeout stays a capacity signal (V2-554).
+    Timeout,
+    /// A dial/relay/transport failure — the peer could not be reached at all
+    /// (`Error::Network` and other non-response errors), typically a dead or
+    /// stale relayed DHT address. This is remote peer churn, not local
+    /// backpressure, so a shortfall made up purely of these must not push the
+    /// store AIMD limiter down (V2-554).
+    Dial,
 }
 
-/// Classify a failed single-peer PUT (ADR-0002). A `RemotePut` carries the
-/// node's structured `ProtocolError`; a `PaymentRequired` response surfaces as
-/// [`Error::Payment`]; anything else is a transport failure.
+/// Classify a failed single-peer PUT (ADR-0002 / V2-468 / V2-554). A
+/// `RemotePut` carries the node's structured `ProtocolError`; a
+/// `PaymentRequired` response surfaces as [`Error::Payment`]; a
+/// [`Error::Timeout`] is genuine local backpressure; anything else is a
+/// dial/relay failure (remote churn).
 fn classify_put_failure(error: &Error) -> PutRejection {
     match error {
         Error::RemotePut { source, .. } => match source {
@@ -61,30 +74,47 @@ fn classify_put_failure(error: &Error) -> PutRejection {
         // price-floor `PaymentFailed` — not a transport shortfall, so it must
         // not push the store AIMD limiter down (ADR-0002 / V2-468).
         Error::Payment(_) => PutRejection::PriceFloor,
-        _ => PutRejection::Transport,
+        // The peer did not answer in time: genuine local backpressure.
+        Error::Timeout(_) => PutRejection::Timeout,
+        // Could not reach the peer at all: dial/relay churn (remote), not a
+        // local-capacity signal.
+        _ => PutRejection::Dial,
     }
 }
 
 /// Decide the error for a close-group store that fell short of quorum.
 ///
-/// When every failure was an application-level decline — the node responded
-/// (full / price-floor / `PaymentRequired` / other remote rejection) and there
-/// was **no** transport failure — return the representative application error so
-/// the shortfall classifies as `ApplicationError` and does not push the store
-/// AIMD limiter down as a false capacity signal (ADR-0002 / V2-468). A shortfall
-/// that included any transport failure is a genuine capacity signal and surfaces
-/// as `InsufficientPeers` (classified `NetworkError`).
+/// Only genuine local backpressure should push the store AIMD limiter down.
+/// The failure mix decides which signal to surface:
+///
+/// 1. **Any PUT-response timeout** (`timeout > 0`): the client's own requests
+///    are timing out — genuine local congestion. Surface `InsufficientPeers`
+///    (classified `NetworkError`) so the limiter still backs off (V2-554).
+/// 2. **No timeouts, no dial failures** — every failure was an application
+///    decline (full / price-floor / `PaymentRequired` / other remote
+///    rejection): surface the representative application error so the shortfall
+///    classifies `ApplicationError` and does not suppress the limiter
+///    (ADR-0002 / V2-468).
+/// 3. **No timeouts, but dial/relay failures present**: the shortfall is
+///    close-group dial churn (dead/stale relayed peer addresses) — remote peer
+///    churn, not local capacity. Surface [`Error::CloseGroupShortfall`]
+///    (classified `ApplicationError`) so it does NOT push the limiter down
+///    (V2-554). Still recoverable/retryable.
 fn put_shortfall_error(
-    transport: usize,
+    timeout: usize,
+    dial: usize,
     first_app_rejection: Option<Error>,
-    insufficient_peers_message: String,
+    shortfall_message: String,
 ) -> Error {
-    if transport == 0 {
+    if timeout > 0 {
+        return Error::InsufficientPeers(shortfall_message);
+    }
+    if dial == 0 {
         if let Some(app_rejection) = first_app_rejection {
             return app_rejection;
         }
     }
-    Error::InsufficientPeers(insufficient_peers_message)
+    Error::CloseGroupShortfall(shortfall_message)
 }
 
 /// Result of one sweep over a chunk's close group.
@@ -405,7 +435,8 @@ impl Client {
         let mut full = 0usize;
         let mut price_floor = 0usize;
         let mut other_remote = 0usize;
-        let mut transport = 0usize;
+        let mut timeout = 0usize;
+        let mut dial = 0usize;
         let mut first_app_rejection: Option<Error> = None;
 
         while let Some((peer_id, result)) = put_futures.next().await {
@@ -427,7 +458,8 @@ impl Client {
                         PutRejection::Full => full += 1,
                         PutRejection::PriceFloor => price_floor += 1,
                         PutRejection::OtherRemote => other_remote += 1,
-                        PutRejection::Transport => transport += 1,
+                        PutRejection::Timeout => timeout += 1,
+                        PutRejection::Dial => dial += 1,
                     }
                     // An application-level decline is `RemotePut` (a structured
                     // node rejection) or `Error::Payment` (`PaymentRequired`):
@@ -458,17 +490,19 @@ impl Client {
             }
         }
 
-        // Quorum not reached. An application-only shortfall surfaces the
-        // representative app error (so it doesn't suppress the limiter); a
-        // shortfall with any transport failure is a real capacity signal.
+        // Quorum not reached. A timeout-bearing shortfall is genuine local
+        // backpressure (capacity signal); an application-only shortfall surfaces
+        // the representative app error; a pure dial-churn shortfall surfaces a
+        // neutral `CloseGroupShortfall` (V2-554). See `put_shortfall_error`.
         let aggregate = format!(
             "Stored on {success_count} peers, need {CLOSE_GROUP_MAJORITY} \
              (full: {full}, price-floor: {price_floor}, other-rejection: {other_remote}, \
-             transport: {transport}). Failures: [{}]",
+             timeout: {timeout}, dial: {dial}). Failures: [{}]",
             failures.join("; ")
         );
         Err(put_shortfall_error(
-            transport,
+            timeout,
+            dial,
             first_app_rejection,
             aggregate,
         ))
@@ -1031,7 +1065,7 @@ mod tests {
     const TEST_DISTANCE_TAIL_INDEX: usize = TEST_XORNAME_BYTE_LEN - 1;
 
     #[test]
-    fn classify_put_failure_maps_remote_and_transport_reasons() {
+    fn classify_put_failure_maps_remote_timeout_and_dial_reasons() {
         let remote = |source| Error::RemotePut {
             address: "test-addr".to_string(),
             source,
@@ -1056,33 +1090,50 @@ mod tests {
             classify_put_failure(&Error::Payment("Payment required: more".to_string())),
             PutRejection::PriceFloor
         ));
+        // A PUT-response timeout is genuine local backpressure (V2-554).
         assert!(matches!(
             classify_put_failure(&Error::Timeout("no response".to_string())),
-            PutRejection::Transport
+            PutRejection::Timeout
+        ));
+        // A dial/relay failure (dead/stale relayed address) is remote churn.
+        assert!(matches!(
+            classify_put_failure(&Error::Network("dial failed".to_string())),
+            PutRejection::Dial
         ));
     }
 
     #[test]
-    fn put_shortfall_surfaces_app_error_only_without_transport_failure() {
+    fn put_shortfall_routes_by_failure_mix() {
         let app = || Error::Payment("Payment required: more".to_string());
         let msg = || "shortfall".to_string();
 
-        // Every failure was an application-level decline (e.g. all peers asked
-        // for more payment): surface the app error so the limiter isn't driven
-        // down as a false capacity signal (ADR-0002 / V2-468).
+        // Every failure was an application-level decline (no timeout, no dial):
+        // surface the app error so the limiter isn't driven down as a false
+        // capacity signal (ADR-0002 / V2-468).
         assert!(matches!(
-            put_shortfall_error(0, Some(app()), msg()),
+            put_shortfall_error(0, 0, Some(app()), msg()),
             Error::Payment(_)
         ));
-        // A transport failure in the mix: a genuine capacity shortfall.
+        // Any PUT-response timeout in the mix is genuine local backpressure:
+        // keep it a capacity signal so the store limiter still backs off (V2-554).
         assert!(matches!(
-            put_shortfall_error(1, Some(app()), msg()),
+            put_shortfall_error(1, 0, Some(app()), msg()),
             Error::InsufficientPeers(_)
         ));
-        // No application rejection captured at all (pure transport): capacity.
         assert!(matches!(
-            put_shortfall_error(0, None, msg()),
+            put_shortfall_error(1, 3, None, msg()),
             Error::InsufficientPeers(_)
+        ));
+        // No timeouts but dial/relay churn present: remote peer churn, not local
+        // capacity — surface a neutral CloseGroupShortfall (V2-554).
+        assert!(matches!(
+            put_shortfall_error(0, 2, None, msg()),
+            Error::CloseGroupShortfall(_)
+        ));
+        // Dial churn alongside an app rejection, still no timeout: neutral.
+        assert!(matches!(
+            put_shortfall_error(0, 1, Some(app()), msg()),
+            Error::CloseGroupShortfall(_)
         ));
     }
 

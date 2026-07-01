@@ -2598,9 +2598,12 @@ impl Client {
                 wave.len()
             );
 
-            // Clamp fan-out to wave size — partial last wave should
-            // not pay for extra slots (see PERF-RESULTS.md).
-            let store_concurrency = store_limiter.current().min(wave.len().max(1));
+            // Cap closure re-read per scheduler refill so mid-flight limiter
+            // growth reaches the rest of the wave (V2-554). Clamped to wave size
+            // — a partial last wave should not pay for extra slots (see
+            // PERF-RESULTS.md).
+            let wave_len = wave.len();
+            let cap = || store_limiter.current().min(wave_len.max(1));
             let chunks: Vec<([u8; 32], Bytes)> = wave
                 .into_iter()
                 .map(|(content, addr)| (addr, content))
@@ -2614,7 +2617,7 @@ impl Client {
             // across waves.
             let outcome = merkle_store_with_retry(
                 chunks,
-                store_concurrency,
+                cap,
                 1,
                 std::time::Duration::ZERO,
                 progress,

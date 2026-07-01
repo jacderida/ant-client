@@ -20,7 +20,7 @@ use ant_protocol::payment::{
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{compute_address, XorName, DATA_TYPE_CHUNK};
 use bytes::Bytes;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -784,35 +784,48 @@ impl Client {
             chunk_attempts_total = chunk_attempts_total.saturating_add(to_retry.len());
 
             let store_limiter = self.controller().store.clone();
-            let store_concurrency = store_limiter
-                .current()
-                .min(to_retry.len().max(1))
-                .min(byte_bound);
-            let mut upload_stream = stream::iter(to_retry)
-                .map(|chunk| {
-                    let chunk_clone = chunk.clone();
-                    let limiter = store_limiter.clone();
-                    async move {
-                        let result = observe_op(
-                            &limiter,
-                            || async move {
-                                self.chunk_put_to_close_group(
-                                    chunk.content,
-                                    chunk.proof_bytes,
-                                    &chunk.quoted_peers,
-                                )
-                                .await
-                            },
-                            classify_error,
-                        )
-                        .await;
-                        (chunk_clone, result)
-                    }
-                })
-                .buffer_unordered(store_concurrency);
+            // Rolling scheduler: keep up to `cap()` stores in flight and re-read
+            // the cap as each slot frees, so mid-flight limiter growth reaches
+            // the rest of this wave instead of being frozen at a per-wave
+            // snapshot (V2-554). The in-flight BYTE budget (`byte_bound`) stays
+            // enforced so a wave of large chunks can't OOM a small host;
+            // iterator exhaustion bounds launches to the wave, so no explicit
+            // clamp to `to_retry.len()` is needed.
+            let make_store = |chunk: PaidChunk| {
+                let chunk_clone = chunk.clone();
+                let limiter = store_limiter.clone();
+                async move {
+                    let result = observe_op(
+                        &limiter,
+                        || async move {
+                            self.chunk_put_to_close_group(
+                                chunk.content,
+                                chunk.proof_bytes,
+                                &chunk.quoted_peers,
+                            )
+                            .await
+                        },
+                        classify_error,
+                    )
+                    .await;
+                    (chunk_clone, result)
+                }
+            };
+            let mut chunk_iter = to_retry.into_iter();
+            let mut in_flight = FuturesUnordered::new();
 
             let mut failed_this_round = Vec::new();
-            while let Some((chunk, result)) = upload_stream.next().await {
+            loop {
+                let slots = store_limiter.current().min(byte_bound).max(1);
+                while in_flight.len() < slots {
+                    match chunk_iter.next() {
+                        Some(chunk) => in_flight.push(make_store(chunk)),
+                        None => break,
+                    }
+                }
+                let Some((chunk, result)) = in_flight.next().await else {
+                    break;
+                };
                 match result {
                     Ok(name) => {
                         let duration_ms = first_seen
