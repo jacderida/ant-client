@@ -412,6 +412,21 @@ async fn post_start_node(
     };
     drop(registry);
 
+    // An evicted node's data directory is gone; refuse to start it (recovery is to dismiss and
+    // re-add, not restart).
+    if config.eviction.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Node {id} has been evicted and cannot be started. Dismiss it with \
+                     `ant node dismiss {id}` and add a new node instead."
+                ),
+                "current_state": { "node_id": id, "status": "evicted" }
+            })),
+        ));
+    }
+
     let supervisor_ref = state.supervisor.clone();
 
     // Acquire write lock once for atomic check-and-act (avoids TOCTOU race)
@@ -465,7 +480,14 @@ async fn post_start_node(
 /// POST /api/v1/nodes/start-all — Start all registered nodes.
 async fn post_start_all(State(state): State<Arc<AppState>>) -> Json<StartNodeResult> {
     let registry = state.registry.read().await;
-    let configs: Vec<_> = registry.list().into_iter().cloned().collect();
+    // Evicted nodes have no data directory; skip them silently rather than attempting a spawn that
+    // would fail. They remain visible as `Evicted` in status until dismissed.
+    let configs: Vec<_> = registry
+        .list()
+        .into_iter()
+        .filter(|c| c.eviction.is_none())
+        .cloned()
+        .collect();
     drop(registry);
 
     let mut started = Vec::new();
@@ -524,6 +546,20 @@ async fn post_stop_node(
     };
     drop(registry);
 
+    // An evicted node is already stopped and its data directory deleted; there is nothing to stop.
+    if config.eviction.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Node {id} has been evicted; there is nothing to stop. Dismiss it with \
+                     `ant node dismiss {id}`."
+                ),
+                "current_state": { "node_id": id, "status": "evicted" }
+            })),
+        ));
+    }
+
     // Acquire write lock once for atomic check-and-act (avoids TOCTOU race)
     let mut supervisor = state.supervisor.write().await;
     if !supervisor.is_running(id) {
@@ -572,9 +608,11 @@ async fn post_stop_node(
 /// POST /api/v1/nodes/stop-all — Stop all running nodes.
 async fn post_stop_all(State(state): State<Arc<AppState>>) -> Json<StopNodeResult> {
     let registry = state.registry.read().await;
+    // Skip evicted nodes — there is nothing to stop, and they should stay `Evicted` until dismissed.
     let configs: Vec<(u32, String)> = registry
         .list()
         .into_iter()
+        .filter(|c| c.eviction.is_none())
         .map(|c| (c.id, c.service_name.clone()))
         .collect();
     drop(registry);
