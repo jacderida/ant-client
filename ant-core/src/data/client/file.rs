@@ -170,6 +170,22 @@ struct FileDownloadFetchContext {
 /// Number of chunks per upload wave (matches batch.rs PAYMENT_WAVE_SIZE).
 const UPLOAD_WAVE_SIZE: usize = 64;
 
+/// Hard ceiling on chunk bodies held in memory at once by the merkle whole-file
+/// store fan-out (`upload_merkle_from_spill`). Each in-flight store holds one
+/// spilled body (≤ `MAX_CHUNK_SIZE` = 4 MiB), so this bounds peak resident store
+/// memory at ~256 MiB — the same bound the old fixed 64-chunk waves gave. The
+/// adaptive store cap can legitimately exceed this (`AdaptiveConfig::sanitize`
+/// permits `adaptive.max.store` above 64), so the fan-out clamps its cap here to
+/// keep a high configured max from pinning gigabytes of chunk bodies (PR #137
+/// review). Throughput is unaffected at the default cap, which is already 64.
+const MERKLE_STORE_MAX_IN_FLIGHT: usize = 64;
+
+/// The merkle whole-file store fan-out concurrency: the adaptive store cap,
+/// clamped to [`MERKLE_STORE_MAX_IN_FLIGHT`] (memory bound) and floored at 1.
+fn merkle_store_cap(limiter_current: usize) -> usize {
+    limiter_current.clamp(1, MERKLE_STORE_MAX_IN_FLIGHT)
+}
+
 /// Stream decrypt batches should be larger than fetch fan-out so
 /// the rolling fetch scheduler can keep launching new chunk GETs as earlier
 /// ones complete, instead of stopping at each self-encryption batch boundary.
@@ -2554,8 +2570,10 @@ impl Client {
         // barrier: a slow straggler (e.g. a chunk whose close-group peers are
         // stale relayed addresses that take minutes to revalidate) no longer
         // holds back the rest of the file. Only the ≤cap in-flight stores hold a
-        // body, so peak resident memory is `cap × MAX_CHUNK_SIZE` — the same
-        // bound the fixed 64-chunk waves gave, since the store cap maxes at 64.
+        // body, so peak resident memory is `cap × MAX_CHUNK_SIZE`; the cap is
+        // clamped to `MERKLE_STORE_MAX_IN_FLIGHT` (below) so it stays within the
+        // ~256 MiB bound the fixed 64-chunk waves gave even if `adaptive.max.store`
+        // is configured above 64.
         // Shared across every deferred round so a converged routing table yields
         // a fresh group. Only a quorum shortfall is recoverable; a missing proof
         // or a failed spill read stays fatal. Mirrors `merkle_upload_chunks`.
@@ -2594,7 +2612,10 @@ impl Client {
         // demand by `store_one`), the same peak-memory bound the fixed 64-chunk
         // waves gave. Quorum-short chunks are collected and deferred to the
         // post-pass concurrent retry rather than parking slots behind a backoff.
-        let cap = || store_limiter.current().max(1);
+        // `merkle_store_cap` clamps to `MERKLE_STORE_MAX_IN_FLIGHT` so a high
+        // configured `adaptive.max.store` can't hold more than the wave-era
+        // ~256 MB of spilled bodies resident (PR #137 review).
+        let cap = || merkle_store_cap(store_limiter.current());
         let outcome = merkle_store_with_retry(
             to_store.clone(),
             cap,
@@ -2669,7 +2690,7 @@ impl Client {
             let dr = merkle_deferred_retry(
                 deferred,
                 &DEFERRED_ROUND_DELAYS_SECS,
-                |n: usize| store_limiter.current().min(n.max(1)),
+                |n: usize| merkle_store_cap(store_limiter.current()).min(n.max(1)),
                 progress,
                 total_stored,
                 total_chunks,
@@ -2719,10 +2740,27 @@ impl Client {
             failed.extend(dr.failed_addresses);
         }
 
+        // Emit a single terminal `WaveComplete`. The whole-file store now runs
+        // as one cap-bounded pass rather than fixed waves, but `WaveComplete` is
+        // a public phase-completion signal (consumed by the CLI progress adapter
+        // and external API clients), so report it once — "wave 1 of 1" — after
+        // the store pass and deferred retries so consumers that key on it still
+        // see the store phase complete (PR #137 review). Per-chunk `ChunkStored`
+        // events drive the progress bar as before.
+        if let Some(tx) = progress {
+            let _ = tx
+                .send(UploadEvent::WaveComplete {
+                    wave: 1,
+                    total_waves: 1,
+                    stored_so_far: total_stored,
+                    total: total_chunks,
+                })
+                .await;
+        }
+
         // A file with any permanently-failed chunk is not fully stored — surface
-        // it as `PartialUpload`, but only after the single wave pass and every
-        // deferred retry round are exhausted (never silently succeed with
-        // missing chunks).
+        // it as `PartialUpload`, but only after the store pass and every deferred
+        // retry round are exhausted (never silently succeed with missing chunks).
         if !failed.is_empty() {
             let failed_count = failed.len();
             let total_attempts = 1 + DEFERRED_ROUND_DELAYS_SECS.len();
@@ -3406,6 +3444,19 @@ impl Client {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merkle_store_cap_clamps_to_memory_bound() {
+        // Below the ceiling: pass the adaptive cap through unchanged.
+        assert_eq!(merkle_store_cap(8), 8);
+        assert_eq!(merkle_store_cap(64), 64);
+        // A configured `adaptive.max.store` above the ceiling must be clamped so
+        // the whole-file fan-out can't pin more than ~256 MB of bodies (PR #137).
+        assert_eq!(merkle_store_cap(512), MERKLE_STORE_MAX_IN_FLIGHT);
+        assert_eq!(merkle_store_cap(usize::MAX), MERKLE_STORE_MAX_IN_FLIGHT);
+        // Never zero — always make progress.
+        assert_eq!(merkle_store_cap(0), 1);
+    }
 
     #[test]
     fn distributed_sample_indices_spreads_across_large_file() {
