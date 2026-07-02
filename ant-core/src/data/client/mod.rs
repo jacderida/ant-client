@@ -63,6 +63,11 @@ pub(crate) const PUT_TARGET_WIDTH: usize = 20;
 /// - `RemotePut` -> `ApplicationError` (the remote node responded with a
 ///   structured rejection — the transport succeeded, so the node declined
 ///   at the application layer; not a local capacity signal)
+/// - `CloseGroupShortfall` -> `ApplicationError` (a quorum shortfall caused
+///   by close-group dial/relay churn with no PUT-response timeouts — remote
+///   peer churn, not local backpressure; a timeout-bearing shortfall keeps
+///   `InsufficientPeers`/`NetworkError` instead, so genuine congestion still
+///   cuts the cap — V2-554)
 pub(crate) fn classify_error(err: &Error) -> Outcome {
     match err {
         Error::Timeout(_) => Outcome::Timeout,
@@ -88,7 +93,14 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         // transport round-trip succeeded, so the node declined at the
         // application layer (payment/disk/quote/pool). Not a local
         // capacity signal; recorded but must not push the limiter down.
-        | Error::RemotePut { .. } => Outcome::ApplicationError,
+        | Error::RemotePut { .. }
+        // A close-group PUT shortfall caused purely by dial/relay churn
+        // (dead/stale relayed peer addresses), with no PUT-response
+        // timeouts to signal local backpressure. Remote peer churn, not
+        // "client sending too fast" — must not push the limiter down
+        // (V2-554). A shortfall that DID time out keeps `InsufficientPeers`
+        // (`NetworkError`) so real congestion still cuts the cap.
+        | Error::CloseGroupShortfall(_) => Outcome::ApplicationError,
     }
 }
 
@@ -669,6 +681,14 @@ mod tests {
                 },
                 Outcome::ApplicationError,
             ),
+            // A close-group quorum shortfall caused by dial/relay churn with
+            // no PUT-response timeouts — remote peer churn, not local
+            // backpressure, so it must NOT register as a capacity signal
+            // (V2-554). A timeout-bearing shortfall keeps `InsufficientPeers`.
+            (
+                Error::CloseGroupShortfall("Stored on 3 peers, need 4".to_string()),
+                Outcome::ApplicationError,
+            ),
         ];
         for (err, expected) in &cases {
             let got = classify_error(err);
@@ -750,7 +770,8 @@ mod tests {
             | Error::Cancelled(_)
             | Error::PartialUpload { .. }
             | Error::BadQuoteBinding { .. }
-            | Error::RemotePut { .. } => (),
+            | Error::RemotePut { .. }
+            | Error::CloseGroupShortfall(_) => (),
         };
     }
 }

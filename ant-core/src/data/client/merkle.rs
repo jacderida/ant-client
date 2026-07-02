@@ -835,19 +835,32 @@ impl Client {
                 addresses.len()
             )));
         }
-        let store_concurrency = store_limiter.current().min(batch_size.max(1));
+        // Cap closure re-read per scheduler refill so mid-flight limiter growth
+        // is applied to the rest of the batch (V2-554). Clamped to batch size —
+        // partial batches should not pay for unused slots (see PERF-RESULTS.md).
+        let cap = || store_limiter.current().min(batch_size.max(1));
 
-        let chunks: Vec<([u8; 32], Bytes)> = addresses.into_iter().zip(chunk_contents).collect();
+        // External-signer path: the chunk bodies are already resident in memory,
+        // so `store_one` clones each from this map on demand. (The whole-file
+        // path instead reads bodies from the on-disk spill — same `store_one(addr)`
+        // shape, so the store scheduler never carries a resident set of bodies.)
+        let bodies: std::collections::HashMap<[u8; 32], Bytes> =
+            addresses.iter().copied().zip(chunk_contents).collect();
+        let addrs = addresses;
 
         // Store one chunk to its (freshly re-collected) close group. Called
         // once per chunk per attempt, so a retry round naturally lands on a
         // converged routing table. Only `InsufficientPeers` is recoverable;
         // a missing proof stays fatal.
-        let store_one = |addr: [u8; 32], content: Bytes| {
+        let store_one = |addr: [u8; 32]| {
             let limiter = store_limiter.clone();
+            let content = bodies.get(&addr).cloned();
             let proof_bytes = batch_result.proofs.get(&addr).cloned();
             async move {
                 let started = std::time::Instant::now();
+                let content = content.ok_or_else(|| {
+                    Error::InvalidData(format!("missing chunk body for {}", hex::encode(addr)))
+                })?;
                 let proof = proof_bytes.ok_or_else(|| {
                     Error::Payment(format!(
                         "Missing merkle proof for chunk {}",
@@ -866,8 +879,8 @@ impl Client {
         };
 
         let outcome = merkle_store_with_retry(
-            chunks,
-            store_concurrency,
+            addrs,
+            cap,
             MERKLE_STORE_MAX_ATTEMPTS,
             MERKLE_RETRY_BACKOFF,
             progress,
@@ -947,15 +960,22 @@ pub(crate) struct MerkleStoreOutcome {
 
 /// Drive a set of merkle chunk stores with bounded retry of quorum shortfalls.
 ///
-/// Runs `store_one` over all `chunks` concurrently (up to `store_concurrency`),
-/// collecting any `InsufficientPeers` failures rather than aborting. Failed
-/// chunks are retried — `store_one` re-collects their close group on each call,
-/// so a converged routing table can yield a fresh group — for up to
-/// `max_attempts` rounds, sleeping a jittered `backoff` between rounds. A
-/// chunk's success is counted once and recorded in the retry round it landed on
-/// (`retries_histogram[round]`). `stored_offset` seeds the returned `stored`
-/// count and the progress numbering; `total` is the whole-file total reported
-/// in progress events.
+/// Runs `store_one(addr)` over all `addrs` concurrently, keeping up to `cap()`
+/// stores in flight and RE-READING `cap()` as each slot frees — so mid-flight
+/// adaptive growth is applied to the rest of the round instead of being frozen
+/// at a per-round snapshot (V2-554). `store_one` acquires the chunk body itself
+/// (e.g. reads it from the on-disk spill), so only the ≤`cap()` in-flight stores
+/// hold a body in memory — the caller passes addresses, never a resident set of
+/// bodies, which is what lets the whole-file store run as one cap-bounded
+/// fan-out instead of memory-bounded waves. Collects quorum shortfalls
+/// (`InsufficientPeers`, `CloseGroupShortfall`, `RemotePut`) rather than
+/// aborting. Failed chunks are retried — `store_one` re-collects their close
+/// group on each call, so a converged routing table can yield a fresh group —
+/// for up to `max_attempts` rounds, sleeping a jittered `backoff` between
+/// rounds. A chunk's success is counted once and recorded in the retry round it
+/// landed on (`retries_histogram[round]`). `stored_offset` seeds the returned
+/// `stored` count and the progress numbering; `total` is the whole-file total
+/// reported in progress events.
 ///
 /// A non-quorum error stops the pass but does **not** discard progress: the
 /// successes already completed this pass stay in `stored`/`stored_addresses`,
@@ -964,9 +984,9 @@ pub(crate) struct MerkleStoreOutcome {
 /// Callers that want the old abort-everything behaviour re-raise `fatal` as
 /// `Err`; CLI callers fold it into `PartialUpload` while keeping the stores.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn merkle_store_with_retry<F, Fut>(
-    chunks: Vec<([u8; 32], Bytes)>,
-    store_concurrency: usize,
+pub(crate) async fn merkle_store_with_retry<F, Fut, C>(
+    addrs: Vec<[u8; 32]>,
+    cap: C,
     max_attempts: usize,
     backoff: Duration,
     progress: Option<&mpsc::Sender<UploadEvent>>,
@@ -975,30 +995,45 @@ pub(crate) async fn merkle_store_with_retry<F, Fut>(
     store_one: F,
 ) -> Result<MerkleStoreOutcome>
 where
-    F: Fn([u8; 32], Bytes) -> Fut,
+    F: Fn([u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Result<std::time::Instant>>,
+    C: Fn() -> usize,
 {
     let attempts = max_attempts.max(1);
     let mut outcome = MerkleStoreOutcome {
         stored: stored_offset,
         ..MerkleStoreOutcome::default()
     };
-    let mut pending = chunks;
+    let mut pending = addrs;
 
     for attempt in 0..attempts {
-        let concurrency = store_concurrency.min(pending.len().max(1)).max(1);
-        // Carries the chunk body forward for the next round plus the last
+        // Carries the failing address forward for the next round plus the last
         // quorum-shortfall message, so an exhausted set can report per-chunk
-        // errors via `failed_addresses`.
-        let mut next_failed: Vec<([u8; 32], Bytes, String)> = Vec::new();
+        // errors via `failed_addresses`. The chunk BODY is not carried — each
+        // `store_one` re-reads it on demand, so at most `cap` bodies are ever
+        // resident regardless of the total chunk count.
+        let mut next_failed: Vec<([u8; 32], String)> = Vec::new();
 
-        let mut upload_stream = stream::iter(pending.into_iter().map(|(addr, content)| {
-            let fut = store_one(addr, content.clone());
-            async move { (addr, content, fut.await) }
-        }))
-        .buffer_unordered(concurrency);
-
-        while let Some((addr, content, result)) = upload_stream.next().await {
+        // Rolling scheduler: keep up to `cap()` stores in flight, re-reading the
+        // cap as each slot frees so limiter growth mid-round is applied to the
+        // remaining chunks (V2-554). Iterator exhaustion bounds the launch count
+        // to the pending set, so no explicit clamp to `pending.len()` is needed.
+        let mut pending_iter = pending.into_iter();
+        let mut in_flight = FuturesUnordered::new();
+        loop {
+            let slots = cap().max(1);
+            while in_flight.len() < slots {
+                match pending_iter.next() {
+                    Some(addr) => {
+                        let fut = store_one(addr);
+                        in_flight.push(async move { (addr, fut.await) });
+                    }
+                    None => break,
+                }
+            }
+            let Some((addr, result)) = in_flight.next().await else {
+                break;
+            };
             outcome.stats.chunk_attempts_total =
                 outcome.stats.chunk_attempts_total.saturating_add(1);
             match result {
@@ -1018,13 +1053,18 @@ where
                         });
                     }
                 }
-                // A quorum shortfall — whether reported as a transport
-                // shortfall (`InsufficientPeers`) or an app-only rejection
+                // A quorum shortfall — whether a timeout-bearing capacity
+                // shortfall (`InsufficientPeers`), a pure dial-churn shortfall
+                // (`CloseGroupShortfall`, V2-554), or an app-only rejection
                 // (`RemotePut`, e.g. pool-rejected / quote-stale / disk-full,
                 // which are transient) — is recoverable: defer and retry the
-                // chunk rather than aborting the whole upload (V2-468).
-                Err(e @ (Error::InsufficientPeers(_) | Error::RemotePut { .. })) => {
-                    next_failed.push((addr, content, e.to_string()));
+                // chunk rather than aborting the whole upload (V2-468 / V2-554).
+                Err(
+                    e @ (Error::InsufficientPeers(_)
+                    | Error::CloseGroupShortfall(_)
+                    | Error::RemotePut { .. }),
+                ) => {
+                    next_failed.push((addr, e.to_string()));
                 }
                 Err(e) => {
                     // Non-quorum error: fatal. Stop consuming the stream but do
@@ -1034,7 +1074,7 @@ where
                     // far) as failed; anything still in flight is left for the
                     // caller to treat as not-stored (input minus
                     // `stored_addresses`).
-                    next_failed.push((addr, content, e.to_string()));
+                    next_failed.push((addr, e.to_string()));
                     outcome.fatal = Some(e);
                     break;
                 }
@@ -1043,10 +1083,7 @@ where
 
         if outcome.fatal.is_some() {
             outcome.failed = next_failed.len();
-            outcome.failed_addresses = next_failed
-                .into_iter()
-                .map(|(addr, _content, msg)| (addr, msg))
-                .collect();
+            outcome.failed_addresses = next_failed;
             return Ok(outcome);
         }
 
@@ -1060,10 +1097,7 @@ where
                 attempt = attempt + 1,
                 "merkle chunks short of quorum, retrying after backoff"
             );
-            pending = next_failed
-                .into_iter()
-                .map(|(addr, content, _msg)| (addr, content))
-                .collect();
+            pending = next_failed.into_iter().map(|(addr, _msg)| addr).collect();
             if backoff > Duration::ZERO {
                 // Jitter the wait (±MERKLE_RETRY_JITTER) so a large failed set
                 // does not re-probe the same divergent nodes in lockstep.
@@ -1078,10 +1112,7 @@ where
             }
         } else {
             outcome.failed = next_failed.len();
-            outcome.failed_addresses = next_failed
-                .into_iter()
-                .map(|(addr, _content, msg)| (addr, msg))
-                .collect();
+            outcome.failed_addresses = next_failed;
             break;
         }
     }
@@ -1137,28 +1168,24 @@ pub(crate) struct DeferredRetryOutcome {
 /// Retry a file-level set of quorum-short merkle chunks in concurrent rounds.
 ///
 /// This is the upload analogue of the download path's deferred-retry loop. The
-/// wave passes store each wave in a single pass (no in-wave backoff barrier) and
-/// hand their quorum-short chunks here. Each round processes the still-pending
-/// chunks in **bounded batches of `batch_size`**: it re-reads only one batch of
-/// bodies at a time via `read_bodies` (from the spill file), so peak resident
-/// memory stays at the wave path's `batch_size × MAX_CHUNK_SIZE` bound rather
-/// than scaling with the whole file's deferred-chunk count. Each batch is stored
-/// concurrently at `concurrency_for(len)` via the single-pass
-/// [`merkle_store_with_retry`] primitive, and survivors carry to the next round
+/// whole-file store pass hands its quorum-short chunks here. Each round stores
+/// all still-pending chunks in a single cap-bounded pass via
+/// [`merkle_store_with_retry`] at `concurrency_for(len)` — `store_one(addr)`
+/// re-reads each body on demand (from the spill), so only the ≤`concurrency_for`
+/// in-flight stores hold a body and peak resident memory stays bounded
+/// regardless of the deferred-chunk count. Survivors carry to the next round
 /// after a `round_delays_secs` sleep. Chunks still short after the final round
 /// become `failed_addresses`; a non-quorum store error stops the pass and is
-/// reported via `fatal` (with every not-yet-stored chunk recorded as
-/// `failed_addresses`) so the caller can surface `PartialUpload` without
-/// discarding earlier progress.
+/// reported via `fatal` (with the quorum shortfalls seen so far recorded as
+/// `failed_addresses`) so the caller can surface `PartialUpload` — reconciled
+/// against the full address list — without discarding earlier progress.
 ///
 /// `store_one`, `progress`, `stored_offset` and `total` mirror
 /// [`merkle_store_with_retry`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn merkle_deferred_retry<RB, CF, SF, Fut>(
+pub(crate) async fn merkle_deferred_retry<CF, SF, Fut>(
     deferred: Vec<([u8; 32], String)>,
     round_delays_secs: &[u64],
-    batch_size: usize,
-    read_bodies: RB,
     concurrency_for: CF,
     progress: Option<&mpsc::Sender<UploadEvent>>,
     stored_offset: usize,
@@ -1166,12 +1193,10 @@ pub(crate) async fn merkle_deferred_retry<RB, CF, SF, Fut>(
     store_one: SF,
 ) -> Result<DeferredRetryOutcome>
 where
-    RB: Fn(&[[u8; 32]]) -> Result<Vec<([u8; 32], Bytes)>>,
     CF: Fn(usize) -> usize,
-    SF: Fn([u8; 32], Bytes) -> Fut,
+    SF: Fn([u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Result<std::time::Instant>>,
 {
-    let batch_size = batch_size.max(1);
     let mut outcome = DeferredRetryOutcome {
         stored: stored_offset,
         ..DeferredRetryOutcome::default()
@@ -1193,73 +1218,62 @@ where
             remaining.len(),
         );
 
-        // Drain this round's input; survivors accumulate back into `remaining`
-        // for the next round. A single-pass batch records its successes in
-        // histogram slot 0, so all of this round's successes redirect to one
-        // slot.
+        // Store this round's whole pending set in one cap-bounded pass. A
+        // single-pass round records its successes in histogram slot 0, so
+        // redirect them into the round's own slot.
         let slot = deferred_round_histogram_slot(round, outcome.stats.retries_histogram.len());
-        let round_input = std::mem::take(&mut remaining);
-        let mut input_iter = round_input.into_iter();
+        let round_addrs: Vec<[u8; 32]> = std::mem::take(&mut remaining)
+            .into_iter()
+            .map(|(addr, _msg)| addr)
+            .collect();
+        let round_len = round_addrs.len();
+        // Re-read the cap per scheduler refill (V2-554) via `concurrency_for`,
+        // which re-samples the store limiter clamped to this round's size.
+        let cap = || concurrency_for(round_len);
 
-        loop {
-            let batch: Vec<([u8; 32], String)> = input_iter.by_ref().take(batch_size).collect();
-            if batch.is_empty() {
-                break;
-            }
-            let batch_addrs: Vec<[u8; 32]> = batch.iter().map(|(addr, _)| *addr).collect();
-            // Re-read only this batch's bodies from the spill (≤ batch_size
-            // resident at a time), so the deferred path keeps the wave path's
-            // memory bound regardless of how many chunks were deferred.
-            let chunks = read_bodies(&batch_addrs)?;
-            let concurrency = concurrency_for(batch_addrs.len());
+        let round_outcome = merkle_store_with_retry(
+            round_addrs,
+            cap,
+            1,
+            Duration::ZERO,
+            progress,
+            outcome.stored,
+            total,
+            &store_one,
+        )
+        .await?;
 
-            let batch_outcome = merkle_store_with_retry(
-                chunks,
-                concurrency,
-                1,
-                Duration::ZERO,
-                progress,
-                outcome.stored,
-                total,
-                &store_one,
-            )
-            .await?;
+        outcome.stored = round_outcome.stored;
+        outcome
+            .stored_addresses
+            .extend(round_outcome.stored_addresses);
 
-            outcome.stored = batch_outcome.stored;
-            outcome
-                .stored_addresses
-                .extend(batch_outcome.stored_addresses);
+        // Merge stats, redirecting this round's successes to its slot.
+        outcome.stats.chunk_attempts_total = outcome
+            .stats
+            .chunk_attempts_total
+            .saturating_add(round_outcome.stats.chunk_attempts_total);
+        outcome
+            .stats
+            .store_durations_ms
+            .extend(round_outcome.stats.store_durations_ms);
+        let landed: usize = round_outcome.stats.retries_histogram.iter().sum();
+        outcome.stats.retries_histogram[slot] =
+            outcome.stats.retries_histogram[slot].saturating_add(landed);
 
-            // Merge stats, redirecting this round's successes to its slot.
-            outcome.stats.chunk_attempts_total = outcome
-                .stats
-                .chunk_attempts_total
-                .saturating_add(batch_outcome.stats.chunk_attempts_total);
-            outcome
-                .stats
-                .store_durations_ms
-                .extend(batch_outcome.stats.store_durations_ms);
-            let landed: usize = batch_outcome.stats.retries_histogram.iter().sum();
-            outcome.stats.retries_histogram[slot] =
-                outcome.stats.retries_histogram[slot].saturating_add(landed);
-
-            if let Some(fatal) = batch_outcome.fatal {
-                // Fatal mid-pass: confirmed stores are preserved above. Report
-                // everything not stored as failed — this batch's quorum
-                // shortfalls, the remaining unprocessed batches in this round,
-                // and any survivors already carried from earlier batches.
-                outcome.fatal = Some(fatal.to_string());
-                let mut failed = batch_outcome.failed_addresses;
-                failed.extend(input_iter);
-                failed.extend(std::mem::take(&mut remaining));
-                outcome.failed = failed.len();
-                outcome.failed_addresses = failed;
-                return Ok(outcome);
-            }
-
-            // Quorum-short chunks from this batch survive to the next round.
-            remaining.extend(batch_outcome.failed_addresses);
+        if let Some(fatal) = round_outcome.fatal {
+            // Fatal mid-pass: confirmed stores are preserved above. The store
+            // helper left this round's quorum shortfalls in `failed_addresses`;
+            // chunks still in flight / not yet launched are reconciled against
+            // the full address list by the caller's `partial_upload_after_fatal`.
+            outcome.fatal = Some(fatal.to_string());
+            outcome.failed = round_outcome.failed_addresses.len();
+            outcome.failed_addresses = round_outcome.failed_addresses;
+            return Ok(outcome);
         }
+
+        // Quorum-short chunks from this round survive to the next.
+        remaining = round_outcome.failed_addresses;
     }
 
     outcome.failed = remaining.len();
@@ -1769,12 +1783,10 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
-    /// Build `count` (addr, content) pairs for the retry helper.
-    fn make_chunks(count: usize) -> Vec<([u8; 32], Bytes)> {
+    /// Build `count` chunk addresses for the store helper. Bodies are read on
+    /// demand by `store_one`, so the tests pass addresses only.
+    fn make_addrs(count: usize) -> Vec<[u8; 32]> {
         make_test_addresses(count)
-            .into_iter()
-            .map(|addr| (addr, Bytes::from_static(b"chunk")))
-            .collect()
     }
 
     /// C2.1: a per-chunk `InsufficientPeers` is collected, not propagated —
@@ -1782,12 +1794,11 @@ mod tests {
     /// subset is reported via `failed` and the rest are `stored`.
     #[tokio::test]
     async fn store_with_retry_collects_failures_instead_of_aborting() {
-        let chunks = make_chunks(6);
-        let failing: std::collections::HashSet<[u8; 32]> =
-            chunks.iter().take(2).map(|(a, _)| *a).collect();
+        let chunks = make_addrs(6);
+        let failing: std::collections::HashSet<[u8; 32]> = chunks.iter().take(2).copied().collect();
         let failing_for_closure = failing.clone();
 
-        let store_one = move |addr: [u8; 32], _content: Bytes| {
+        let store_one = move |addr: [u8; 32]| {
             let fail = failing_for_closure.contains(&addr);
             async move {
                 if fail {
@@ -1798,9 +1809,10 @@ mod tests {
             }
         };
 
-        let outcome = merkle_store_with_retry(chunks, 8, 1, Duration::ZERO, None, 0, 6, store_one)
-            .await
-            .expect("quorum shortfalls must not abort the batch");
+        let outcome =
+            merkle_store_with_retry(chunks, || 8, 1, Duration::ZERO, None, 0, 6, store_one)
+                .await
+                .expect("quorum shortfalls must not abort the batch");
 
         assert_eq!(outcome.stored, 4);
         assert_eq!(outcome.failed, 2);
@@ -1809,18 +1821,143 @@ mod tests {
         assert_eq!(outcome.stats.chunk_attempts_total, 6);
     }
 
+    /// V2-554: the store scheduler must RE-READ the cap as each slot frees
+    /// (rolling), not snapshot it once like `buffer_unordered`. A snapshot would
+    /// invoke the cap closure once per attempt; the rolling scheduler invokes it
+    /// once per drained slot, so mid-flight limiter growth reaches the rest of
+    /// the round. Proven here by counting cap-closure invocations.
+    #[tokio::test]
+    async fn store_with_retry_rereads_cap_per_slot() {
+        let count = 6;
+        let chunks = make_addrs(count);
+        let cap_calls = Arc::new(Mutex::new(0usize));
+        let cap_calls_for_closure = cap_calls.clone();
+        let cap = move || {
+            *cap_calls_for_closure.lock().expect("cap counter poisoned") += 1;
+            2
+        };
+        let store_one = move |_addr: [u8; 32]| async move { Ok(std::time::Instant::now()) };
+
+        let outcome =
+            merkle_store_with_retry(chunks, cap, 1, Duration::ZERO, None, 0, count, store_one)
+                .await
+                .expect("all stores succeed");
+
+        assert_eq!(outcome.stored, count);
+        let calls = *cap_calls.lock().expect("cap counter poisoned");
+        assert!(
+            calls >= count,
+            "cap must be re-read per drained slot (rolling), not snapshotted once — \
+             expected >= {count} invocations, got {calls}",
+        );
+    }
+
+    /// The whole-file store pass is a single cap-bounded fan-out with NO wave
+    /// barrier: one slow straggler (a chunk whose peers take a long time) must
+    /// not block the rest of the file, and must be driven to completion
+    /// concurrently by the fast chunks. If the scheduler serialized (a barrier),
+    /// the fast chunks could not run until the straggler returned — a deadlock
+    /// the surrounding timeout would catch.
+    #[tokio::test]
+    async fn store_pass_has_no_barrier() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = 8;
+        let addrs = make_addrs(count);
+        let slow = addrs[0];
+        let fast_completed = Arc::new(AtomicUsize::new(0));
+        let release_slow = Arc::new(tokio::sync::Notify::new());
+
+        let store_one = move |addr: [u8; 32]| {
+            let fast_completed = fast_completed.clone();
+            let release_slow = release_slow.clone();
+            async move {
+                if addr == slow {
+                    // Block until every fast chunk has finished. This can only
+                    // resolve if the fast chunks run WHILE this one is parked —
+                    // i.e. there is no barrier serializing the store pass.
+                    release_slow.notified().await;
+                } else if fast_completed.fetch_add(1, Ordering::SeqCst) + 1 == count - 1 {
+                    release_slow.notify_one();
+                }
+                Ok(std::time::Instant::now())
+            }
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            merkle_store_with_retry(addrs, || 8, 1, Duration::ZERO, None, 0, count, store_one),
+        )
+        .await
+        .expect("store pass must not deadlock — a slow chunk must not block the others")
+        .expect("all stores succeed");
+
+        assert_eq!(outcome.stored, count);
+    }
+
+    /// Peak memory is bounded by the store cap, not the file size: `store_one`
+    /// reads each body on demand, so the scheduler holds at most `cap` stores
+    /// (hence at most `cap` bodies) in flight at once — the property that lets
+    /// the whole file store as one fan-out without the old 64-chunk waves.
+    #[tokio::test]
+    async fn store_pass_keeps_at_most_cap_in_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = 40;
+        let cap = 4;
+        let addrs = make_addrs(count);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight_for_closure = max_in_flight.clone();
+
+        let store_one = move |_addr: [u8; 32]| {
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight_for_closure.clone();
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(now, Ordering::SeqCst);
+                // Yield so sibling stores get a chance to start concurrently,
+                // maximising the observed in-flight count.
+                tokio::task::yield_now().await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(std::time::Instant::now())
+            }
+        };
+
+        let outcome = merkle_store_with_retry(
+            addrs,
+            move || cap,
+            1,
+            Duration::ZERO,
+            None,
+            0,
+            count,
+            store_one,
+        )
+        .await
+        .expect("all stores succeed");
+
+        assert_eq!(outcome.stored, count);
+        let peak = max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak <= cap,
+            "at most `cap` bodies may be in flight (memory bound), got peak {peak} > cap {cap}",
+        );
+        assert!(
+            peak > 1,
+            "the pass must actually run concurrently, not serialize (peak {peak})",
+        );
+    }
+
     /// V2-468: an app-only quorum shortfall surfaces as `Error::RemotePut`
     /// (pool-rejected / quote-stale / disk-full — transient), which must be
     /// treated as recoverable just like `InsufficientPeers`: collected and
     /// retried, never aborting the whole batch.
     #[tokio::test]
     async fn store_with_retry_treats_remote_put_as_recoverable() {
-        let chunks = make_chunks(6);
-        let failing: std::collections::HashSet<[u8; 32]> =
-            chunks.iter().take(2).map(|(a, _)| *a).collect();
+        let chunks = make_addrs(6);
+        let failing: std::collections::HashSet<[u8; 32]> = chunks.iter().take(2).copied().collect();
         let failing_for_closure = failing.clone();
 
-        let store_one = move |addr: [u8; 32], _content: Bytes| {
+        let store_one = move |addr: [u8; 32]| {
             let fail = failing_for_closure.contains(&addr);
             async move {
                 if fail {
@@ -1836,9 +1973,10 @@ mod tests {
             }
         };
 
-        let outcome = merkle_store_with_retry(chunks, 8, 1, Duration::ZERO, None, 0, 6, store_one)
-            .await
-            .expect("remote app-rejections must not abort the batch");
+        let outcome =
+            merkle_store_with_retry(chunks, || 8, 1, Duration::ZERO, None, 0, 6, store_one)
+                .await
+                .expect("remote app-rejections must not abort the batch");
 
         assert_eq!(outcome.stored, 4);
         assert_eq!(outcome.failed, 2);
@@ -1849,14 +1987,15 @@ mod tests {
     /// whether to re-raise it or fold it into `PartialUpload`.
     #[tokio::test]
     async fn store_with_retry_reports_non_quorum_errors_as_fatal() {
-        let chunks = make_chunks(3);
-        let store_one = |_addr: [u8; 32], _content: Bytes| async move {
+        let chunks = make_addrs(3);
+        let store_one = |_addr: [u8; 32]| async move {
             Err::<std::time::Instant, _>(Error::Payment("missing proof".into()))
         };
 
-        let outcome = merkle_store_with_retry(chunks, 8, 3, Duration::ZERO, None, 0, 3, store_one)
-            .await
-            .expect("fatal is carried in the outcome, not returned as Err");
+        let outcome =
+            merkle_store_with_retry(chunks, || 8, 3, Duration::ZERO, None, 0, 3, store_one)
+                .await
+                .expect("fatal is carried in the outcome, not returned as Err");
         assert!(matches!(outcome.fatal, Some(Error::Payment(_))));
     }
 
@@ -1866,9 +2005,9 @@ mod tests {
     /// aborts fatally.
     #[tokio::test]
     async fn store_with_retry_fatal_preserves_same_pass_successes() {
-        let chunks = make_chunks(6);
-        let bad = chunks[5].0;
-        let store_one = move |addr: [u8; 32], _content: Bytes| async move {
+        let chunks = make_addrs(6);
+        let bad = chunks[5];
+        let store_one = move |addr: [u8; 32]| async move {
             if addr == bad {
                 Err(Error::Payment("fatal".into()))
             } else {
@@ -1876,9 +2015,10 @@ mod tests {
             }
         };
 
-        let outcome = merkle_store_with_retry(chunks, 1, 1, Duration::ZERO, None, 0, 6, store_one)
-            .await
-            .expect("fatal carried in outcome, not returned as Err");
+        let outcome =
+            merkle_store_with_retry(chunks, || 1, 1, Duration::ZERO, None, 0, 6, store_one)
+                .await
+                .expect("fatal carried in outcome, not returned as Err");
         assert!(matches!(outcome.fatal, Some(Error::Payment(_))));
         // The five chunks stored before the abort are preserved, not lost.
         assert_eq!(outcome.stored, 5);
@@ -1891,17 +2031,16 @@ mod tests {
     /// C2.2: only the chunks that failed the previous round are retried.
     #[tokio::test]
     async fn store_with_retry_retries_only_the_failed_set() {
-        let chunks = make_chunks(5);
+        let chunks = make_addrs(5);
         let total = chunks.len();
-        let failing: std::collections::HashSet<[u8; 32]> =
-            chunks.iter().take(2).map(|(a, _)| *a).collect();
+        let failing: std::collections::HashSet<[u8; 32]> = chunks.iter().take(2).copied().collect();
         let failing_for_closure = failing.clone();
 
         // Record every (addr) the store op was invoked with, in call order.
         let calls = Arc::new(Mutex::new(Vec::<[u8; 32]>::new()));
         let calls_for_closure = calls.clone();
 
-        let store_one = move |addr: [u8; 32], _content: Bytes| {
+        let store_one = move |addr: [u8; 32]| {
             let calls = calls_for_closure.clone();
             // Fails the first round only; succeeds thereafter.
             let already_seen = calls.lock().unwrap().iter().filter(|&&a| a == addr).count();
@@ -1917,7 +2056,7 @@ mod tests {
         };
 
         let outcome =
-            merkle_store_with_retry(chunks, 8, 3, Duration::ZERO, None, 0, total, store_one)
+            merkle_store_with_retry(chunks, || 8, 3, Duration::ZERO, None, 0, total, store_one)
                 .await
                 .expect("should converge after retry");
 
@@ -1938,14 +2077,14 @@ mod tests {
     /// once as stored and recorded as one retry in `retries_histogram[1]`.
     #[tokio::test]
     async fn store_with_retry_counts_retry_success_once_in_histogram() {
-        let chunks = make_chunks(4);
+        let chunks = make_addrs(4);
         let total = chunks.len();
-        let flaky_addr = chunks[0].0;
+        let flaky_addr = chunks[0];
 
         let attempts = Arc::new(Mutex::new(HashMap::<[u8; 32], usize>::new()));
         let attempts_for_closure = attempts.clone();
 
-        let store_one = move |addr: [u8; 32], _content: Bytes| {
+        let store_one = move |addr: [u8; 32]| {
             let attempts = attempts_for_closure.clone();
             let n = {
                 let mut m = attempts.lock().unwrap();
@@ -1964,7 +2103,7 @@ mod tests {
         };
 
         let outcome =
-            merkle_store_with_retry(chunks, 8, 3, Duration::ZERO, None, 0, total, store_one)
+            merkle_store_with_retry(chunks, || 8, 3, Duration::ZERO, None, 0, total, store_one)
                 .await
                 .expect("flaky chunk should recover on retry");
 
@@ -1983,16 +2122,16 @@ mod tests {
     /// `MERKLE_STORE_MAX_ATTEMPTS` times.
     #[tokio::test]
     async fn store_with_retry_reports_all_failed_when_retries_exhausted() {
-        let chunks = make_chunks(3);
+        let chunks = make_addrs(3);
         let total = chunks.len();
 
-        let store_one = |_addr: [u8; 32], _content: Bytes| async move {
+        let store_one = |_addr: [u8; 32]| async move {
             Err::<std::time::Instant, _>(Error::InsufficientPeers("never converges".into()))
         };
 
         let outcome = merkle_store_with_retry(
             chunks,
-            8,
+            || 8,
             MERKLE_STORE_MAX_ATTEMPTS,
             Duration::ZERO,
             None,
@@ -2016,16 +2155,15 @@ mod tests {
 
     /// D (CLI path): when retries are exhausted, `failed_addresses` names
     /// exactly the still-short-of-quorum chunks (with their last error message)
-    /// and excludes the ones that stored. This is what `upload_waves_merkle`
+    /// and excludes the ones that stored. This is what `upload_merkle_from_spill`
     /// uses to build `PartialUpload`.
     #[tokio::test]
     async fn store_with_retry_records_failed_addresses_when_exhausted() {
-        let chunks = make_chunks(6);
-        let failing: std::collections::HashSet<[u8; 32]> =
-            chunks.iter().take(2).map(|(a, _)| *a).collect();
+        let chunks = make_addrs(6);
+        let failing: std::collections::HashSet<[u8; 32]> = chunks.iter().take(2).copied().collect();
         let failing_for_closure = failing.clone();
 
-        let store_one = move |addr: [u8; 32], _content: Bytes| {
+        let store_one = move |addr: [u8; 32]| {
             let fail = failing_for_closure.contains(&addr);
             async move {
                 if fail {
@@ -2038,7 +2176,7 @@ mod tests {
 
         let outcome = merkle_store_with_retry(
             chunks,
-            8,
+            || 8,
             MERKLE_STORE_MAX_ATTEMPTS,
             Duration::ZERO,
             None,
@@ -2066,14 +2204,13 @@ mod tests {
     /// `PartialUpload` is raised by the CLI path in that case).
     #[tokio::test]
     async fn store_with_retry_failed_addresses_empty_on_full_success() {
-        let chunks = make_chunks(4);
+        let chunks = make_addrs(4);
         let total = chunks.len();
-        let store_one =
-            |_addr: [u8; 32], _content: Bytes| async move { Ok(std::time::Instant::now()) };
+        let store_one = |_addr: [u8; 32]| async move { Ok(std::time::Instant::now()) };
 
         let outcome = merkle_store_with_retry(
             chunks,
-            8,
+            || 8,
             MERKLE_STORE_MAX_ATTEMPTS,
             Duration::ZERO,
             None,
@@ -2105,16 +2242,6 @@ mod tests {
         assert_eq!(deferred_round_histogram_slot(9, 4), 3);
     }
 
-    /// Re-read bodies for a deferred set from a fake "spill": every requested
-    /// address is returned paired with a stub body. Zero delays so tests do not
-    /// actually sleep between rounds.
-    fn fake_read_bodies(addrs: &[[u8; 32]]) -> Result<Vec<([u8; 32], Bytes)>> {
-        Ok(addrs
-            .iter()
-            .map(|a| (*a, Bytes::from_static(b"deferred-body")))
-            .collect())
-    }
-
     fn deferred_set(count: usize) -> Vec<([u8; 32], String)> {
         make_test_addresses(count)
             .into_iter()
@@ -2132,7 +2259,7 @@ mod tests {
         // (round 1 → histogram slot 2).
         let attempts = Arc::new(Mutex::new(HashMap::<[u8; 32], usize>::new()));
         let attempts_for_closure = attempts.clone();
-        let store_one = move |addr: [u8; 32], _content: Bytes| {
+        let store_one = move |addr: [u8; 32]| {
             let attempts = attempts_for_closure.clone();
             async move {
                 let n = {
@@ -2152,8 +2279,6 @@ mod tests {
         let outcome = merkle_deferred_retry(
             deferred,
             &[0, 0, 0],
-            64,
-            fake_read_bodies,
             |n: usize| n.max(1),
             None,
             0,
@@ -2180,15 +2305,13 @@ mod tests {
     #[tokio::test]
     async fn deferred_retry_leftovers_become_failed() {
         let deferred = deferred_set(2);
-        let store_one = |_addr: [u8; 32], _content: Bytes| async move {
+        let store_one = |_addr: [u8; 32]| async move {
             Err::<std::time::Instant, _>(Error::InsufficientPeers("always short".into()))
         };
 
         let outcome = merkle_deferred_retry(
             deferred,
             &[0, 0, 0],
-            64,
-            fake_read_bodies,
             |n: usize| n.max(1),
             None,
             0,
@@ -2222,7 +2345,7 @@ mod tests {
         // hits a fatal Payment error on round 1.
         let attempts = Arc::new(Mutex::new(HashMap::<[u8; 32], usize>::new()));
         let attempts_for_closure = attempts.clone();
-        let store_one = move |addr: [u8; 32], _content: Bytes| {
+        let store_one = move |addr: [u8; 32]| {
             let attempts = attempts_for_closure.clone();
             async move {
                 let n = {
@@ -2244,8 +2367,6 @@ mod tests {
         let outcome = merkle_deferred_retry(
             deferred,
             &[0, 0, 0],
-            64,
-            fake_read_bodies,
             |n: usize| n.max(1),
             None,
             0,
@@ -2266,15 +2387,13 @@ mod tests {
     /// An empty deferred set is a no-op: no rounds run, nothing stored or failed.
     #[tokio::test]
     async fn deferred_retry_empty_set_is_a_noop() {
-        let store_one = |_addr: [u8; 32], _content: Bytes| async move {
+        let store_one = |_addr: [u8; 32]| async move {
             Err::<std::time::Instant, _>(Error::InsufficientPeers("unused".into()))
         };
 
         let outcome = merkle_deferred_retry(
             Vec::new(),
             &DEFERRED_ROUND_DELAYS_SECS,
-            64,
-            fake_read_bodies,
             |n: usize| n.max(1),
             None,
             7,
@@ -2289,50 +2408,5 @@ mod tests {
         assert!(outcome.stored_addresses.is_empty());
         assert!(outcome.failed_addresses.is_empty());
         assert!(outcome.fatal.is_none());
-    }
-
-    /// The memory-bound guard (V2-466 review finding 1): a deferred set far
-    /// larger than `batch_size` is read from the spill in batches of at most
-    /// `batch_size`, so peak resident bodies never scale with the file-wide
-    /// deferred count. All chunks still store.
-    #[tokio::test]
-    async fn deferred_retry_reads_bodies_in_bounded_batches() {
-        let deferred = deferred_set(10);
-        let batch_size = 4;
-        // Record the largest single read_bodies request.
-        let max_batch = Arc::new(Mutex::new(0usize));
-        let max_batch_for_closure = max_batch.clone();
-        let read_bodies = move |addrs: &[[u8; 32]]| {
-            let mut m = max_batch_for_closure.lock().unwrap();
-            *m = (*m).max(addrs.len());
-            Ok(addrs
-                .iter()
-                .map(|a| (*a, Bytes::from_static(b"body")))
-                .collect())
-        };
-        let store_one =
-            |_addr: [u8; 32], _content: Bytes| async move { Ok(std::time::Instant::now()) };
-
-        let outcome = merkle_deferred_retry(
-            deferred,
-            &[0, 0, 0],
-            batch_size,
-            read_bodies,
-            |n: usize| n.max(1),
-            None,
-            0,
-            10,
-            store_one,
-        )
-        .await
-        .expect("bounded-batch deferred retry stores everything");
-
-        assert_eq!(outcome.stored, 10);
-        assert_eq!(outcome.stored_addresses.len(), 10);
-        assert_eq!(outcome.failed, 0);
-        assert!(
-            *max_batch.lock().unwrap() <= batch_size,
-            "read_bodies must never be handed more than batch_size addresses at once"
-        );
     }
 }

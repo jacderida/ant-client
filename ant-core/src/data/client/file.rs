@@ -61,13 +61,6 @@ pub enum UploadEvent {
     ChunkQuoted { quoted: usize, total: usize },
     /// A chunk has been stored on the network.
     ChunkStored { stored: usize, total: usize },
-    /// A wave has completed.
-    WaveComplete {
-        wave: usize,
-        total_waves: usize,
-        stored_so_far: usize,
-        total: usize,
-    },
 }
 
 /// Progress events emitted during file download for UI feedback.
@@ -169,6 +162,22 @@ struct FileDownloadFetchContext {
 
 /// Number of chunks per upload wave (matches batch.rs PAYMENT_WAVE_SIZE).
 const UPLOAD_WAVE_SIZE: usize = 64;
+
+/// Hard ceiling on chunk bodies held in memory at once by the merkle whole-file
+/// store fan-out (`upload_merkle_from_spill`). Each in-flight store holds one
+/// spilled body (≤ `MAX_CHUNK_SIZE` = 4 MiB), so this bounds peak resident store
+/// memory at ~256 MiB — the same bound the old fixed 64-chunk waves gave. The
+/// adaptive store cap can legitimately exceed this (`AdaptiveConfig::sanitize`
+/// permits `adaptive.max.store` above 64), so the fan-out clamps its cap here to
+/// keep a high configured max from pinning gigabytes of chunk bodies (PR #137
+/// review). Throughput is unaffected at the default cap, which is already 64.
+const MERKLE_STORE_MAX_IN_FLIGHT: usize = 64;
+
+/// The merkle whole-file store fan-out concurrency: the adaptive store cap,
+/// clamped to [`MERKLE_STORE_MAX_IN_FLIGHT`] (memory bound) and floored at 1.
+fn merkle_store_cap(limiter_current: usize) -> usize {
+    limiter_current.clamp(1, MERKLE_STORE_MAX_IN_FLIGHT)
+}
 
 /// Stream decrypt batches should be larger than fetch fan-out so
 /// the rolling fetch scheduler can keep launching new chunk GETs as earlier
@@ -592,16 +601,6 @@ impl ChunkSpill {
         Ok(Bytes::from(data))
     }
 
-    /// Read a wave of chunks from disk.
-    fn read_wave(&self, wave_addrs: &[[u8; 32]]) -> Result<Vec<(Bytes, [u8; 32])>> {
-        let mut out = Vec::with_capacity(wave_addrs.len());
-        for addr in wave_addrs {
-            let content = self.read_chunk(addr)?;
-            out.push((content, *addr));
-        }
-        Ok(out)
-    }
-
     /// Clean up the spill directory.
     fn cleanup(&self) {
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
@@ -634,7 +633,7 @@ fn cached_merkle_covers_addresses(
 /// A partial [`MerkleBatchPaymentResult`] (from a `pay_for_merkle_multi_batch`
 /// where a later sub-batch's payment failed) carries proofs only for the
 /// already-paid sub-batches, so unpaid chunks reach the upload path with no
-/// proof. `upload_waves_merkle` reports those as failed via
+/// proof. `upload_merkle_from_spill` reports those as failed via
 /// [`Error::PartialUpload`] rather than aborting the whole file. Order within
 /// each group follows `addresses`.
 fn partition_addresses_by_proof(
@@ -716,7 +715,7 @@ struct SingleWaveOutcome {
 /// A `PartialUpload` (chunks short of quorum after retries) is **recoverable**:
 /// its stored/failed chunks and on-chain spend are returned so the caller
 /// records them and continues to the next wave, making the file make maximum
-/// progress exactly like `upload_waves_merkle`. Every other error is **fatal**
+/// progress exactly like `upload_merkle_from_spill`. Every other error is **fatal**
 /// (wallet/payment-infrastructure failures, missing proofs, spill reads) and is
 /// returned via `Err` to abort the file. Because `UPLOAD_WAVE_SIZE ==
 /// PAYMENT_WAVE_SIZE`, each batch call is exactly one payment wave, so folding a
@@ -2047,7 +2046,7 @@ impl Client {
                              resuming with cached merkle proofs"
                         );
                         let (stored, sc, gc, stats) = self
-                            .upload_waves_merkle(
+                            .upload_merkle_from_spill(
                                 &spill,
                                 &spill.addresses,
                                 cached,
@@ -2125,7 +2124,7 @@ impl Client {
                          reusing cached merkle proofs"
                     );
                     let (stored, sc, gc, stats) = self
-                        .upload_waves_merkle(
+                        .upload_merkle_from_spill(
                             &spill,
                             &merkle_plan.to_upload,
                             cached,
@@ -2240,7 +2239,7 @@ impl Client {
                 };
 
                 let (stored, sc, gc, stats) = self
-                    .upload_waves_merkle(
+                    .upload_merkle_from_spill(
                         &spill,
                         &merkle_plan.to_upload,
                         &batch_result,
@@ -2365,7 +2364,7 @@ impl Client {
         // A wave whose chunks fall short of quorum after retries must not abort
         // the file: its failures are accumulated here and surfaced as a single
         // `PartialUpload` only after every wave has been attempted, mirroring
-        // `upload_waves_merkle`. Aborting on the first failed wave (the old `?`)
+        // `upload_merkle_from_spill`. Aborting on the first failed wave (the old `?`)
         // discarded all later waves' progress — already self-encrypted, spilled,
         // and in some cases already paid for — converting high per-chunk success
         // into 0% per-file success.
@@ -2409,7 +2408,7 @@ impl Client {
             // Fold this wave's result. A quorum shortfall (`PartialUpload`) is
             // recoverable and its parts are returned to be recorded here;
             // genuinely fatal errors propagate via `?` and abort the file, as in
-            // `upload_waves_merkle`.
+            // `upload_merkle_from_spill`.
             let outcome = fold_single_wave(
                 self.batch_upload_chunks_with_events(
                     wave_data,
@@ -2449,17 +2448,6 @@ impl Client {
             {
                 *slot = slot.saturating_add(*count);
             }
-
-            if let Some(tx) = progress {
-                let _ = tx
-                    .send(UploadEvent::WaveComplete {
-                        wave: wave_num,
-                        total_waves: wave_count,
-                        stored_so_far: total_stored,
-                        total: total_chunks,
-                    })
-                    .await;
-            }
         }
 
         // Any chunk still failed after every wave was attempted means the file
@@ -2494,20 +2482,23 @@ impl Client {
 
     /// Upload chunks from a spill using pre-computed merkle proofs.
     ///
-    /// Reads one wave at a time from disk, pairs each chunk with its proof,
-    /// and uploads concurrently. Peak memory: ~`UPLOAD_WAVE_SIZE × MAX_CHUNK_SIZE`.
+    /// Stores the whole file as a **single cap-bounded fan-out** — not in fixed
+    /// waves. The store concurrency limiter is the only throttle: `store_one`
+    /// reads each chunk's body from the on-disk spill on demand, so at most
+    /// `store_cap` (≤ 64) bodies are ever resident, giving the same
+    /// `~store_cap × MAX_CHUNK_SIZE` peak-memory bound the old 64-chunk waves
+    /// gave — but with **no wave barrier**, so a slow straggler (e.g. a chunk
+    /// whose close-group peers are stale relayed addresses that take minutes to
+    /// revalidate) no longer stalls the rest of the file behind it.
     ///
-    /// A chunk that is transiently short of quorum (`InsufficientPeers`) does
-    /// **not** abort the file, nor does it block the pipeline: each wave is
-    /// stored in a **single pass** (no in-wave backoff barrier), and chunks
-    /// short of quorum are collected into a file-level deferred set rather than
-    /// retried in place. After the last wave, [`merkle_deferred_retry`] retries
-    /// the whole deferred set in concurrent rounds ([`DEFERRED_ROUND_DELAYS_SECS`]
-    /// delays), re-reading each chunk's body from the spill and reusing its
-    /// proof. This keeps every wave running at full fan-out instead of parking
-    /// idle slots behind one slow chunk's backoff, while peak memory stays
-    /// bounded (bodies are re-read from disk, never pinned). Non-quorum errors
-    /// (e.g. a missing proof) stay fatal and abort immediately.
+    /// A chunk that is transiently short of quorum (`InsufficientPeers` /
+    /// `CloseGroupShortfall` / `RemotePut`) does **not** abort the file, nor
+    /// block the pass: the store pass is a **single attempt** (no in-pass
+    /// backoff), and quorum-short chunks are collected into a deferred set. After
+    /// the pass, [`merkle_deferred_retry`] retries that set in concurrent rounds
+    /// ([`DEFERRED_ROUND_DELAYS_SECS`] delays), re-reading each body from the
+    /// spill and reusing its proof. Non-quorum errors (e.g. a missing proof)
+    /// stay fatal and abort immediately.
     ///
     /// Returns `(chunks_stored, storage_cost_atto, gas_cost_wei)` on success.
     /// Costs come from the `batch_result` which was populated during payment.
@@ -2515,9 +2506,9 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`Error::PartialUpload`] if any chunk is still short of quorum
-    /// after all retries across every wave (other chunks remain stored), or the
-    /// underlying error for a non-quorum failure.
-    async fn upload_waves_merkle(
+    /// after the store pass and every deferred round (other chunks remain
+    /// stored), or the underlying error for a non-quorum failure.
+    async fn upload_merkle_from_spill(
         &self,
         spill: &ChunkSpill,
         addresses: &[[u8; 32]],
@@ -2529,10 +2520,6 @@ impl Client {
         let total_chunks = total_stored + addresses.len();
         let mut stored_addresses: Vec<[u8; 32]> = already_stored_addresses.to_vec();
         let mut failed: Vec<([u8; 32], String)> = Vec::new();
-        // Chunks short of quorum on their single wave pass are collected here and
-        // retried after the last wave (see `merkle_deferred_retry`), so a slow
-        // chunk never holds its wave's other slots idle behind a backoff.
-        let mut deferred: Vec<([u8; 32], String)> = Vec::new();
         let mut agg_stats = WaveAggregateStats::default();
 
         // Chunks without a merkle proof were never paid for: a partial
@@ -2557,17 +2544,22 @@ impl Client {
             }
         }
 
-        let waves: Vec<&[[u8; 32]]> = to_store.chunks(UPLOAD_WAVE_SIZE).collect();
-        let wave_count = waves.len();
-
         let store_limiter = self.controller().store.clone();
 
         // Store one chunk to its (freshly re-collected) close group, reusing the
-        // chunk's merkle proof. Shared across every retry round so a converged
-        // routing table yields a fresh group. Only `InsufficientPeers` is
-        // recoverable; a missing proof stays fatal. Mirrors the external-signer
-        // path's closure in `merkle_upload_chunks`.
-        let store_one = |addr: [u8; 32], content: Bytes| {
+        // chunk's merkle proof. Reads the body from the on-disk spill on demand,
+        // so the whole-file store runs as ONE cap-bounded fan-out with no per-wave
+        // barrier: a slow straggler (e.g. a chunk whose close-group peers are
+        // stale relayed addresses that take minutes to revalidate) no longer
+        // holds back the rest of the file. Only the ≤cap in-flight stores hold a
+        // body, so peak resident memory is `cap × MAX_CHUNK_SIZE`; the cap is
+        // clamped to `MERKLE_STORE_MAX_IN_FLIGHT` (below) so it stays within the
+        // ~256 MiB bound the fixed 64-chunk waves gave even if `adaptive.max.store`
+        // is configured above 64.
+        // Shared across every deferred round so a converged routing table yields
+        // a fresh group. Only a quorum shortfall is recoverable; a missing proof
+        // or a failed spill read stays fatal. Mirrors `merkle_upload_chunks`.
+        let store_one = |addr: [u8; 32]| {
             let limiter = store_limiter.clone();
             let proof_bytes = batch_result.proofs.get(&addr).cloned();
             async move {
@@ -2578,6 +2570,7 @@ impl Client {
                         hex::encode(addr)
                     ))
                 })?;
+                let content = spill.read_chunk(&addr)?;
                 let peers = self.put_target_peers(&addr).await?;
                 observe_op(
                     &limiter,
@@ -2589,133 +2582,97 @@ impl Client {
             }
         };
 
-        for (wave_idx, wave_addrs) in waves.into_iter().enumerate() {
-            let wave_num = wave_idx + 1;
-            let wave = spill.read_wave(wave_addrs)?;
+        info!(
+            "Storing {} chunks (merkle) as a single cap-bounded pass — {total_stored}/{total_chunks} stored so far",
+            to_store.len()
+        );
 
-            info!(
-                "Wave {wave_num}/{wave_count}: storing {} chunks (merkle) — {total_stored}/{total_chunks} stored so far",
-                wave.len()
-            );
+        // Store the WHOLE file in one cap-bounded fan-out (`max_attempts = 1`, no
+        // backoff): no wave barrier, so a slow straggler (dead-relay peers) can't
+        // hold back the rest of the file. The store cap re-reads the limiter per
+        // slot, so it maxes at 64 → ≤64 bodies resident (bodies read from spill on
+        // demand by `store_one`), the same peak-memory bound the fixed 64-chunk
+        // waves gave. Quorum-short chunks are collected and deferred to the
+        // post-pass concurrent retry rather than parking slots behind a backoff.
+        // `merkle_store_cap` clamps to `MERKLE_STORE_MAX_IN_FLIGHT` so a high
+        // configured `adaptive.max.store` can't hold more than the wave-era
+        // ~256 MB of spilled bodies resident (PR #137 review).
+        let cap = || merkle_store_cap(store_limiter.current());
+        let outcome = merkle_store_with_retry(
+            to_store.clone(),
+            cap,
+            1,
+            std::time::Duration::ZERO,
+            progress,
+            total_stored,
+            total_chunks,
+            &store_one,
+        )
+        .await?;
 
-            // Clamp fan-out to wave size — partial last wave should
-            // not pay for extra slots (see PERF-RESULTS.md).
-            let store_concurrency = store_limiter.current().min(wave.len().max(1));
-            let chunks: Vec<([u8; 32], Bytes)> = wave
-                .into_iter()
-                .map(|(content, addr)| (addr, content))
-                .collect();
+        // Record confirmed stores from the explicit set the store helper reports.
+        // Using that set (rather than inferring "chunks minus failed") keeps
+        // `stored_addresses` correct even when a fatal abort leaves some chunks
+        // neither stored nor reported short of quorum.
+        stored_addresses.extend(&outcome.stored_addresses);
+        total_stored = outcome.stored;
 
-            // Store the wave in a SINGLE pass (`max_attempts = 1`, no backoff):
-            // quorum-short chunks are collected and deferred to a post-wave
-            // concurrent retry rather than parking this wave's other slots
-            // behind a backoff. `stored_offset` is the running cumulative count
-            // so the progress events the driver emits stay correctly numbered
-            // across waves.
-            let outcome = merkle_store_with_retry(
-                chunks,
-                store_concurrency,
-                1,
-                std::time::Duration::ZERO,
-                progress,
-                total_stored,
-                total_chunks,
-                &store_one,
-            )
-            .await?;
-
-            // Record this wave's confirmed stores from the explicit set the
-            // store helper reports. Using that set (rather than inferring
-            // "wave chunks minus failed") keeps `stored_addresses` correct even
-            // when a fatal abort leaves some of the wave neither stored nor
-            // reported short of quorum.
-            stored_addresses.extend(&outcome.stored_addresses);
-            total_stored = outcome.stored;
-
-            // Merge per-wave stats (durations, attempts, per-round histogram).
-            agg_stats.chunk_attempts_total = agg_stats
-                .chunk_attempts_total
-                .saturating_add(outcome.stats.chunk_attempts_total);
-            agg_stats
-                .store_durations_ms
-                .extend(outcome.stats.store_durations_ms);
-            for (slot, count) in agg_stats
-                .retries_histogram
-                .iter_mut()
-                .zip(outcome.stats.retries_histogram.iter())
-            {
-                *slot = slot.saturating_add(*count);
-            }
-
-            if let Some(e) = outcome.fatal {
-                // A non-quorum store error is fatal (missing proofs were
-                // filtered out above, so this is a genuine network/store
-                // failure). Preserve every chunk stored so far — including this
-                // wave's same-pass successes — and report every not-stored chunk
-                // as failed, so the `PartialUpload` counts are accurate rather
-                // than omitting same-wave stores and under-counting failures.
-                warn!("merkle wave {wave_num}/{wave_count} aborted: {e}");
-                // Best per-chunk messages we already have: missing-proof, this
-                // wave's shortfalls, and earlier waves' deferred shortfalls.
-                let mut known_failed = failed;
-                known_failed.extend(outcome.failed_addresses);
-                known_failed.extend(std::mem::take(&mut deferred));
-                return Err(partial_upload_after_fatal(
-                    addresses,
-                    stored_addresses,
-                    total_stored,
-                    total_chunks,
-                    known_failed,
-                    PartialUploadSpend {
-                        storage_cost_atto: batch_result.storage_cost_atto.clone(),
-                        gas_cost_wei: batch_result.gas_cost_wei,
-                    },
-                    format!("merkle chunk store aborted: {e}"),
-                ));
-            }
-
-            // Non-fatal: this wave's quorum-short chunks are deferred (not failed
-            // yet) for the post-wave concurrent retry. A deferred chunk joins
-            // `stored_addresses` only if/when a later round stores it.
-            deferred.extend(outcome.failed_addresses);
-
-            if let Some(tx) = progress {
-                let _ = tx
-                    .send(UploadEvent::WaveComplete {
-                        wave: wave_num,
-                        total_waves: wave_count,
-                        stored_so_far: total_stored,
-                        total: total_chunks,
-                    })
-                    .await;
-            }
+        // Merge store stats (durations, attempts, per-round histogram).
+        agg_stats.chunk_attempts_total = agg_stats
+            .chunk_attempts_total
+            .saturating_add(outcome.stats.chunk_attempts_total);
+        agg_stats
+            .store_durations_ms
+            .extend(outcome.stats.store_durations_ms);
+        for (slot, count) in agg_stats
+            .retries_histogram
+            .iter_mut()
+            .zip(outcome.stats.retries_histogram.iter())
+        {
+            *slot = slot.saturating_add(*count);
         }
 
-        // The wave passes never blocked on backoff; now retry the whole
-        // file-level deferred set in concurrent rounds. Bodies are re-read from
-        // the spill at retry time (peak RAM unchanged) and proofs are re-attached
-        // by `store_one`. Chunks still short after the final round become
-        // `failed`; a non-quorum error aborts as `PartialUpload`.
+        if let Some(e) = outcome.fatal {
+            // A non-quorum store error is fatal (missing proofs were filtered out
+            // above, so this is a genuine network/store failure). Preserve every
+            // chunk stored so far and report every not-stored chunk as failed, so
+            // the `PartialUpload` counts are accurate.
+            warn!("merkle store aborted: {e}");
+            let mut known_failed = failed;
+            known_failed.extend(outcome.failed_addresses);
+            return Err(partial_upload_after_fatal(
+                addresses,
+                stored_addresses,
+                total_stored,
+                total_chunks,
+                known_failed,
+                PartialUploadSpend {
+                    storage_cost_atto: batch_result.storage_cost_atto.clone(),
+                    gas_cost_wei: batch_result.gas_cost_wei,
+                },
+                format!("merkle chunk store aborted: {e}"),
+            ));
+        }
+
+        // Non-fatal: quorum-short chunks are deferred (not failed yet) for the
+        // post-pass concurrent retry. A deferred chunk joins `stored_addresses`
+        // only if/when a later round stores it.
+        let deferred: Vec<([u8; 32], String)> = outcome.failed_addresses;
+
+        // The store pass never blocked on backoff; now retry the deferred set in
+        // concurrent rounds. Bodies are re-read from the spill by `store_one`
+        // (peak RAM unchanged) and proofs re-attached. Chunks still short after
+        // the final round become `failed`; a non-quorum error aborts as
+        // `PartialUpload`.
         if !deferred.is_empty() {
             info!(
-                "Deferring {} merkle chunk(s) short of quorum for concurrent retry after final wave",
+                "Deferring {} merkle chunk(s) short of quorum for concurrent retry after the store pass",
                 deferred.len()
             );
             let dr = merkle_deferred_retry(
                 deferred,
                 &DEFERRED_ROUND_DELAYS_SECS,
-                // Read and store at most one wave's worth of bodies at a time so
-                // the deferred path keeps the wave path's ~256 MB peak-memory
-                // bound regardless of how many chunks were deferred file-wide.
-                UPLOAD_WAVE_SIZE,
-                |addrs: &[[u8; 32]]| {
-                    spill.read_wave(addrs).map(|wave| {
-                        wave.into_iter()
-                            .map(|(content, addr)| (addr, content))
-                            .collect()
-                    })
-                },
-                |n: usize| store_limiter.current().min(n.max(1)),
+                |n: usize| merkle_store_cap(store_limiter.current()).min(n.max(1)),
                 progress,
                 total_stored,
                 total_chunks,
@@ -2766,9 +2723,8 @@ impl Client {
         }
 
         // A file with any permanently-failed chunk is not fully stored — surface
-        // it as `PartialUpload`, but only after the single wave pass and every
-        // deferred retry round are exhausted (never silently succeed with
-        // missing chunks).
+        // it as `PartialUpload`, but only after the store pass and every deferred
+        // retry round are exhausted (never silently succeed with missing chunks).
         if !failed.is_empty() {
             let failed_count = failed.len();
             let total_attempts = 1 + DEFERRED_ROUND_DELAYS_SECS.len();
@@ -3454,6 +3410,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merkle_store_cap_clamps_to_memory_bound() {
+        // Below the ceiling: pass the adaptive cap through unchanged.
+        assert_eq!(merkle_store_cap(8), 8);
+        assert_eq!(merkle_store_cap(64), 64);
+        // A configured `adaptive.max.store` above the ceiling must be clamped so
+        // the whole-file fan-out can't pin more than ~256 MB of bodies (PR #137).
+        assert_eq!(merkle_store_cap(512), MERKLE_STORE_MAX_IN_FLIGHT);
+        assert_eq!(merkle_store_cap(usize::MAX), MERKLE_STORE_MAX_IN_FLIGHT);
+        // Never zero — always make progress.
+        assert_eq!(merkle_store_cap(0), 1);
+    }
+
+    #[test]
     fn distributed_sample_indices_spreads_across_large_file() {
         // cap 5 over 100 chunks: first and last included, evenly spread.
         assert_eq!(distributed_sample_indices(100, 5), vec![0, 24, 49, 74, 99]);
@@ -3568,7 +3537,7 @@ mod tests {
     }
 
     /// A partial merkle payment leaves some addresses without a proof. Those
-    /// must be split out so `upload_waves_merkle` reports them as failed
+    /// must be split out so `upload_merkle_from_spill` reports them as failed
     /// (`PartialUpload`) instead of aborting the whole file — preserving the
     /// addresses' original order in each group.
     #[test]

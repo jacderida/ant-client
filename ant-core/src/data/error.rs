@@ -43,6 +43,23 @@ pub enum Error {
         source: ant_protocol::ProtocolError,
     },
 
+    /// A chunk PUT missed its close-group quorum, and the shortfall was
+    /// caused by close-group **dial/relay churn** — dead or stale relayed
+    /// peer addresses that could not be dialled — with **no** evidence of
+    /// local backpressure (no PUT-response timeouts among the failures).
+    ///
+    /// This is remote peer churn (the same dead relayed DHT addresses as
+    /// V2-551), NOT evidence the client is sending too fast. More local send
+    /// concurrency neither causes nor fixes it, so it classifies as
+    /// `Outcome::ApplicationError` (see `classify_error`) and does NOT push
+    /// the adaptive store limiter down (V2-554). Distinct from
+    /// [`Error::InsufficientPeers`], which a close-group shortfall keeps when
+    /// any PUT-response *timeout* is present (genuine local backpressure that
+    /// must still cut the cap). Like `InsufficientPeers`, it is a recoverable
+    /// quorum shortfall and is deferred/retried, not fatal.
+    #[error("close-group PUT shortfall (dial churn): {0}")]
+    CloseGroupShortfall(String),
+
     /// Invalid data received.
     #[error("invalid data: {0}")]
     InvalidData(String),
@@ -235,6 +252,15 @@ mod tests {
     fn test_display_insufficient_peers() {
         let err = Error::InsufficientPeers("need 5, got 2".to_string());
         assert_eq!(err.to_string(), "insufficient peers: need 5, got 2");
+    }
+
+    #[test]
+    fn test_display_close_group_shortfall() {
+        let err = Error::CloseGroupShortfall("Stored on 3 peers, need 4".to_string());
+        assert_eq!(
+            err.to_string(),
+            "close-group PUT shortfall (dial churn): Stored on 3 peers, need 4"
+        );
     }
 
     #[test]
