@@ -426,13 +426,6 @@ async fn drive_upload_progress(
                 let pos = std::cmp::max(pb.position(), stored as u64);
                 pb.set_position(pos);
             }
-            UploadEvent::WaveComplete {
-                stored_so_far,
-                total: _,
-                ..
-            } => {
-                pb.set_position(stored_so_far as u64);
-            }
         }
     }
 

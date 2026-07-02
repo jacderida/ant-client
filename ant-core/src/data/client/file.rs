@@ -61,13 +61,6 @@ pub enum UploadEvent {
     ChunkQuoted { quoted: usize, total: usize },
     /// A chunk has been stored on the network.
     ChunkStored { stored: usize, total: usize },
-    /// A wave has completed.
-    WaveComplete {
-        wave: usize,
-        total_waves: usize,
-        stored_so_far: usize,
-        total: usize,
-    },
 }
 
 /// Progress events emitted during file download for UI feedback.
@@ -2455,17 +2448,6 @@ impl Client {
             {
                 *slot = slot.saturating_add(*count);
             }
-
-            if let Some(tx) = progress {
-                let _ = tx
-                    .send(UploadEvent::WaveComplete {
-                        wave: wave_num,
-                        total_waves: wave_count,
-                        stored_so_far: total_stored,
-                        total: total_chunks,
-                    })
-                    .await;
-            }
         }
 
         // Any chunk still failed after every wave was attempted means the file
@@ -2738,24 +2720,6 @@ impl Client {
                 ));
             }
             failed.extend(dr.failed_addresses);
-        }
-
-        // Emit a single terminal `WaveComplete`. The whole-file store now runs
-        // as one cap-bounded pass rather than fixed waves, but `WaveComplete` is
-        // a public phase-completion signal (consumed by the CLI progress adapter
-        // and external API clients), so report it once — "wave 1 of 1" — after
-        // the store pass and deferred retries so consumers that key on it still
-        // see the store phase complete (PR #137 review). Per-chunk `ChunkStored`
-        // events drive the progress bar as before.
-        if let Some(tx) = progress {
-            let _ = tx
-                .send(UploadEvent::WaveComplete {
-                    wave: 1,
-                    total_waves: 1,
-                    stored_so_far: total_stored,
-                    total: total_chunks,
-                })
-                .await;
         }
 
         // A file with any permanently-failed chunk is not fully stored — surface
