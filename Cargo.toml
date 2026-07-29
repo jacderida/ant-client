@@ -1,3 +1,6 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
 resolver = "2"
+
+[patch.crates-io]
+saorsa-core = { git = "https://github.com/mickvandijke/saorsa-core.git", branch = "feat/relay-canary-gate-rc-2026.6.2" }

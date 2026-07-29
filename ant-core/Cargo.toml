@@ -65,7 +65,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # `ant-protocol` pin above points at a released version, this ant-node must
 # track the matching released version carrying the same saorsa-core /
 # ant-protocol lineage.
-ant-node = { version = "0.15.0", optional = true }
+ant-node = { git = "https://github.com/jacderida/ant-node.git", branch = "chrisoneil/relay-canary-testnet-saorsa-branches", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -96,7 +96,7 @@ test-utils = []
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { version = "0.15.0", features = ["test-utils"] }
+ant-node = { git = "https://github.com/jacderida/ant-node.git", branch = "chrisoneil/relay-canary-testnet-saorsa-branches", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
