@@ -3254,7 +3254,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5197,8 +5197,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.26.3"
-source = "git+https://github.com/mickvandijke/saorsa-core.git?branch=feat%2Frelay-canary-gate-rc-2026.6.2#ae2dbda0dca0ad2b816962f86adcf37bbc6bfd40"
+version = "0.26.4"
+source = "git+https://github.com/mickvandijke/saorsa-core.git?branch=feat%2Frelay-canary-gate-rc-2026.6.2#38e38fa4a2e0ca920c5d621436e4f6749a4cfafb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5312,7 +5312,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.35.2"
-source = "git+https://github.com/WithAutonomi/saorsa-transport.git?branch=fix%2Fpr136-provisional-relay#4a2ceb96c424f12d76422b06674a45c2472cda71"
+source = "git+https://github.com/WithAutonomi/saorsa-transport.git?branch=fix%2Fpr136-provisional-relay#e24989f21a0bc90cd42bf45ffbdb0bc1700048eb"
 dependencies = [
  "anyhow",
  "async-trait",
